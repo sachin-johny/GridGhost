@@ -24,7 +24,7 @@ import tempfile
 from pathlib import Path
 
 # Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.board_model import BoardModel, BoardOutline, Component, Net, Pad
 from parsers.kicad_parser import KiCadParser
@@ -44,8 +44,8 @@ from engine.cost_function import (
     count_overlaps,
     count_out_of_bounds,
 )
-from legalization import legalize
-from profiles import get_profile, list_profiles, BoardProfile, BUILTIN_PROFILES
+from legalization.legalizer import legalize
+from profiles.board_profiles import get_profile, list_profiles, BoardProfile, BUILTIN_PROFILES
 from samples.sample_board import SAMPLE_KICAD_PCB, create_sample_board
 
 
