@@ -57,7 +57,7 @@ passed = 0
 failed = 0
 
 
-def test(name: str, func) -> None:
+def run_test(name: str, func) -> None:
     """Run a test function and report results."""
     global passed, failed
     try:
@@ -613,47 +613,47 @@ def main():
     print("=" * 60 + "\n")
 
     print("Data Model Tests:")
-    test("BoardOutline basics", test_board_outline)
-    test("Component overlap", test_component_overlap)
-    test("Component bounding box", test_component_bbox)
-    test("Pad absolute position", test_pad_absolute_pos)
-    test("BoardModel serialization", test_board_model_serialization)
-    test("BoardModel lookup helpers", test_board_model_lookup)
+    run_test("BoardOutline basics", test_board_outline)
+    run_test("Component overlap", test_component_overlap)
+    run_test("Component bounding box", test_component_bbox)
+    run_test("Pad absolute position", test_pad_absolute_pos)
+    run_test("BoardModel serialization", test_board_model_serialization)
+    run_test("BoardModel lookup helpers", test_board_model_lookup)
 
     print("\nParser Tests:")
-    test("KiCad parser", test_kicad_parser)
-    test("JSON roundtrip", test_json_roundtrip)
+    run_test("KiCad parser", test_kicad_parser)
+    run_test("JSON roundtrip", test_json_roundtrip)
 
     print("\nNet Clustering Tests:")
-    test("Build net hypergraph", test_build_hypergraph)
-    test("Component clustering", test_clustering)
-    test("Seed position computation", test_seed_positions)
+    run_test("Build net hypergraph", test_build_hypergraph)
+    run_test("Component clustering", test_clustering)
+    run_test("Seed position computation", test_seed_positions)
 
     print("\nHPWL Cost Function Tests:")
-    test("HPWL 2-pin net", test_hpwl_2pin)
-    test("HPWL 3-pin clique", test_hpwl_3pin_clique)
-    test("HPWL star model", test_hpwl_star)
-    test("HPWL auto model selection", test_hpwl_auto_model)
-    test("Total HPWL", test_total_hpwl)
-    test("Overlap penalty", test_overlap_penalty)
-    test("Boundary penalty", test_boundary_penalty)
-    test("Cost function evaluation", test_cost_function)
+    run_test("HPWL 2-pin net", test_hpwl_2pin)
+    run_test("HPWL 3-pin clique", test_hpwl_3pin_clique)
+    run_test("HPWL star model", test_hpwl_star)
+    run_test("HPWL auto model selection", test_hpwl_auto_model)
+    run_test("Total HPWL", test_total_hpwl)
+    run_test("Overlap penalty", test_overlap_penalty)
+    run_test("Boundary penalty", test_boundary_penalty)
+    run_test("Cost function evaluation", test_cost_function)
 
     print("\nGrid Placement Tests:")
-    test("Grid placement", test_grid_placement)
-    test("Edge-aware placement", test_edge_aware_placement)
+    run_test("Grid placement", test_grid_placement)
+    run_test("Edge-aware placement", test_edge_aware_placement)
 
     print("\nLegalization Tests:")
-    test("Grid snapping", test_grid_snap)
-    test("Boundary enforcement", test_boundary_enforcement)
-    test("Overlap resolution", test_overlap_resolution)
+    run_test("Grid snapping", test_grid_snap)
+    run_test("Boundary enforcement", test_boundary_enforcement)
+    run_test("Overlap resolution", test_overlap_resolution)
 
     print("\nBoard Profile Tests:")
-    test("Built-in profiles", test_builtin_profiles)
-    test("Profile rules", test_profile_rules)
+    run_test("Built-in profiles", test_builtin_profiles)
+    run_test("Profile rules", test_profile_rules)
 
     print("\nEnd-to-End Pipeline:")
-    test("Full Phase 1 pipeline", test_full_pipeline)
+    run_test("Full Phase 1 pipeline", test_full_pipeline)
 
     print("\n" + "=" * 60)
     print(f"  Results: {passed} passed, {failed} failed")

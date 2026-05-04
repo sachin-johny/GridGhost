@@ -109,8 +109,16 @@ def cmd_place(args) -> None:
     costs = cost_fn.evaluate(model)
     print_cost_breakdown(costs, "Placement Cost (Pre-Legalization)")
 
+    # Optional Phase 2 optimization
+    if args.optimize:
+        print("Step 6: Running Phase 2 optimizer (greedy swap)...")
+        from engine.simple_optimizer import greedy_swap_optimize
+        model = greedy_swap_optimize(model, cost_fn, max_iters=10)
+        costs_opt = cost_fn.evaluate(model)
+        print_cost_breakdown(costs_opt, "Placement Cost (Post-Optimization)")
+
     # Step 7: Legalization
-    print("Step 6: Running legalization pass...")
+    print("Step 7: Running legalization pass...")
     legalize(model, grid_mm=args.grid, verbose=True)
     print_board_summary(model, "After Legalization")
 
@@ -244,6 +252,7 @@ def main():
     p_place.add_argument("-g", "--grid", type=float, default=0.1, help="Legalization grid in mm (default: 0.1)")
     p_place.add_argument("--edge-aware", action="store_true", help="Use edge-aware placement for connectors")
     p_place.add_argument("--interactive", action="store_true", help="Interactive profile tuning")
+    p_place.add_argument("--optimize", action="store_true", help="Run Phase 2 optimizer after grid placement")
     p_place.add_argument("--dry-run", action="store_true", help="Don't write PCB output file")
 
     # ---- cost ----
