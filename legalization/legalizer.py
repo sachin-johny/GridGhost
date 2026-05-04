@@ -1,0 +1,184 @@
+"""Legalization pass for PCB placement.
+
+Runs AFTER optimization to produce a legal, grid-snapped placement:
+1. Grid snapping — round coordinates to KiCad's placement grid
+2. Boundary enforcement — clamp out-of-bounds components
+3. Overlap resolution — iteratively shift overlapping components apart
+
+IMPORTANT: Run legalization as a single post-optimization pass,
+NOT iteratively inside the optimizer loop — it would corrupt
+gradient/energy signals.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Optional
+
+from models.board_model import BoardModel, Component, BoardOutline
+
+
+def legalize(
+    model: BoardModel,
+    grid_mm: float = 0.1,
+    max_iterations: int = 100,
+    push_strength: float = 0.5,
+    verbose: bool = False,
+) -> BoardModel:
+    """Full legalization pipeline.
+
+    Args:
+        model: Board model with optimized but potentially illegal positions
+        grid_mm: Grid size in mm (0.1mm or 0.05mm typical for KiCad)
+        max_iterations: Max iterations for overlap resolution
+        push_strength: How far to push overlapping components (fraction of overlap)
+        verbose: Print progress information
+
+    Returns:
+        BoardModel with legalized component positions
+    """
+    if verbose:
+        overlaps_before = _count_overlaps(model)
+        oob_before = _count_oob(model)
+        print(f"Legalization input: {overlaps_before} overlaps, {oob_before} out-of-bounds")
+
+    # Step 1: Snap to grid
+    _snap_to_grid(model, grid_mm)
+
+    # Step 2: Enforce board boundary
+    _enforce_boundary(model)
+
+    # Step 3: Resolve overlaps
+    _resolve_overlaps(model, max_iterations, push_strength, grid_mm, verbose)
+
+    # Step 4: Final grid snap and boundary check
+    _snap_to_grid(model, grid_mm)
+    _enforce_boundary(model)
+
+    if verbose:
+        overlaps_after = _count_overlaps(model)
+        oob_after = _count_oob(model)
+        print(f"Legalization output: {overlaps_after} overlaps, {oob_after} out-of-bounds")
+
+    return model
+
+
+def _snap_to_grid(model: BoardModel, grid_mm: float) -> None:
+    """Round all component positions to the nearest grid point."""
+    for comp in model.components:
+        if comp.is_fixed:
+            continue
+        comp.x = round(comp.x / grid_mm) * grid_mm
+        comp.y = round(comp.y / grid_mm) * grid_mm
+        # Snap rotation to nearest 90°
+        comp.rotation = round(comp.rotation / 90.0) * 90.0
+
+
+def _enforce_boundary(model: BoardModel) -> None:
+    """Clamp component positions so their bounding boxes stay within the board."""
+    board = model.board
+    for comp in model.components:
+        if comp.is_fixed:
+            continue
+        half_w = comp.effective_width / 2.0
+        half_h = comp.effective_height / 2.0
+
+        comp.x = max(board.x_min + half_w, min(comp.x, board.x_max - half_w))
+        comp.y = max(board.y_min + half_h, min(comp.y, board.y_max - half_h))
+
+
+def _resolve_overlaps(
+    model: BoardModel,
+    max_iterations: int,
+    push_strength: float,
+    grid_mm: float,
+    verbose: bool,
+) -> None:
+    """Iteratively resolve component overlaps by pushing components apart.
+
+    Uses a force-directed push-apart strategy: for each overlapping pair,
+    compute the overlap direction and push both components away from each other.
+    """
+    for iteration in range(max_iterations):
+        overlap_count = 0
+        components = [c for c in model.components if not c.is_fixed]
+
+        # Sort by position for deterministic resolution
+        components.sort(key=lambda c: (c.x, c.y))
+
+        for i, c1 in enumerate(components):
+            for c2 in components[i + 1:]:
+                if not c1.overlaps(c2):
+                    continue
+
+                overlap_count += 1
+                _push_apart(c1, c2, push_strength, grid_mm)
+
+        if overlap_count == 0:
+            if verbose:
+                print(f"  Overlap resolution converged in {iteration + 1} iterations")
+            break
+    else:
+        if verbose:
+            print(f"  Overlap resolution: max iterations ({max_iterations}) reached, "
+                  f"{_count_overlaps(model)} overlaps remaining")
+
+
+def _push_apart(c1: Component, c2: Component, strength: float, grid_mm: float) -> None:
+    """Push two overlapping components apart along the axis of minimum separation.
+
+    The direction is chosen to minimize displacement (push along the axis
+    where the overlap is smallest).
+    """
+    # Compute overlap on each axis
+    ax1, ay1, ax2, ay2 = c1.bbox
+    bx1, by1, bx2, by2 = c2.bbox
+
+    overlap_x = min(ax2, bx2) - max(ax1, bx1)
+    overlap_y = min(ay2, by2) - max(ay1, by1)
+
+    if overlap_x <= 0 or overlap_y <= 0:
+        return  # No actual overlap
+
+    # Push along the axis with less overlap
+    push_mm = grid_mm  # Minimum push distance = one grid unit
+
+    if overlap_x <= overlap_y:
+        # Push along X axis
+        push_dist = max(overlap_x * strength, push_mm)
+        if c1.x <= c2.x:
+            c1.x -= push_dist / 2.0
+            c2.x += push_dist / 2.0
+        else:
+            c1.x += push_dist / 2.0
+            c2.x -= push_dist / 2.0
+    else:
+        # Push along Y axis
+        push_dist = max(overlap_y * strength, push_mm)
+        if c1.y <= c2.y:
+            c1.y -= push_dist / 2.0
+            c2.y += push_dist / 2.0
+        else:
+            c1.y += push_dist / 2.0
+            c2.y -= push_dist / 2.0
+
+
+def _count_overlaps(model: BoardModel) -> int:
+    """Count overlapping component pairs."""
+    count = 0
+    for i, c1 in enumerate(model.components):
+        for c2 in model.components[i + 1:]:
+            if c1.overlaps(c2):
+                count += 1
+    return count
+
+
+def _count_oob(model: BoardModel) -> int:
+    """Count out-of-bounds components."""
+    count = 0
+    board = model.board
+    for comp in model.components:
+        x1, y1, x2, y2 = comp.bbox
+        if x1 < board.x_min or x2 > board.x_max or y1 < board.y_min or y2 > board.y_max:
+            count += 1
+    return count
