@@ -121,60 +121,60 @@ def try_float(val, default=0.0) -> float:
 # Bounding box estimation from fp_line / fp_rect / fp_circle / pad geometry
 # ---------------------------------------------------------------------------
 
-def _extract_fp_geometry(sexp: list) -> tuple[float, float]:
-    """Estimate component width and height from footprint geometry (fp_line, fp_rect, pad)."""
+def _extract_fp_geometry(sexp: list, margin_mm: float = 0.5) -> tuple[float, float, float, float]:
+    """Extract component bounding box from footprint geometry.
+
+    Collects the outermost extent across ALL relevant KiCad layers
+    (CrtYd, Fab, SilkS, Paste, Cu, Mask) plus actual pad sizes.
+
+    Returns: (width, height, bbox_offset_x, bbox_offset_y)
+        - width/height: total extent including margin
+        - bbox_offset_x/y: offset from footprint origin to geometry center
+    """
+    RELEVANT = ("CrtYd", "Fab", "Silk", "Paste", ".Cu", "Mask")
     min_x, min_y = float('inf'), float('inf')
     max_x, max_y = float('-inf'), float('-inf')
 
-    # Collect all coordinate points from fp_line (start/end), fp_rect, and pad positions
-    for start_expr in find_deep(sexp, "fp_line"):
-        layer = find_first(start_expr, "layer")
-        # Only consider F.SilkS or F.Cu / B.SilkS for bounding
-        if layer and len(layer) > 1 and "Silk" not in str(layer[1]) and "Fab" not in str(layer[1]):
+    # Collect geometry from fp_line, fp_rect, fp_circle, fp_arc, fp_poly
+    geom_items = (find_deep(sexp, "fp_line") + find_deep(sexp, "fp_rect") +
+                  find_deep(sexp, "fp_circle") + find_deep(sexp, "fp_arc") +
+                  find_deep(sexp, "fp_poly"))
+    for item in geom_items:
+        layer = find_first(item, "layer")
+        if not layer or len(layer) < 2:
             continue
-        start_pt = find_first(start_expr, "start")
-        end_pt = find_first(start_expr, "end")
-        if start_pt and len(start_pt) >= 3:
-            min_x = min(min_x, try_float(start_pt[1]))
-            min_y = min(min_y, try_float(start_pt[2]))
-            max_x = max(max_x, try_float(start_pt[1]))
-            max_y = max(max_y, try_float(start_pt[2]))
-        if end_pt and len(end_pt) >= 3:
-            min_x = min(min_x, try_float(end_pt[1]))
-            min_y = min(min_y, try_float(end_pt[2]))
-            max_x = max(max_x, try_float(end_pt[1]))
-            max_y = max(max_y, try_float(end_pt[2]))
+        layer_str = str(layer[1])
+        if not any(kw in layer_str for kw in RELEVANT):
+            continue
+        for pt_key in ("start", "end", "center"):
+            pt = find_first(item, pt_key)
+            if pt and len(pt) >= 3:
+                v1, v2 = try_float(pt[1]), try_float(pt[2])
+                min_x, min_y = min(min_x, v1), min(min_y, v2)
+                max_x, max_y = max(max_x, v1), max(max_y, v2)
 
-    for rect_expr in find_deep(sexp, "fp_rect"):
-        start_pt = find_first(rect_expr, "start")
-        end_pt = find_first(rect_expr, "end")
-        if start_pt and len(start_pt) >= 3:
-            min_x = min(min_x, try_float(start_pt[1]))
-            min_y = min(min_y, try_float(start_pt[2]))
-            max_x = max(max_x, try_float(start_pt[1]))
-            max_y = max(max_y, try_float(start_pt[2]))
-        if end_pt and len(end_pt) >= 3:
-            min_x = min(min_x, try_float(end_pt[1]))
-            min_y = min(min_y, try_float(end_pt[2]))
-            max_x = max(max_x, try_float(end_pt[1]))
-            max_y = max(max_y, try_float(end_pt[2]))
-
-    # Also consider pad positions for bounding estimation
+    # Collect actual pad sizes (not hardcoded 0.5mm)
     for pad_expr in find_all(sexp, "pad"):
         at_expr = find_first(pad_expr, "at")
-        if at_expr and len(at_expr) >= 3:
-            px, py = try_float(at_expr[1]), try_float(at_expr[2])
-            # Estimate pad size as ~1mm for bbox purposes
-            pad_half = 0.5
-            min_x = min(min_x, px - pad_half)
-            min_y = min(min_y, py - pad_half)
-            max_x = max(max_x, px + pad_half)
-            max_y = max(max_y, py + pad_half)
+        if not (at_expr and len(at_expr) >= 3):
+            continue
+        px, py = try_float(at_expr[1]), try_float(at_expr[2])
+        size_expr = find_first(pad_expr, "size")
+        sx = sy = 0.5
+        if size_expr and len(size_expr) >= 3:
+            sx, sy = try_float(size_expr[1]) / 2.0, try_float(size_expr[2]) / 2.0
+        min_x, min_y = min(min_x, px - sx), min(min_y, py - sy)
+        max_x, max_y = max(max_x, px + sx), max(max_y, py + sy)
 
     if min_x == float('inf'):
-        return 2.0, 2.0  # Default fallback size
+        return 2.0, 2.0, 0.0, 0.0
 
-    return max(max_x - min_x, 0.5), max(max_y - min_y, 0.5)
+    w = max(max_x - min_x, 0.5)
+    h = max(max_y - min_y, 0.5)
+    # Offset from footprint origin to geometry center
+    off_x = (min_x + max_x) / 2.0
+    off_y = (min_y + max_y) / 2.0
+    return w, h, off_x, off_y
 
 
 # ---------------------------------------------------------------------------
@@ -345,12 +345,13 @@ def _needs_inferred_board(board_outline: BoardOutline, components: list[Componen
 class KiCadParser:
     """Parser for .kicad_pcb files."""
 
-    def __init__(self, filepath: str):
+    def __init__(self, filepath: str, bbox_margin: float = 0.5):
         self.filepath = Path(filepath)
         if not self.filepath.exists():
             raise FileNotFoundError(f"PCB file not found: {filepath}")
         self._sexp = None
         self._net_id_to_name: dict[str, str] = {}  # Maps net ID ("1") → name ("VCC")
+        self._bbox_margin = bbox_margin  # Margin around bbox in mm
 
     def parse(self) -> BoardModel:
         """Parse the .kicad_pcb file and return a BoardModel."""
@@ -457,8 +458,8 @@ class KiCadParser:
             if pad:
                 pads.append(pad)
 
-        # Bounding box from geometry
-        width, height = _extract_fp_geometry(fp_expr)
+        # Bounding box from geometry (with margin for spacing)
+        width, height, bbox_ox, bbox_oy = _extract_fp_geometry(fp_expr, margin_mm=self._bbox_margin)
 
         # Determine if fixed. Keep connectors movable so the auto-placer can
         # move them to the board perimeter during edge-aware placement.
@@ -475,6 +476,9 @@ class KiCadParser:
             layer=layer,
             width=width,
             height=height,
+            courtyard_margin=self._bbox_margin,
+            bbox_offset_x=bbox_ox,
+            bbox_offset_y=bbox_oy,
             pads=pads,
             is_fixed=is_fixed,
             component_type=comp_type,

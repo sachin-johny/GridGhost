@@ -28,7 +28,7 @@ from models.board_model import BoardModel
 from parsers.kicad_parser import KiCadParser
 from parsers.placement_writer import apply_placement, export_positions_json
 from engine.net_clustering import cluster_components, compute_seed_positions
-from engine.grid_placement import grid_place, edge_aware_grid_place
+from engine.grid_placement import grid_place, edge_aware_grid_place, shelf_packing_place, force_directed_place
 from engine.cost_function import CostFunction, total_hpwl, count_overlaps, count_out_of_bounds
 from legalization.legalizer import legalize
 from profiles.board_profiles import get_profile, list_profiles, BoardProfile
@@ -63,10 +63,13 @@ def cmd_place(args) -> None:
 
     # Step 1: Extract
     print("Step 1: Extracting board data...")
-    parser = KiCadParser(args.input)
+    parser = KiCadParser(args.input, bbox_margin=args.bbox_margin)
     model = parser.parse()
     print_board_summary(model, "After Extraction")
     print_component_table(model)
+    if args.verbose:
+        for c in model.components:
+            print(f"  {c.ref}: bbox_offset=({c.bbox_offset_x:.1f}, {c.bbox_offset_y:.1f})")
 
     # Step 2: Select board profile
     print("Step 2: Selecting board profile...")
@@ -89,18 +92,41 @@ def cmd_place(args) -> None:
     clusters = cluster_components(model)
     print_cluster_info(clusters)
 
-    # Step 5: Grid placement
-    print("Step 4: Running grid placement...")
-    has_connectors = any(c.component_type == "connector" for c in model.components)
-    if args.edge_aware or has_connectors:
-        edge_aware_grid_place(model, margin=args.margin, spacing_factor=args.spacing)
-        if args.edge_aware:
-            print("  Using edge-aware placement (connectors near edges)")
-        else:
-            print("  Using edge-aware placement automatically for connector parts")
+    # Step 5: Placement algorithm
+    print("Step 4: Running placement algorithm...")
+
+    # Choose placement algorithm
+    if args.force_directed:
+        print("  Using force-directed placement (attractive + repulsive forces)")
+        force_directed_place(
+            model,
+            margin=args.margin,
+            iterations=args.fd_iterations,
+            k_attract=args.fd_attract,
+            k_repel=args.fd_repel,
+            min_spacing=args.fd_spacing,
+            verbose=args.verbose
+        )
+    elif args.shelf_packing:
+        print("  Using shelf-packing placement (non-overlapping rows)")
+        shelf_packing_place(
+            model,
+            margin=args.margin,
+            spacing=args.fd_spacing,
+            sort_by="size"
+        )
     else:
-        grid_place(model, margin=args.margin, spacing_factor=args.spacing)
-    print_board_summary(model, "After Grid Placement")
+        # Default: improved grid placement with better spacing
+        has_connectors = any(c.component_type == "connector" for c in model.components)
+        if args.edge_aware or has_connectors:
+            edge_aware_grid_place(model, margin=args.margin, spacing_factor=args.spacing)
+            if args.edge_aware:
+                print("  Using edge-aware placement (connectors near edges)")
+            else:
+                print("  Using edge-aware placement automatically for connector parts")
+        else:
+            grid_place(model, margin=args.margin, spacing_factor=args.spacing)
+    print_board_summary(model, "After Placement")
 
     # Step 6: Cost evaluation
     print("Step 5: Evaluating placement cost...")
@@ -248,8 +274,8 @@ def main():
     p_place.add_argument("--output-json", help="Output board model JSON path")
     p_place.add_argument(
         "-p", "--profile", default="generic",
-        choices=["mcu_peripheral", "power_supply", "rf_frontend", "mixed_signal", "generic"],
-        help="Board profile (default: generic)",
+        choices=["mcu_peripheral", "power_supply", "rf_frontend", "mixed_signal", "generic", "small_board"],
+        help="Board profile (default: generic; use 'small_board' for dense boards to reduce congestion)",
     )
     p_place.add_argument("-m", "--margin", type=float, default=5.0, help="Board edge margin in mm (default: 5.0)")
     p_place.add_argument("-s", "--spacing", type=float, default=1.3, help="Component spacing factor (default: 1.3)")
@@ -258,6 +284,16 @@ def main():
     p_place.add_argument("--interactive", action="store_true", help="Interactive profile tuning")
     p_place.add_argument("--optimize", action="store_true", help="Run Phase 2 optimizer after grid placement")
     p_place.add_argument("--dry-run", action="store_true", help="Don't write PCB output file")
+    # New placement algorithms
+    p_place.add_argument("--force-directed", action="store_true", help="Use force-directed placement (recommended for small boards)")
+    p_place.add_argument("--shelf-packing", action="store_true", help="Use shelf-packing placement (guaranteed non-overlapping)")
+    p_place.add_argument("--verbose", action="store_true", help="Verbose output during placement")
+    # Force-directed parameters
+    p_place.add_argument("--fd-iterations", type=int, default=100, help="Force-directed iterations (default: 100)")
+    p_place.add_argument("--fd-attract", type=float, default=0.01, help="Attractive force coefficient (default: 0.01)")
+    p_place.add_argument("--fd-repel", type=float, default=500.0, help="Repulsive force coefficient (default: 500.0)")
+    p_place.add_argument("--fd-spacing", type=float, default=2.0, help="Minimum component spacing mm (default: 2.0)")
+    p_place.add_argument("--bbox-margin", type=float, default=0.5, help="Margin around component bounding box mm (default: 0.5)")
 
     # ---- cost ----
     p_cost = subparsers.add_parser("cost", help="Evaluate placement cost")

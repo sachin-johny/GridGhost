@@ -68,6 +68,19 @@ class BoardProfile:
 # Built-in profiles
 # ---------------------------------------------------------------------------
 
+# Small board profile - for dense boards where spacing is critical
+_SMALL_BOARD = BoardProfile(
+    name="small_board",
+    display_name="Small/Dense Board",
+    description="For small boards where spacing is critical. "
+                "Higher overlap penalty and lower HPWL weight to prevent congestion.",
+    alpha=0.5,    # Lower HPWL weight
+    beta=15.0,     # High overlap penalty to prevent congestion
+    gamma=3.0,      # Standard boundary penalty
+    delta=2.0,       # No constraint rules
+    rules=[],
+)
+
 BUILTIN_PROFILES: dict[str, BoardProfile] = {
     "mcu_peripheral": BoardProfile(
         name="mcu_peripheral",
@@ -140,6 +153,7 @@ BUILTIN_PROFILES: dict[str, BoardProfile] = {
         delta=2.0,
         rules=[],
     ),
+    "small_board": _SMALL_BOARD,
 }
 
 

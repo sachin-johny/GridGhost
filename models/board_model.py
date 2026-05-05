@@ -42,6 +42,8 @@ class Component:
     width: float = 0.0        # Bounding box width in mm
     height: float = 0.0       # Bounding box height in mm
     courtyard_margin: float = 0.25  # Courtyard margin in mm (default 0.25mm per KiCad convention)
+    bbox_offset_x: float = 0.0  # Offset from footprint origin to bbox center (mm)
+    bbox_offset_y: float = 0.0  # Offset from footprint origin to bbox center (mm)
     pads: list[Pad] = field(default_factory=list)
     nets: list[str] = field(default_factory=list)  # Net names connected to this component
     is_fixed: bool = False    # If True, position should not be changed by optimizer
@@ -49,14 +51,20 @@ class Component:
 
     @property
     def bbox(self) -> tuple[float, float, float, float]:
-        """Return bounding box (x_min, y_min, x_max, y_max) including courtyard."""
+        """Return bounding box (x_min, y_min, x_max, y_max) including courtyard.
+
+        Uses bbox_offset to account for footprints whose origin is not
+        at the center of their geometry (common for connectors, displays, etc.).
+        """
+        cx = self.x + self.bbox_offset_x
+        cy = self.y + self.bbox_offset_y
         half_w = (self.width / 2.0) + self.courtyard_margin
         half_h = (self.height / 2.0) + self.courtyard_margin
         return (
-            self.x - half_w,
-            self.y - half_h,
-            self.x + half_w,
-            self.y + half_h,
+            cx - half_w,
+            cy - half_h,
+            cx + half_w,
+            cy + half_h,
         )
 
     @property
@@ -187,6 +195,8 @@ class BoardModel:
                     "width": c.width,
                     "height": c.height,
                     "courtyard_margin": c.courtyard_margin,
+                    "bbox_offset_x": c.bbox_offset_x,
+                    "bbox_offset_y": c.bbox_offset_y,
                     "pads": [asdict(p) for p in c.pads],
                     "nets": c.nets,
                     "is_fixed": c.is_fixed,
@@ -237,6 +247,8 @@ class BoardModel:
                 width=cd.get("width", 0.0),
                 height=cd.get("height", 0.0),
                 courtyard_margin=cd.get("courtyard_margin", 0.25),
+                bbox_offset_x=cd.get("bbox_offset_x", 0.0),
+                bbox_offset_y=cd.get("bbox_offset_y", 0.0),
                 pads=pads,
                 nets=cd.get("nets", []),
                 is_fixed=cd.get("is_fixed", False),

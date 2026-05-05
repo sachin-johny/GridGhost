@@ -148,10 +148,15 @@ def _resolve_overlaps(
 
 
 def _push_apart(c1: Component, c2: Component, strength: float, grid_mm: float) -> None:
-    """Push two overlapping components apart along the axis of minimum separation.
+    """Push two overlapping components apart along axis of minimum separation.
 
-    The direction is chosen to minimize displacement (push along the axis
-    where the overlap is smallest). Ensures minimum push distance to guarantee progress.
+    The direction is chosen to minimize displacement (push along axis
+    where overlap is smallest). For severe overlaps, pushes on both axes.
+
+    Args:
+        c1, c2: Overlapping components
+        strength: Multiplier for push distance
+        grid_mm: Minimum movement (1.5x grid unit)
     """
     # Compute overlap on each axis
     ax1, ay1, ax2, ay2 = c1.bbox
@@ -163,36 +168,47 @@ def _push_apart(c1: Component, c2: Component, strength: float, grid_mm: float) -
     if overlap_x <= 0 or overlap_y <= 0:
         return  # No actual overlap
 
-    # Push along the axis with less overlap
+    # For severe overlaps (>70% of smaller dimension), push on both axes
+    c1_min = min(c1.effective_width, c1.effective_height)
+    c2_min = min(c2.effective_width, c2.effective_height)
+    severity_threshold = 0.7 * min(c1_min, c2_min)
+
+    push_both = (overlap_x > severity_threshold) or (overlap_y > severity_threshold)
+
     # Ensure minimum push distance = 1.5x grid unit to guarantee progress
     push_mm = max(grid_mm * 1.5, 0.15)
 
-    if overlap_x <= overlap_y:
-        # Push along X axis
-        push_dist = max(overlap_x * strength, push_mm)
-        if c1.is_fixed and not c2.is_fixed:
-            c2.x += push_dist if c2.x >= c1.x else -push_dist
-        elif c2.is_fixed and not c1.is_fixed:
-            c1.x += push_dist if c1.x >= c2.x else -push_dist
-        elif c1.x <= c2.x:
-            c1.x -= push_dist / 2.0
-            c2.x += push_dist / 2.0
-        else:
-            c1.x += push_dist / 2.0
-            c2.x -= push_dist / 2.0
+    # Calculate push distances
+    if push_both:
+        # Push along diagonal (both axes) for severe overlap
+        push_x = max(overlap_x * strength * 0.5, push_mm)
+        push_y = max(overlap_y * strength * 0.5, push_mm)
+    elif overlap_x <= overlap_y:
+        # Push along X axis (smaller overlap)
+        push_x = max(overlap_x * strength, push_mm)
+        push_y = 0
     else:
-        # Push along Y axis
-        push_dist = max(overlap_y * strength, push_mm)
-        if c1.is_fixed and not c2.is_fixed:
-            c2.y += push_dist if c2.y >= c1.y else -push_dist
-        elif c2.is_fixed and not c1.is_fixed:
-            c1.y += push_dist if c1.y >= c2.y else -push_dist
-        elif c1.y <= c2.y:
-            c1.y -= push_dist / 2.0
-            c2.y += push_dist / 2.0
-        else:
-            c1.y += push_dist / 2.0
-            c2.y -= push_dist / 2.0
+        # Push along Y axis (smaller overlap)
+        push_x = 0
+        push_y = max(overlap_y * strength, push_mm)
+
+    # Determine push direction based on relative positions
+    dx = 1 if c2.x >= c1.x else -1
+    dy = 1 if c2.y >= c1.y else -1
+
+    # Apply push
+    if c1.is_fixed and not c2.is_fixed:
+        c2.x += dx * push_x
+        c2.y += dy * push_y
+    elif c2.is_fixed and not c1.is_fixed:
+        c1.x -= dx * push_x
+        c1.y -= dy * push_y
+    else:
+        # Split push between both components
+        c1.x -= dx * push_x / 2.0
+        c1.y -= dy * push_y / 2.0
+        c2.x += dx * push_x / 2.0
+        c2.y += dy * push_y / 2.0
 
 
 def _count_overlaps(model: BoardModel) -> int:

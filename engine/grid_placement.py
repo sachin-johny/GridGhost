@@ -16,6 +16,7 @@ from typing import Optional
 
 from models.board_model import BoardModel, Component
 from engine.net_clustering import compute_seed_positions, assign_cluster_positions, cluster_components
+from engine.cost_function import total_hpwl
 
 
 def grid_place(
@@ -309,11 +310,11 @@ def _apply_strong_repulsion(model: BoardModel) -> None:
     interior = [c for c in model.components if c.component_type in ("resistor", "capacitor", "ic") and not c.is_fixed]
     if len(interior) < 2:
         return
-    
+
     min_distances = {"resistor": 10.0, "capacitor": 8.0, "ic": 12.0}
     board = model.board
-    
-    for _ in range(150):  # STRONG: 150 repulsion iterations
+
+    for _ in range(150):
         moved = False
         for i, ca in enumerate(interior):
             for cb in interior[i+1:]:
@@ -321,19 +322,241 @@ def _apply_strong_repulsion(model: BoardModel) -> None:
                 dy = cb.y - ca.y
                 dist = (dx**2 + dy**2) ** 0.5
                 min_d = max(min_distances.get(ca.component_type, 10), min_distances.get(cb.component_type, 10))
-                
+
                 if dist < min_d:
                     if dist < 0.1:
                         dx, dy = math.cos(_ * 0.3), math.sin(_ * 0.3)
                     else:
                         dx, dy = dx/dist, dy/dist
-                    
-                    push = (min_d - dist) * 2.0 + 1.0  # STRONG push
+
+                    push = (min_d - dist) * 2.0 + 1.0  # Strong push
                     ca.x = max(board.x_min + ca.effective_width/2, min(ca.x - push*dx, board.x_max - ca.effective_width/2))
                     ca.y = max(board.y_min + ca.effective_height/2, min(ca.y - push*dy, board.y_max - ca.effective_height/2))
                     cb.x = max(board.x_min + cb.effective_width/2, min(cb.x + push*dx, board.x_max - cb.effective_width/2))
                     cb.y = max(board.y_min + cb.effective_height/2, min(cb.y + push*dy, board.y_max - cb.effective_height/2))
                     moved = True
-        
+
         if not moved:
             break
+
+
+def force_directed_place(
+    model: BoardModel,
+    margin: float = 5.0,
+    iterations: int = 100,
+    k_attract: float = 0.01,  # Attractive force coefficient (HPWL gradient)
+    k_repel: float = 500.0,   # Repulsive force coefficient
+    min_spacing: float = 2.0,   # Minimum component spacing in mm
+    dt: float = 0.5,            # Time step for simulation
+    verbose: bool = False,
+) -> BoardModel:
+    """Force-directed placement with balanced attractive and repulsive forces.
+
+    Attractive forces: Derived from HPWL gradient - pulls connected components together
+    Repulsive forces: Inverse distance - pushes all components apart
+    Cooling schedule: Reduces dt over iterations to stabilize
+
+    Args:
+        model: Board model to optimize in-place
+        margin: Board edge margin in mm
+        iterations: Number of simulation iterations
+        k_attract: Attractive force coefficient (lower = gentler)
+        k_repel: Repulsive force coefficient (higher = stronger spreading)
+        min_spacing: Minimum spacing between components
+        dt: Time step (controls movement per iteration)
+        verbose: Print progress
+
+    Returns:
+        BoardModel with force-directed placement
+    """
+    movable = [c for c in model.components if not c.is_fixed]
+    if not movable:
+        return model
+
+    board = model.board
+    comp_map = {c.ref: c for c in model.components}
+
+    # Build adjacency list for efficient attractive force calculation
+    adjacency = {}
+    for net in model.nets:
+        refs = list(net.component_refs)
+        for i, r1 in enumerate(refs):
+            for r2 in refs[i+1:]:
+                if r1 in comp_map and r2 in comp_map:
+                    adjacency.setdefault(r1, []).append(r2)
+                    adjacency.setdefault(r2, []).append(r1)
+
+    # Initial positions from shelf packing or current placement
+    # (ensure components start well-separated)
+    shelf_packing_place(model, margin, spacing=min_spacing)
+
+    prev_hpwl = float('inf')
+
+    for iter_num in range(iterations):
+        forces = {c.ref: (0.0, 0.0) for c in movable}
+
+        # Cooling schedule - reduce movement over time
+        current_dt = dt * (1.0 - iter_num / iterations) * 0.8 + dt * 0.2
+
+        # Calculate attractive forces (HPWL gradient)
+        for comp in movable:
+            fx, fy = 0.0, 0.0
+            if comp.ref in adjacency:
+                for neighbor_ref in adjacency[comp.ref]:
+                    neighbor = comp_map.get(neighbor_ref)
+                    if neighbor and neighbor.is_fixed:
+                        # Attractive to fixed components
+                        dx = neighbor.x - comp.x
+                        dy = neighbor.y - comp.y
+                        dist = math.sqrt(dx*dx + dy*dy) + 0.1
+                        fx += k_attract * dx / dist
+                        fy += k_attract * dy / dist
+            forces[comp.ref] = (forces[comp.ref][0] + fx, forces[comp.ref][1] + fy)
+
+        # Calculate repulsive forces (all pairs)
+        for i, c1 in enumerate(movable):
+            fx, fy = forces[c1.ref]
+            for c2 in movable[i+1:]:
+                dx = c2.x - c1.x
+                dy = c2.y - c1.y
+                dist_sq = dx*dx + dy*dy
+                dist = math.sqrt(dist_sq)
+
+                # Repulsion only applies if close
+                if dist < min_spacing * 3:
+                    if dist < 0.1:
+                        dx, dy = 1.0, 0.0  # Avoid division by zero
+                        dist = 1.0
+
+                    # Inverse distance repulsion
+                    force = k_repel / (dist_sq + 0.01)
+                    fx -= force * dx / dist
+                    fy -= force * dy / dist
+
+                    # Apply equal and opposite force to c2
+                    c2_fx, c2_fy = forces[c2.ref]
+                    forces[c2.ref] = (c2_fx + force * dx / dist, c2_fy + force * dy / dist)
+
+            forces[c1.ref] = (fx, fy)
+
+        # Apply forces with time step
+        max_move = 0.0
+        for comp in movable:
+            fx, fy = forces[comp.ref]
+            new_x = comp.x + fx * current_dt
+            new_y = comp.y + fy * current_dt
+
+            # Clamp to board bounds
+            new_x = max(board.x_min + margin + comp.effective_width/2,
+                       min(new_x, board.x_max - margin - comp.effective_width/2))
+            new_y = max(board.y_min + margin + comp.effective_height/2,
+                       min(new_y, board.y_max - margin - comp.effective_height/2))
+
+            move = math.sqrt((new_x - comp.x)**2 + (new_y - comp.y)**2)
+            max_move = max(max_move, move)
+
+            comp.x = new_x
+            comp.y = new_y
+
+        # Check convergence
+        current_hpwl = total_hpwl(model)
+        overlap_count = sum(1 for i, c1 in enumerate(movable)
+                           for c2 in movable[i+1:] if c1.overlaps(c2))
+
+        if verbose and iter_num % 10 == 0:
+            print(f"  Iter {iter_num}: HPWL={current_hpwl:.1f}, overlaps={overlap_count}, max_move={max_move:.2f}")
+
+        # Stop if converged (HPWL not improving and no significant movement)
+        if iter_num > 10 and max_move < 0.05:
+            if verbose:
+                print(f"  Converged at iteration {iter_num}")
+            break
+
+    return model
+
+
+__all__ = [
+    "grid_place",
+    "edge_aware_grid_place",
+    "shelf_packing_place",
+    "force_directed_place",
+]
+
+
+def shelf_packing_place(
+    model: BoardModel,
+    margin: float = 5.0,
+    spacing: float = 0.5,
+    sort_by: str = "size",
+) -> BoardModel:
+    """Shelf-packing algorithm for non-overlapping initial placement.
+
+    Uses a shelf-packing strategy where components are sorted by size
+    and placed in rows (shelves) across the board, ensuring no overlaps.
+
+    Args:
+        model: Board model with unplaced components
+        margin: Margin from board edges in mm
+        spacing: Minimum spacing between components in mm
+        sort_by: How to sort components: "size", "connectivity", or "ref"
+
+    Returns:
+        BoardModel with updated component positions
+    """
+    board = model.board
+    connectors = [c for c in model.components if c.component_type == "connector"]
+    interior = [c for c in model.components if c.component_type != "connector"]
+
+    # Place connectors on perimeter first
+    if connectors:
+        _place_connectors_on_perimeter(connectors, board, margin)
+
+    # Sort interior components
+    if sort_by == "size":
+        interior.sort(key=lambda c: (c.effective_width * c.effective_height), reverse=True)
+    elif sort_by == "connectivity":
+        interior.sort(key=lambda c: len(c.nets), reverse=True)
+    else:
+        interior.sort(key=lambda c: c.ref)
+
+    # Determine usable interior area (accounting for connector perimeter zone)
+    connector_zone = max([c.effective_width for c in connectors], default=0) + spacing
+    x_min = board.x_min + margin + connector_zone
+    y_min = board.y_min + margin + connector_zone
+    x_max = board.x_max - margin - connector_zone
+    y_max = board.y_max - margin - connector_zone
+
+    # Shelf packing
+    current_x = x_min
+    current_y = y_min
+    current_shelf_height = 0
+
+    for comp in interior:
+        if comp.is_fixed:
+            continue
+
+        comp_w = comp.effective_width + spacing
+        comp_h = comp.effective_height + spacing
+
+        # Check if component fits in current shelf
+        if current_x + comp_w > x_max:
+            # Start new shelf
+            current_x = x_min
+            current_y += current_shelf_height
+            current_shelf_height = 0
+
+        # Check if new shelf fits in board
+        if current_y + comp_h > y_max:
+            # Reset to top and try to find space
+            current_y = y_min
+            current_x = x_min
+
+        # Place component at current position
+        comp.x = current_x + comp.effective_width / 2.0
+        comp.y = current_y + comp.effective_height / 2.0
+
+        # Advance cursor
+        current_x += comp_w
+        current_shelf_height = max(current_shelf_height, comp_h)
+
+    return model
