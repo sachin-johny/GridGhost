@@ -27,24 +27,24 @@ def print_board_summary(model: BoardModel, title: str = "Board Summary") -> None
 
 def print_cost_breakdown(costs: dict, title: str = "Cost Breakdown") -> None:
     """Print a formatted cost breakdown."""
-    print(f"\n{'─' * 50}")
+    print(f"\n{'-' * 50}")
     print(f"  {title}")
-    print(f"{'─' * 50}")
+    print(f"{'-' * 50}")
     print(f"  HPWL:              {costs['hpwl']:.2f}")
     print(f"  Overlap penalty:   {costs['overlap']:.2f}")
     print(f"  Boundary penalty:  {costs['boundary']:.2f}")
     print(f"  Constraint penalty:{costs['constraint']:.2f}")
-    print(f"  ─────────────────────────────")
+    print(f"  {'-' * 29}")
     print(f"  TOTAL COST:        {costs['total']:.2f}")
     print(f"  Overlaps:          {costs['overlap_count']}")
     print(f"  Out-of-bounds:     {costs['oob_count']}")
-    print(f"{'─' * 50}\n")
+    print(f"{'-' * 50}\n")
 
 
 def print_component_table(model: BoardModel, show_pads: bool = False) -> None:
     """Print a table of all components with their positions."""
     print(f"\n{'Ref':<8} {'Type':<12} {'Layer':<7} {'X':>8} {'Y':>8} {'Rot':>5} {'W':>6} {'H':>6} {'Fixed':>6} {'Nets':>5}")
-    print("─" * 85)
+    print("-" * 85)
     for c in sorted(model.components, key=lambda c: c.ref):
         print(
             f"{c.ref:<8} {c.component_type:<12} {c.layer:<7} "
@@ -57,9 +57,9 @@ def print_component_table(model: BoardModel, show_pads: bool = False) -> None:
 
 def print_cluster_info(clusters: list[list[str]]) -> None:
     """Print clustering results."""
-    print(f"\n{'─' * 50}")
+    print(f"\n{'-' * 50}")
     print(f"  Net Clustering Results ({len(clusters)} clusters)")
-    print(f"{'─' * 50}")
+    print(f"{'-' * 50}")
     for i, cluster in enumerate(clusters):
         print(f"  Cluster {i}: [{', '.join(cluster)}]")
-    print(f"{'─' * 50}\n")
+    print(f"{'-' * 50}\n")

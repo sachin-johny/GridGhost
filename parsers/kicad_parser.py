@@ -285,6 +285,59 @@ def _extract_board_outline(sexp: list) -> BoardOutline:
     )
 
 
+def _infer_board_from_components(components: list[Component]) -> BoardOutline:
+    """Infer a board outline from placed components when Edge.Cuts is absent.
+
+    This keeps the component cluster centered instead of forcing it into the
+    top-left corner of the default 100x100 mm fallback board.
+    """
+    if not components:
+        return BoardOutline(x_min=0.0, y_min=0.0, x_max=100.0, y_max=100.0)
+
+    min_x = float('inf')
+    min_y = float('inf')
+    max_x = float('-inf')
+    max_y = float('-inf')
+
+    for comp in components:
+        half_w = comp.effective_width / 2.0
+        half_h = comp.effective_height / 2.0
+        min_x = min(min_x, comp.x - half_w)
+        min_y = min(min_y, comp.y - half_h)
+        max_x = max(max_x, comp.x + half_w)
+        max_y = max(max_y, comp.y + half_h)
+
+    padding = max(5.0, max(max_x - min_x, max_y - min_y) * 0.15)
+    return BoardOutline(
+        x_min=min_x - padding,
+        y_min=min_y - padding,
+        x_max=max_x + padding,
+        y_max=max_y + padding,
+    )
+
+
+def _needs_inferred_board(board_outline: BoardOutline, components: list[Component]) -> bool:
+    """Return True when the parsed outline is just the default fallback board."""
+    if not components:
+        return False
+
+    is_default_board = (
+        math.isclose(board_outline.x_min, 0.0)
+        and math.isclose(board_outline.y_min, 0.0)
+        and math.isclose(board_outline.x_max, 100.0)
+        and math.isclose(board_outline.y_max, 100.0)
+    )
+    if not is_default_board:
+        return False
+
+    for comp in components:
+        bx1, by1, bx2, by2 = comp.bbox
+        if bx1 < board_outline.x_min or by1 < board_outline.y_min or bx2 > board_outline.x_max or by2 > board_outline.y_max:
+            return True
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Main parser
 # ---------------------------------------------------------------------------
@@ -306,11 +359,12 @@ class KiCadParser:
         parsed = parse_sexp(tokens)
         # The root is the `kicad_pcb` expression
         self._sexp = parsed[0] if parsed else parsed
+        sexp = self._sexp or []
 
         # Build net ID → name mapping from top-level net definitions
         self._build_net_id_map()
 
-        board_outline = _extract_board_outline(self._sexp)
+        board_outline = _extract_board_outline(sexp)
         components = self._extract_components()
         nets = self._extract_nets()
 
@@ -323,6 +377,9 @@ class KiCadParser:
                     comp_nets.add(pad.net)
             comp.nets = sorted(comp_nets)
 
+        if _needs_inferred_board(board_outline, components):
+            board_outline = _infer_board_from_components(components)
+
         model = BoardModel(
             board=board_outline,
             components=components,
@@ -333,7 +390,8 @@ class KiCadParser:
 
     def _build_net_id_map(self) -> None:
         """Build mapping from net IDs to net names from top-level (net <id> <name>) definitions."""
-        for net_expr in find_all(self._sexp, "net"):
+        sexp = self._sexp or []
+        for net_expr in find_all(sexp, "net"):
             if len(net_expr) >= 3:
                 net_id = net_expr[1]
                 net_name = net_expr[2]
@@ -342,12 +400,13 @@ class KiCadParser:
     def _extract_components(self) -> list[Component]:
         """Extract all footprints as Components."""
         components = []
+        sexp = self._sexp or []
 
-        for fp_expr in find_all(self._sexp, "footprint"):
+        for fp_expr in find_all(sexp, "footprint"):
             # Also handle "module" for older KiCad formats
             self._parse_footprint(fp_expr, components)
 
-        for fp_expr in find_all(self._sexp, "module"):
+        for fp_expr in find_all(sexp, "module"):
             self._parse_footprint(fp_expr, components)
 
         return components
@@ -421,7 +480,7 @@ class KiCadParser:
         )
         components.append(comp)
 
-    def _resolve_net_name(self, net_expr: list) -> Optional[str]:
+    def _resolve_net_name(self, net_expr: Optional[list]) -> Optional[str]:
         """Resolve a pad's net expression to a net name.
 
         Handles two formats:
@@ -474,8 +533,9 @@ class KiCadParser:
     def _extract_nets(self) -> list[Net]:
         """Extract net definitions."""
         nets = []
+        sexp = self._sexp or []
         # From (net <id> <name>) in the nets section
-        for net_expr in find_all(self._sexp, "net"):
+        for net_expr in find_all(sexp, "net"):
             if len(net_expr) >= 3 and isinstance(net_expr[1], str) and isinstance(net_expr[2], str):
                 net_name = net_expr[2]
                 # Collect pins from all footprints
@@ -483,7 +543,7 @@ class KiCadParser:
                 for comp_ref, pad_name, pad_net in self._collect_net_pins():
                     if pad_net == net_name:
                         pins.append((comp_ref, pad_name))
-                nets.append(Net(name=net_name, pins=pins))
+                nets.append(Net(net_name, pins))
 
         # If no net section found, build nets from pad net assignments
         if not nets:
@@ -492,7 +552,7 @@ class KiCadParser:
                 if pad_net:
                     net_dict.setdefault(pad_net, []).append((comp_ref, pad_name))
             for name, pins in net_dict.items():
-                nets.append(Net(name=name, pins=pins))
+                nets.append(Net(name, pins))
 
         return nets
 
@@ -500,8 +560,9 @@ class KiCadParser:
         """Collect all (comp_ref, pad_name, net_name) tuples from all footprints."""
         result = []
         seen_refs = set()
+        sexp = self._sexp or []
 
-        for fp_expr in find_all(self._sexp, "footprint") + find_all(self._sexp, "module"):
+        for fp_expr in find_all(sexp, "footprint") + find_all(sexp, "module"):
             # Get reference
             ref = ""
             for prop in find_all(fp_expr, "property"):

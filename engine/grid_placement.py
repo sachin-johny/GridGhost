@@ -171,8 +171,10 @@ def edge_aware_grid_place(
     # Then move connectors to board edges
     board = model.board
     for comp in model.components:
-        if comp.component_type == "connector" and not comp.is_fixed:
-            _move_to_nearest_edge(comp, board, margin)
+        if comp.component_type == "connector":
+            if not comp.is_fixed:
+                _move_to_nearest_edge(comp, board, margin)
+            _orient_connector_outward(comp, board)
 
     return model
 
@@ -204,3 +206,32 @@ def _move_to_nearest_edge(comp: Component, board, margin: float) -> None:
             comp.y = board.y_min + edge_offset
         comp.x = max(board.x_min + margin + comp.effective_width / 2.0,
                      min(comp.x, board.x_max - margin - comp.effective_width / 2.0))
+
+
+def _orient_connector_outward(comp: Component, board) -> None:
+    """Rotate a connector so its front faces outward from the nearest edge.
+
+    This is a simple heuristic for designs without explicit connector
+    orientation metadata.
+    """
+    left_dist = abs(comp.x - board.x_min)
+    right_dist = abs(board.x_max - comp.x)
+    top_dist = abs(comp.y - board.y_min)
+    bottom_dist = abs(board.y_max - comp.y)
+
+    nearest = min(
+        (left_dist, "left"),
+        (right_dist, "right"),
+        (top_dist, "top"),
+        (bottom_dist, "bottom"),
+        key=lambda item: item[0],
+    )[1]
+
+    if nearest == "left":
+        comp.rotation = 90.0
+    elif nearest == "right":
+        comp.rotation = 270.0
+    elif nearest == "top":
+        comp.rotation = 180.0
+    else:
+        comp.rotation = 0.0

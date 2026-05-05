@@ -73,7 +73,7 @@ def cmd_place(args) -> None:
     profile = get_profile(args.profile)
     print(f"  Profile: {profile.display_name}")
     print(f"  Description: {profile.description}")
-    print(f"  Cost weights: α={profile.alpha}, β={profile.beta}, γ={profile.gamma}, δ={profile.delta}")
+    print(f"  Cost weights: alpha={profile.alpha}, beta={profile.beta}, gamma={profile.gamma}, delta={profile.delta}")
     if profile.active_rules():
         print("  Active rules:")
         for rule in profile.active_rules():
@@ -91,9 +91,13 @@ def cmd_place(args) -> None:
 
     # Step 5: Grid placement
     print("Step 4: Running grid placement...")
-    if args.edge_aware:
+    has_connectors = any(c.component_type == "connector" for c in model.components if not c.is_fixed)
+    if args.edge_aware or has_connectors:
         edge_aware_grid_place(model, margin=args.margin, spacing_factor=args.spacing)
-        print("  Using edge-aware placement (connectors near edges)")
+        if args.edge_aware:
+            print("  Using edge-aware placement (connectors near edges)")
+        else:
+            print("  Using edge-aware placement automatically for connector parts")
     else:
         grid_place(model, margin=args.margin, spacing_factor=args.spacing)
     print_board_summary(model, "After Grid Placement")
