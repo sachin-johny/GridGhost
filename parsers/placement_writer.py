@@ -1,11 +1,12 @@
 """Placement application layer — writes optimized positions back to .kicad_pcb.
 
-Maps optimized coordinates → KiCad nanometer units and updates the PCB file.
+Maps optimized coordinates back to the KiCad PCB file format.
 All changes are applied in one pass.
 
 Coordinate system:
-- KiCad uses nanometers (int) internally
-- Convert: kicad_units = int(mm_value * 1e6)
+- KiCad stores coordinates in millimeters (floating-point) in the file
+- Internal representation is already in millimeters
+- Precision: Round to 6 decimal places (1 micrometer precision)
 """
 
 from __future__ import annotations
@@ -18,14 +19,16 @@ from typing import Optional
 from models.board_model import BoardModel, Component
 
 
-def mm_to_kicad_nm(mm: float) -> int:
-    """Convert millimeters to KiCad nanometer units."""
-    return int(round(mm * 1e6))
-
-
-def kicad_nm_to_mm(nm: int) -> float:
-    """Convert KiCad nanometer units to millimeters."""
-    return nm / 1e6
+def format_kicad_coord(mm: float) -> str:
+    """Format a coordinate value for KiCad PCB file (millimeters as float).
+    
+    KiCad stores coordinates as floating-point millimeters.
+    Round to 6 decimal places for micrometer precision.
+    """
+    # Round to 6 decimal places and convert to string
+    # Remove trailing zeros after decimal point
+    formatted = f"{round(mm, 6):.6f}".rstrip('0').rstrip('.')
+    return formatted
 
 
 def apply_placement(
@@ -165,8 +168,8 @@ def _extract_reference(fp_block: str) -> Optional[str]:
 
 def _update_position(fp_block: str, comp: Component) -> str:
     """Update the (at x y [rotation]) field in a footprint block."""
-    x_nm = mm_to_kicad_nm(comp.x)
-    y_nm = mm_to_kicad_nm(comp.y)
+    x_str = format_kicad_coord(comp.x)
+    y_str = format_kicad_coord(comp.y)
 
     # Find and replace the (at ...) at the footprint level (not pad level)
     # The footprint-level (at ...) comes before any (pad ...) expressions
@@ -183,9 +186,9 @@ def _update_position(fp_block: str, comp: Component) -> str:
 
     # Build new (at ...) expression
     if comp.rotation != 0.0:
-        new_at = f"(at {x_nm} {y_nm} {int(comp.rotation)})"
+        new_at = f"(at {x_str} {y_str} {int(comp.rotation)})"
     else:
-        new_at = f"(at {x_nm} {y_nm})"
+        new_at = f"(at {x_str} {y_str})"
 
     # Replace the (at ...) in the header
     # Match the footprint-level at expression
