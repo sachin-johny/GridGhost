@@ -279,7 +279,7 @@ def main():
     )
     p_place.add_argument("-m", "--margin", type=float, default=5.0, help="Board edge margin in mm (default: 5.0)")
     p_place.add_argument("-s", "--spacing", type=float, default=1.3, help="Component spacing factor (default: 1.3)")
-    p_place.add_argument("-g", "--grid", type=float, default=0.1, help="Legalization grid in mm (default: 0.1)")
+    p_place.add_argument("-g", "--grid", type=float, default=1.8, help="Legalization grid in mm (default: 1.8)")
     p_place.add_argument("--edge-aware", action="store_true", help="Use edge-aware placement for connectors")
     p_place.add_argument("--interactive", action="store_true", help="Interactive profile tuning")
     p_place.add_argument("--optimize", action="store_true", help="Run Phase 2 optimizer after grid placement")
