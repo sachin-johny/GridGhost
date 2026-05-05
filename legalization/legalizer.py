@@ -21,8 +21,8 @@ from models.board_model import BoardModel, Component, BoardOutline
 def legalize(
     model: BoardModel,
     grid_mm: float = 0.1,
-    max_iterations: int = 100,
-    push_strength: float = 0.5,
+    max_iterations: int = 300,
+    push_strength: float = 1,
     verbose: bool = False,
 ) -> BoardModel:
     """Full legalization pipeline.
@@ -30,8 +30,8 @@ def legalize(
     Args:
         model: Board model with optimized but potentially illegal positions
         grid_mm: Grid size in mm (0.1mm or 0.05mm typical for KiCad)
-        max_iterations: Max iterations for overlap resolution
-        push_strength: How far to push overlapping components (fraction of overlap)
+        max_iterations: Max iterations for overlap resolution (300 for dense designs)
+        push_strength: How far to push overlapping components (fraction of overlap, 0.8 is aggressive)
         verbose: Print progress information
 
     Returns:
@@ -98,10 +98,15 @@ def _resolve_overlaps(
 
     Uses a force-directed push-apart strategy: for each overlapping pair,
     compute the overlap direction and push both components away from each other.
+    Increases push_strength adaptively if progress stalls.
     """
+    prev_overlap_count = float("inf")
+    stall_iterations = 0
+    adaptive_strength = push_strength
+
     for iteration in range(max_iterations):
         overlap_count = 0
-        components = [c for c in model.components if not c.is_fixed]
+        components = list(model.components)
 
         # Sort by position for deterministic resolution
         components.sort(key=lambda c: (c.x, c.y))
@@ -111,8 +116,26 @@ def _resolve_overlaps(
                 if not c1.overlaps(c2):
                     continue
 
+                # Cannot resolve if both are fixed.
+                if c1.is_fixed and c2.is_fixed:
+                    continue
+
                 overlap_count += 1
-                _push_apart(c1, c2, push_strength, grid_mm)
+                _push_apart(c1, c2, adaptive_strength, grid_mm)
+
+        # Keep everything inside board after each sweep.
+        _enforce_boundary(model)
+
+        # Detect stalling and increase push strength
+        if overlap_count >= prev_overlap_count:
+            stall_iterations += 1
+            if stall_iterations >= 10:
+                adaptive_strength = min(1.5, adaptive_strength * 1.2)
+                stall_iterations = 0
+        else:
+            stall_iterations = 0
+
+        prev_overlap_count = overlap_count
 
         if overlap_count == 0:
             if verbose:
@@ -128,7 +151,7 @@ def _push_apart(c1: Component, c2: Component, strength: float, grid_mm: float) -
     """Push two overlapping components apart along the axis of minimum separation.
 
     The direction is chosen to minimize displacement (push along the axis
-    where the overlap is smallest).
+    where the overlap is smallest). Ensures minimum push distance to guarantee progress.
     """
     # Compute overlap on each axis
     ax1, ay1, ax2, ay2 = c1.bbox
@@ -141,12 +164,17 @@ def _push_apart(c1: Component, c2: Component, strength: float, grid_mm: float) -
         return  # No actual overlap
 
     # Push along the axis with less overlap
-    push_mm = grid_mm  # Minimum push distance = one grid unit
+    # Ensure minimum push distance = 1.5x grid unit to guarantee progress
+    push_mm = max(grid_mm * 1.5, 0.15)
 
     if overlap_x <= overlap_y:
         # Push along X axis
         push_dist = max(overlap_x * strength, push_mm)
-        if c1.x <= c2.x:
+        if c1.is_fixed and not c2.is_fixed:
+            c2.x += push_dist if c2.x >= c1.x else -push_dist
+        elif c2.is_fixed and not c1.is_fixed:
+            c1.x += push_dist if c1.x >= c2.x else -push_dist
+        elif c1.x <= c2.x:
             c1.x -= push_dist / 2.0
             c2.x += push_dist / 2.0
         else:
@@ -155,7 +183,11 @@ def _push_apart(c1: Component, c2: Component, strength: float, grid_mm: float) -
     else:
         # Push along Y axis
         push_dist = max(overlap_y * strength, push_mm)
-        if c1.y <= c2.y:
+        if c1.is_fixed and not c2.is_fixed:
+            c2.y += push_dist if c2.y >= c1.y else -push_dist
+        elif c2.is_fixed and not c1.is_fixed:
+            c1.y += push_dist if c1.y >= c2.y else -push_dist
+        elif c1.y <= c2.y:
             c1.y -= push_dist / 2.0
             c2.y += push_dist / 2.0
         else:

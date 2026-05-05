@@ -10,6 +10,7 @@ from typing import Optional
 
 from models.board_model import BoardModel, Component
 from engine.cost_function import CostFunction
+from engine.cost_function import count_overlaps, count_out_of_bounds
 
 
 def greedy_swap_optimize(model: BoardModel, cost_fn: CostFunction, max_iters: int = 5) -> BoardModel:
@@ -28,6 +29,8 @@ def greedy_swap_optimize(model: BoardModel, cost_fn: CostFunction, max_iters: in
         return model
 
     best_cost = cost_fn.cost(model)
+    best_overlap_count = count_overlaps(model)
+    best_oob_count = count_out_of_bounds(model)
 
     for it in range(max_iters):
         improved = False
@@ -46,9 +49,17 @@ def greedy_swap_optimize(model: BoardModel, cost_fn: CostFunction, max_iters: in
                 a.x, a.y, a.rotation, b.x, b.y, b.rotation = bx, by, br, ax, ay, ar
 
                 new_cost = cost_fn.cost(model)
+                new_overlap_count = count_overlaps(model)
+                new_oob_count = count_out_of_bounds(model)
 
-                if new_cost < best_cost:
+                if (
+                    new_cost < best_cost
+                    and new_overlap_count <= best_overlap_count
+                    and new_oob_count <= best_oob_count
+                ):
                     best_cost = new_cost
+                    best_overlap_count = new_overlap_count
+                    best_oob_count = new_oob_count
                     improved = True
                 else:
                     # Revert

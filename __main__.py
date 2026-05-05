@@ -91,7 +91,7 @@ def cmd_place(args) -> None:
 
     # Step 5: Grid placement
     print("Step 4: Running grid placement...")
-    has_connectors = any(c.component_type == "connector" for c in model.components if not c.is_fixed)
+    has_connectors = any(c.component_type == "connector" for c in model.components)
     if args.edge_aware or has_connectors:
         edge_aware_grid_place(model, margin=args.margin, spacing_factor=args.spacing)
         if args.edge_aware:

@@ -460,9 +460,10 @@ class KiCadParser:
         # Bounding box from geometry
         width, height = _extract_fp_geometry(fp_expr)
 
-        # Determine if fixed (connectors, etc.)
+        # Determine if fixed. Keep connectors movable so the auto-placer can
+        # move them to the board perimeter during edge-aware placement.
         comp_type = _infer_component_type(ref, lib_id, value)
-        is_fixed = comp_type in ("connector",)  # Fix connectors by default
+        is_fixed = False
 
         comp = Component(
             ref=ref,
