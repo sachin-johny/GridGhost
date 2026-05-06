@@ -7,6 +7,7 @@ and the optimization engine. All coordinates are in millimeters.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
@@ -49,32 +50,44 @@ class Component:
     is_fixed: bool = False    # If True, position should not be changed by optimizer
     component_type: str = "generic"  # "ic", "capacitor", "resistor", "connector", "crystal", "generic"
 
+    # Cached trig values (set by _update_trig)
+    _cos_a: float = field(default=1.0, repr=False, compare=False)
+    _sin_a: float = field(default=0.0, repr=False, compare=False)
+
+    def __post_init__(self):
+        self._update_trig()
+
+    def _update_trig(self):
+        rad = math.radians(self.rotation)
+        self._cos_a = math.cos(rad)
+        self._sin_a = math.sin(rad)
+
+    def set_rotation(self, angle: float):
+        self.rotation = angle % 360.0
+        self._update_trig()
+
+    @property
+    def _is_rotated_90(self) -> bool:
+        return int(self.rotation) % 180 == 90
+
     @property
     def bbox(self) -> tuple[float, float, float, float]:
-        """Return bounding box (x_min, y_min, x_max, y_max) including courtyard.
-
-        Uses bbox_offset to account for footprints whose origin is not
-        at the center of their geometry (common for connectors, displays, etc.).
-        """
-        cx = self.x + self.bbox_offset_x
-        cy = self.y + self.bbox_offset_y
-        half_w = (self.width / 2.0) + self.courtyard_margin
-        half_h = (self.height / 2.0) + self.courtyard_margin
-        return (
-            cx - half_w,
-            cy - half_h,
-            cx + half_w,
-            cy + half_h,
-        )
+        half_w = self.effective_width / 2.0
+        half_h = self.effective_height / 2.0
+        cx = self.x + self.bbox_offset_x * self._cos_a - self.bbox_offset_y * self._sin_a
+        cy = self.y + self.bbox_offset_x * self._sin_a + self.bbox_offset_y * self._cos_a
+        return (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
 
     @property
     def effective_width(self) -> float:
-        """Width including courtyard margin."""
+        if self._is_rotated_90:
+            return self.height + 2 * self.courtyard_margin
         return self.width + 2 * self.courtyard_margin
 
     @property
     def effective_height(self) -> float:
-        """Height including courtyard margin."""
+        if self._is_rotated_90:
+            return self.width + 2 * self.courtyard_margin
         return self.height + 2 * self.courtyard_margin
 
     def overlaps(self, other: Component) -> bool:

@@ -186,7 +186,7 @@ def _update_position(fp_block: str, comp: Component) -> str:
 
     # Build new (at ...) expression
     if comp.rotation != 0.0:
-        new_at = f"(at {x_str} {y_str} {int(comp.rotation)})"
+        new_at = f"(at {x_str} {y_str} {round(comp.rotation)})"
     else:
         new_at = f"(at {x_str} {y_str})"
 

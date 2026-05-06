@@ -1,0 +1,325 @@
+"""Incremental cost computation for Simulated Annealing.
+
+Provides O(k) incremental updates instead of O(n^2) full recomputation,
+essential for SA performance where thousands of moves are evaluated per second.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+from bisect import bisect_left, insort
+from itertools import combinations
+
+from models.board_model import BoardModel
+
+OVERLAP_WEIGHT = 50.0
+BOUNDARY_WEIGHT = 50.0
+
+_POWER_PREFIXES = (
+    'GND', 'AGND', 'DGND', 'PGND', 'SGND',
+    'VSS', 'VCC', 'VDD', 'VEE', 'VBAT', 'VBUS',
+)
+_POWER_VOLTAGE_RE = re.compile(r'^[+\-]\d[\d.]*V', re.IGNORECASE)
+
+
+def _is_power_net(name: str) -> bool:
+    n = name.lstrip('/').upper()
+    return any(n.startswith(p) for p in _POWER_PREFIXES) or bool(_POWER_VOLTAGE_RE.match(n))
+
+
+def _pair_key(i: int, j: int) -> tuple[int, int]:
+    return (i, j) if i < j else (j, i)
+
+
+class CostState:
+    """Incremental cost state for SA moves.
+
+    Maintains per-net HPWL, per-pair overlap penalties, and per-component
+    boundary penalties. Supports O(k) incremental updates and O(k) snapshot/restore.
+    """
+
+    def __init__(self, model: BoardModel, power_net_prefixes=None):
+        self.model = model
+        self._comps = model.components
+        self._n = len(self._comps)
+
+        # Build net -> set of component indices
+        self._net_indices: dict[str, list[int]] = {}
+        self._power_nets: set[str] = set()
+        self._comp_nets: list[set[str]] = [set() for _ in range(self._n)]
+
+        for net in model.nets:
+            if _is_power_net(net.name):
+                self._power_nets.add(net.name)
+            indices = []
+            for ref, _pad_name in net.pins:
+                for idx, comp in enumerate(self._comps):
+                    if comp.ref == ref:
+                        indices.append(idx)
+                        self._comp_nets[idx].add(net.name)
+                        break
+            if len(indices) >= 2:
+                self._net_indices[net.name] = indices
+
+        # Per-net HPWL cache
+        self._net_hpwl: dict[str, float] = {}
+        # Per-pair overlap penalty cache
+        self._pair_overlaps: dict[tuple[int, int], float] = {}
+        # Per-component boundary penalty
+        self._comp_boundary: list[float] = [0.0] * self._n
+        # Sorted xmin index for fast overlap neighbor lookup
+        self._xmin_items: list[tuple[float, int]] = []
+
+        # Penalty scaling (annealer controls this)
+        self._penalty_scale = 1.0
+
+        self._compute_all()
+
+    # ------------------------------------------------------------------
+    # Full computation
+    # ------------------------------------------------------------------
+
+    def _compute_all(self):
+        self._net_hpwl.clear()
+        self._pair_overlaps.clear()
+        self._xmin_items.clear()
+
+        # HPWL per net (skip power nets)
+        for net_name, indices in self._net_indices.items():
+            if net_name in self._power_nets:
+                continue
+            self._net_hpwl[net_name] = self._compute_net_hpwl(net_name, indices)
+
+        # Overlaps — build sorted xmin index + compute all pairs
+        for i in range(self._n):
+            bbox = self._comps[i].bbox
+            self._xmin_items.append((bbox[0], i))
+
+        self._xmin_items.sort()
+
+        for i in range(self._n):
+            bbox_i = self._comps[i].bbox
+            for j in range(i + 1, self._n):
+                bbox_j = self._comps[j].bbox
+                penalty = self._compute_overlap_penalty(bbox_i, bbox_j)
+                if penalty > 0:
+                    self._pair_overlaps[(i, j)] = penalty
+
+        # Boundary
+        board = self.model.board
+        for i in range(self._n):
+            self._comp_boundary[i] = self._compute_boundary(self._comps[i].bbox, board)
+
+    # ------------------------------------------------------------------
+    # Per-item computation helpers
+    # ------------------------------------------------------------------
+
+    def _compute_net_hpwl(self, net_name: str, indices: list[int]) -> float:
+        comp_map = {idx: self._comps[idx] for idx in indices}
+        pins = []
+        net_obj = self.model.get_net(net_name)
+        if not net_obj:
+            return 0.0
+
+        for ref, pad_name in net_obj.pins:
+            comp = None
+            comp_idx = None
+            for idx in indices:
+                if self._comps[idx].ref == ref:
+                    comp = self._comps[idx]
+                    comp_idx = idx
+                    break
+            if not comp:
+                continue
+            for pad in comp.pads:
+                if pad.pad_name == pad_name:
+                    abs_x, abs_y = pad.absolute_pos(comp.x, comp.y, comp.rotation)
+                    pins.append((abs_x, abs_y))
+                    break
+            else:
+                pins.append((comp.x, comp.y))
+
+        if len(pins) < 2:
+            return 0.0
+
+        xs = [p[0] for p in pins]
+        ys = [p[1] for p in pins]
+        return (max(xs) - min(xs)) + (max(ys) - min(ys))
+
+    @staticmethod
+    def _compute_overlap_penalty(
+        bbox_a: tuple[float, float, float, float],
+        bbox_b: tuple[float, float, float, float],
+    ) -> float:
+        ox1 = max(bbox_a[0], bbox_b[0])
+        oy1 = max(bbox_a[1], bbox_b[1])
+        ox2 = min(bbox_a[2], bbox_b[2])
+        oy2 = min(bbox_a[3], bbox_b[3])
+        if ox2 <= ox1 or oy2 <= oy1:
+            return 0.0
+        return (ox2 - ox1) * (oy2 - oy1)
+
+    @staticmethod
+    def _compute_boundary(
+        bbox: tuple[float, float, float, float],
+        board,
+    ) -> float:
+        left = max(0.0, board.x_min - bbox[0])
+        right = max(0.0, bbox[2] - board.x_max)
+        top = max(0.0, board.y_min - bbox[1])
+        bottom = max(0.0, bbox[3] - board.y_max)
+        overflow = left + right + top + bottom
+        return overflow ** 2
+
+    # ------------------------------------------------------------------
+    # Incremental update
+    # ------------------------------------------------------------------
+
+    def incremental_update(self, moved_indices: set[int]) -> float:
+        """Recompute costs for moved components. Returns new total_cost."""
+        # Update xmin index
+        for i in moved_indices:
+            bbox = self._comps[i].bbox
+            # Remove old entry
+            self._xmin_items = [(x, idx) for x, idx in self._xmin_items if idx != i]
+            insort(self._xmin_items, (bbox[0], i))
+
+        # Recompute HPWL for affected nets
+        affected_nets: set[str] = set()
+        for i in moved_indices:
+            affected_nets.update(self._comp_nets[i])
+
+        for net_name in affected_nets:
+            if net_name in self._power_nets:
+                continue
+            indices = self._net_indices.get(net_name)
+            if indices:
+                self._net_hpwl[net_name] = self._compute_net_hpwl(net_name, indices)
+
+        # Recompute overlaps involving moved components
+        # Remove old overlap entries
+        keys_to_remove = [k for k in self._pair_overlaps if k[0] in moved_indices or k[1] in moved_indices]
+        for k in keys_to_remove:
+            del self._pair_overlaps[k]
+
+        # Scan nearby using sorted xmin
+        board_xmax = self.model.board.x_max
+        for i in moved_indices:
+            bbox_i = self._comps[i].bbox
+            # Use binary search: find all components with xmin < bbox_i.xmax
+            pos = bisect_left(self._xmin_items, (bbox_i[2],))
+            for k in range(pos):
+                _, j = self._xmin_items[k]
+                if j == i:
+                    continue
+                pk = _pair_key(i, j)
+                if pk in self._pair_overlaps:
+                    continue
+                bbox_j = self._comps[j].bbox
+                # Quick reject
+                if bbox_j[0] >= bbox_i[2] or bbox_i[0] >= bbox_j[2]:
+                    continue
+                penalty = self._compute_overlap_penalty(bbox_i, bbox_j)
+                if penalty > 0:
+                    self._pair_overlaps[pk] = penalty
+
+        # Boundary
+        board = self.model.board
+        for i in moved_indices:
+            self._comp_boundary[i] = self._compute_boundary(self._comps[i].bbox, board)
+
+        return self.total_cost
+
+    # ------------------------------------------------------------------
+    # Snapshot / Restore
+    # ------------------------------------------------------------------
+
+    def snapshot(self, moved_indices: set[int]) -> dict:
+        """Save state for the given indices so we can restore on rejection."""
+        saved_net_hpwl = {
+            net_name: self._net_hpwl[net_name]
+            for net_name in self._comp_nets_moved(moved_indices)
+            if net_name in self._net_hpwl
+        }
+        saved_pair_overlaps = {
+            k: v for k, v in self._pair_overlaps.items()
+            if k[0] in moved_indices or k[1] in moved_indices
+        }
+        saved_boundary = {i: self._comp_boundary[i] for i in moved_indices}
+        saved_bbox = {i: self._comps[i].bbox for i in moved_indices}
+
+        return {
+            'hpwl': self._hpwl_sum(),
+            'overlap_penalty': self._overlap_sum(),
+            'boundary_penalty': self._boundary_sum(),
+            'net_hpwl': saved_net_hpwl,
+            'pair_overlaps': saved_pair_overlaps,
+            'comp_boundary': saved_boundary,
+            'saved_bbox': saved_bbox,
+        }
+
+    def restore(self, snap: dict):
+        """Restore from a snapshot taken before a rejected move."""
+        # Restore net HPWL
+        for net_name, hpwl in snap['net_hpwl'].items():
+            if net_name in self._net_hpwl or net_name in self._net_indices:
+                self._net_hpwl[net_name] = hpwl
+
+        # Restore pair overlaps: remove all current involving moved, add saved
+        moved_indices = set(snap['saved_bbox'].keys())
+        keys_to_remove = [k for k in self._pair_overlaps if k[0] in moved_indices or k[1] in moved_indices]
+        for k in keys_to_remove:
+            del self._pair_overlaps[k]
+        self._pair_overlaps.update(snap['pair_overlaps'])
+
+        # Restore boundary
+        for i, val in snap['comp_boundary'].items():
+            self._comp_boundary[i] = val
+
+        # Restore xmin index
+        for i, bbox in snap['saved_bbox'].items():
+            self._xmin_items = [(x, idx) for x, idx in self._xmin_items if idx != i]
+            insort(self._xmin_items, (bbox[0], i))
+
+    def _comp_nets_moved(self, moved_indices: set[int]) -> set[str]:
+        nets: set[str] = set()
+        for i in moved_indices:
+            nets.update(self._comp_nets[i])
+        return nets
+
+    # ------------------------------------------------------------------
+    # Cost views
+    # ------------------------------------------------------------------
+
+    def _hpwl_sum(self) -> float:
+        return sum(self._net_hpwl.values())
+
+    def _overlap_sum(self) -> float:
+        return sum(self._pair_overlaps.values())
+
+    def _boundary_sum(self) -> float:
+        return sum(self._comp_boundary)
+
+    @property
+    def total_cost(self) -> float:
+        hpwl = self._hpwl_sum()
+        overlap = OVERLAP_WEIGHT * self._overlap_sum() * self._penalty_scale
+        boundary = BOUNDARY_WEIGHT * self._boundary_sum() * self._penalty_scale
+        return hpwl + overlap + boundary
+
+    @property
+    def normalized_cost(self) -> float:
+        """Unscaled cost for best-solution tracking."""
+        return self._hpwl_sum() + OVERLAP_WEIGHT * self._overlap_sum() + BOUNDARY_WEIGHT * self._boundary_sum()
+
+    @property
+    def hpwl(self) -> float:
+        return self._hpwl_sum()
+
+    @property
+    def overlap_count(self) -> int:
+        return len(self._pair_overlaps)
+
+    def update_penalty_scale(self, scale: float):
+        self._penalty_scale = scale

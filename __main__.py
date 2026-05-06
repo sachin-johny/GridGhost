@@ -21,6 +21,7 @@ from parsers.placement_writer import apply_placement, export_positions_json
 from engine.net_clustering import cluster_components, compute_seed_positions
 from engine.grid_placement import grid_place, force_directed_place
 from engine.cost_function import CostFunction, total_hpwl, count_overlaps, count_out_of_bounds
+from engine.annealer import run_sa, SAConfig
 from legalization.legalizer import legalize
 from profiles.board_profiles import get_profile, list_profiles, BoardProfile
 from utils.display import (
@@ -29,14 +30,30 @@ from utils.display import (
     print_component_table,
     print_cluster_info,
 )
+from config import load_config, Config
 
 ALGORITHMS = ("force-directed", "grid")
 
 
+def _apply_config_to_globals(cfg: Config) -> None:
+    """Push config values into module-level constants used by cost_state."""
+    global _OVERLAP_WEIGHT_BACKUP, _BOUNDARY_WEIGHT_BACKUP
+    import engine.cost_state as cs
+    _OVERLAP_WEIGHT_BACKUP = cs.OVERLAP_WEIGHT
+    _BOUNDARY_WEIGHT_BACKUP = cs.BOUNDARY_WEIGHT
+    cs.OVERLAP_WEIGHT = cfg.cost.overlap_weight
+    cs.BOUNDARY_WEIGHT = cfg.cost.boundary_weight
+
+
+_OVERLAP_WEIGHT_BACKUP = 50.0
+_BOUNDARY_WEIGHT_BACKUP = 50.0
+
+
 def cmd_extract(args) -> None:
     """Extract board data from .kicad_pcb to JSON."""
+    cfg = load_config(args.config)
     print(f"Loading: {args.input}")
-    parser = KiCadParser(args.input)
+    parser = KiCadParser(args.input, bbox_margin=cfg.parser.bbox_margin)
     model = parser.parse()
 
     print_board_summary(model, "Extraction Results")
@@ -49,13 +66,16 @@ def cmd_extract(args) -> None:
 
 def cmd_place(args) -> None:
     """Run the full placement pipeline."""
+    cfg = load_config(args.config)
+    _apply_config_to_globals(cfg)
+
     print(f"\n{'#' * 60}")
     print(f"  KiCad Smart Auto-Placer")
     print(f"{'#' * 60}\n")
 
     # Step 1: Extract
     print("Step 1: Extracting board data...")
-    parser = KiCadParser(args.input, bbox_margin=0.5)
+    parser = KiCadParser(args.input, bbox_margin=cfg.parser.bbox_margin)
     model = parser.parse()
     print_board_summary(model, "After Extraction")
     print_component_table(model)
@@ -83,18 +103,48 @@ def cmd_place(args) -> None:
     # Step 5: Placement algorithm
     print("Step 4: Running placement algorithm...")
     algorithm = args.algorithm
+    pcfg = cfg.placement
 
     if algorithm == "force-directed":
         print("  Algorithm: force-directed (attractive + repulsive forces)")
-        force_directed_place(model, margin=args.margin)
+        force_directed_place(
+            model,
+            margin=args.margin if args.margin is not None else pcfg.margin,
+            iterations=pcfg.force_iterations,
+            k_attract=pcfg.force_k_attract,
+            k_repel=pcfg.force_k_repel,
+            min_spacing=pcfg.force_min_spacing,
+            dt=pcfg.force_dt,
+        )
     else:
         print("  Algorithm: grid (cluster-based seed placement)")
-        grid_place(model, margin=args.margin)
+        grid_place(
+            model,
+            margin=args.margin if args.margin is not None else pcfg.margin,
+            spacing_factor=pcfg.spacing_factor,
+        )
 
     print_board_summary(model, "After Placement")
 
+    # Step 5.5: SA optimization (if enabled)
+    if not args.no_sa:
+        print("Step 5: Running SA optimization...")
+        sa_config = SAConfig(
+            max_iterations=args.sa_iterations,
+            reheat_count=args.sa_reheat,
+            verbose=True,
+        )
+        sa_result = run_sa(model, config=sa_config, verbose=True)
+        print(f"  SA: cost {sa_result['initial_cost']:.1f} → {sa_result['final_cost']:.1f} "
+              f"(Δ={sa_result['improvement']:.1f})")
+        print(f"  SA: HPWL {sa_result['initial_hpwl']:.1f} → {sa_result['final_hpwl']:.1f}")
+        print(f"  SA: overlaps={sa_result['overlap_count']}")
+        print_board_summary(model, "After SA Optimization")
+    else:
+        print("Step 5: SA optimization disabled (--no-sa)")
+
     # Step 6: Cost evaluation
-    print("Step 5: Evaluating placement cost...")
+    print("Step 6: Evaluating placement cost...")
     cost_fn = CostFunction(
         alpha=profile.alpha,
         beta=profile.beta,
@@ -105,8 +155,10 @@ def cmd_place(args) -> None:
     print_cost_breakdown(costs, "Placement Cost (Pre-Legalization)")
 
     # Step 7: Legalization
-    print("Step 6: Running legalization...")
-    legalize(model, grid_mm=0.1, verbose=True)
+    print("Step 7: Running legalization...")
+    lcfg = cfg.legalization
+    legalize(model, grid_mm=lcfg.grid_mm, max_iterations=lcfg.max_iterations,
+             push_strength=lcfg.push_strength, verbose=True)
     print_board_summary(model, "After Legalization")
 
     # Step 8: Final cost evaluation
@@ -116,7 +168,7 @@ def cmd_place(args) -> None:
     print(f"  Cost change from legalization: {improvement:+.2f}")
 
     # Step 9: Save outputs
-    print("\nStep 7: Saving results...")
+    print("\nStep 8: Saving results...")
 
     model_json = args.input.replace(".kicad_pcb", "_placed_model.json")
     model.to_json(model_json)
@@ -130,6 +182,7 @@ def cmd_place(args) -> None:
         output_pcb = args.output or args.input.replace(".kicad_pcb", "_placed.kicad_pcb")
         apply_placement(model, args.input, output_pcb)
         print(f"  Placed PCB: {output_pcb}")
+
     else:
         print("  [DRY RUN] Not writing PCB file")
 
@@ -193,6 +246,7 @@ def main():
         prog="auto_placer",
         description="KiCad Smart Auto-Placer - Constraint-aware PCB auto-placement",
     )
+    parser.add_argument("--config", default=None, help="Path to config.json (default: config.json in script dir)")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     # extract
@@ -211,10 +265,13 @@ def main():
     )
     p_place.add_argument("-a", "--algorithm", default="force-directed", choices=ALGORITHMS,
                          help="Placement algorithm (default: force-directed)")
-    p_place.add_argument("-m", "--margin", type=float, default=5.0,
-                         help="Board edge margin in mm (default: 5.0)")
+    p_place.add_argument("-m", "--margin", type=float, default=None,
+                         help="Board edge margin in mm (default: from config, else 5.0)")
     p_place.add_argument("--dry-run", action="store_true", help="Don't write PCB output file")
     p_place.add_argument("--interactive", action="store_true", help="Interactive profile weight tuning")
+    p_place.add_argument("--no-sa", action="store_true", help="Disable SA optimization after placement")
+    p_place.add_argument("--sa-iterations", type=int, default=200, help="Max SA temperature steps (default: 200)")
+    p_place.add_argument("--sa-reheat", type=int, default=2, help="Number of SA reheat rounds (default: 2)")
 
     # profiles
     subparsers.add_parser("profiles", help="List available board profiles")

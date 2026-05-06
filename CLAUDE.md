@@ -2,28 +2,32 @@
 
 External PCB auto-placement optimization engine for KiCad. Separates data extraction from optimization for better performance and flexibility.
 
-## Project Status (Current: Phase 1 Complete)
+## Project Status (Current: Phase 6 Complete)
 
-**Last Updated:** 2026-05-05
+**Last Updated:** 2026-05-06
 
 ### What Works
-- Full Phase 1 pipeline end-to-end: extraction → net clustering → grid placement → optimization → legalization → result saving
+- Full pipeline end-to-end: extraction → net clustering → placement → SA optimization → legalization → result saving
 - KiCad .kicad_pcb parsing and JSON round-trip support
 - HPWL-based placement cost with overlap, boundary, and constraint penalties
-- Grid placement with cluster-aware seeding and edge-aware connector handling
-- Interior spacing and repulsion logic for resistor/capacitor/IC spreading
-- 27 tests passing, 0 failures
+- Grid and force-directed placement with cluster-aware seeding and edge-aware connector handling
+- Simulated Annealing engine (ported from CadMust-Neo): adaptive cooling, reheating, move operators, greedy refinement
+- Rotation-aware component dimensions and bbox computation
+- Incremental cost computation O(k) for SA performance
+- Power net auto-detection and HPWL exclusion
+- 42 tests passing, 0 failures (27 Phase 1 + 15 Phase 6)
 - `th_sensor.kicad_pcb` dry-run: 0 overlaps, 0 out-of-bounds
 - Larger `cbb.kicad_pcb` now completes placement pipeline
 
 ### Next Improvements (High Priority)
-- Tune spacing/repulsion constants per component type
-- Improve boundary-aware connector placement for larger boards
-- Reduce remaining overlaps on denser boards without hurting HPWL
+- Test SA optimization on real boards and compare HPWL with/without SA
+- Tune SA parameters (iterations, reheat, cooling) for different board sizes
+- Polygon boundary support and keepout zones
 
 ### Known Issues
 - Dense boards still benefit from tuning (pipeline works but placement not optimal)
 - Legalization can increase wirelength (small regression accepted for legal placement)
+- SA on very small test boards can cause boundary penalty spikes
 
 ---
 
@@ -62,6 +66,9 @@ auto_placer/
 ├── engine/
 │   ├── net_clustering.py    # Hypergraph clustering, seed positions, greedy/Louvain
 │   ├── cost_function.py     # HPWL (clique/star), overlap/boundary penalties
+│   ├── cost_state.py        # Incremental cost computation O(k) for SA, power net exclusion
+│   ├── moves.py             # SA move operators: translate, swap, rotate, median
+│   ├── annealer.py          # Simulated Annealing engine with adaptive cooling & reheating
 │   └── grid_placement.py    # Grid, force-directed, and shelf-packing placement algorithms
 ├── legalization/
 │   └── legalizer.py         # Grid snap, boundary clamp, overlap resolution
@@ -73,7 +80,7 @@ auto_placer/
 ├── samples/
 │   └── sample_board.py  # Sample MCU peripheral board (18 components, 11 nets)
 ├── tests/
-│   └── test_phase1.py   # 27 comprehensive Phase 1 tests
+│   └── test_phase1.py   # 42 tests (27 Phase 1 + 15 Phase 6)
 ├── CLAUDE.md           # This file - project context for Claude
 ├── README.md           # Detailed architecture and design docs
 ├── auto_placer_plan.md # Development phases and implementation plan
@@ -122,6 +129,9 @@ python -m auto_placer place <input.kicad_pcb> [options]
   -m, --margin        # Board edge margin mm (default: 5.0)
   --dry-run           # Don't write PCB file
   --interactive       # Interactive profile weight tuning
+  --no-sa             # Disable SA optimization after placement
+  --sa-iterations N   # Max SA temperature steps (default: 200)
+  --sa-reheat N       # Number of SA reheat rounds (default: 2)
 
 python -m auto_placer extract <input.kicad_pcb> [-o output.json]
 python -m auto_placer profiles
@@ -169,7 +179,7 @@ python -m auto_placer profiles
 | 3.5 | ✅ | Grid snap, overlap resolve |
 | 4 | ✅ | Constraint rules + board profiles |
 | 5 | ✅ | Interactive CLI tuning |
-| 6 | ⏳ | Rotation optimization + multi-pass |
+| 6 | ✅ | SA engine + rotation + incremental cost |
 
 **Implementation Order:** 0 → 1 → 2 → 3.5 → 4 → 5 → 6
 

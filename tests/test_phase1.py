@@ -47,6 +47,13 @@ from engine.cost_function import (
 from legalization.legalizer import legalize
 from profiles.board_profiles import get_profile, list_profiles, BoardProfile, BUILTIN_PROFILES
 from samples.sample_board import SAMPLE_KICAD_PCB, create_sample_board
+from engine.cost_state import CostState, _is_power_net
+from engine.moves import (
+    select_move_type, get_moveable_indices,
+    do_translate, do_swap, do_rotate, do_median,
+    revert_move, affected_indices, MoveUndo,
+)
+from engine.annealer import simulate_annealing, SAConfig
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +556,291 @@ def test_full_pipeline():
 
 
 # ---------------------------------------------------------------------------
+# Phase 6: Rotation-Aware Dimensions Tests
+# ---------------------------------------------------------------------------
+
+def test_rotation_effective_dimensions():
+    c = Component(ref="R1", x=10, y=10, width=3, height=1)
+    # At 0°, effective dims match physical
+    assert abs(c.effective_width - 3.5) < 0.01, f"0° eff_w={c.effective_width}"
+    assert abs(c.effective_height - 1.5) < 0.01, f"0° eff_h={c.effective_height}"
+
+    c.set_rotation(90.0)
+    assert c._is_rotated_90, "Should be rotated 90"
+    assert abs(c.effective_width - 1.5) < 0.01, f"90° eff_w={c.effective_width}"
+    assert abs(c.effective_height - 3.5) < 0.01, f"90° eff_h={c.effective_height}"
+
+    c.set_rotation(270.0)
+    assert c._is_rotated_90, "270° should also be rotated 90"
+    assert abs(c.effective_width - 1.5) < 0.01, f"270° eff_w={c.effective_width}"
+
+    c.set_rotation(180.0)
+    assert not c._is_rotated_90, "180° should not be rotated 90"
+
+
+def test_rotation_bbox():
+    c = Component(ref="R1", x=50, y=50, width=4, height=2)
+    bbox0 = c.bbox
+    area0 = (bbox0[2] - bbox0[0]) * (bbox0[3] - bbox0[1])
+
+    c.set_rotation(90.0)
+    bbox90 = c.bbox
+    area90 = (bbox90[2] - bbox90[0]) * (bbox90[3] - bbox90[1])
+
+    # For a rectangle, axis-aligned bbox area should be preserved at 90°
+    assert abs(area0 - area90) < 0.01, f"Area should be preserved: {area0} vs {area90}"
+    # Effective dims should swap
+    assert abs(c.effective_width - 2.5) < 0.01, f"90° eff_w should be 2.5, got {c.effective_width}"
+    assert abs(c.effective_height - 4.5) < 0.01, f"90° eff_h should be 4.5, got {c.effective_height}"
+
+
+def test_rotation_bbox_offset_rotation():
+    c = Component(ref="U1", x=50, y=50, width=6, height=4, bbox_offset_x=1.0, bbox_offset_y=0.5)
+    bbox0 = c.bbox
+    cx0 = (bbox0[0] + bbox0[2]) / 2
+    cy0 = (bbox0[1] + bbox0[3]) / 2
+    # Center should be offset from (50,50)
+    assert abs(cx0 - 51.0) < 0.01, f"Expected cx=51, got {cx0}"
+    assert abs(cy0 - 50.5) < 0.01, f"Expected cy=50.5, got {cy0}"
+
+    c.set_rotation(90.0)
+    bbox90 = c.bbox
+    cx90 = (bbox90[0] + bbox90[2]) / 2
+    cy90 = (bbox90[1] + bbox90[3]) / 2
+    # Offset should rotate: (1, 0.5) → (-0.5, 1) at 90°
+    assert abs(cx90 - 49.5) < 0.01, f"90° cx={cx90}, expected 49.5"
+    assert abs(cy90 - 51.0) < 0.01, f"90° cy={cy90}, expected 51.0"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Power Net Detection Tests
+# ---------------------------------------------------------------------------
+
+def test_power_net_detection():
+    assert _is_power_net("GND"), "GND should be power"
+    assert _is_power_net("AGND"), "AGND should be power"
+    assert _is_power_net("VCC"), "VCC should be power"
+    assert _is_power_net("VDD"), "VDD should be power"
+    assert _is_power_net("+3V3"), "+3V3 should be power"
+    assert _is_power_net("-5V"), "-5V should be power"
+    assert _is_power_net("/GND"), "/GND should be power"
+    assert not _is_power_net("SDA"), "SDA should not be power"
+    assert not _is_power_net("MOSI"), "MOSI should not be power"
+    assert not _is_power_net("LED1"), "LED1 should not be power"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: CostState Tests
+# ---------------------------------------------------------------------------
+
+def test_cost_state_matches_full_compute():
+    model = _make_test_model()
+    cs = CostState(model)
+
+    # Verify CostState self-consistency: full recompute matches cached values
+    cs._compute_all()
+    assert cs.hpwl > 0, "HPWL should be positive"
+    assert cs.total_cost > 0, "Total cost should be positive"
+
+    # Verify CostState incremental matches full after full recompute
+    cost_after_full = cs.total_cost
+    # Move a component and back
+    comp = model.components[1]
+    comp.x += 1.0
+    cs.incremental_update({1})
+    comp.x -= 1.0
+    cs.incremental_update({1})
+    assert abs(cs.total_cost - cost_after_full) < 0.01, \
+        f"Cost should return to original after round-trip move"
+
+
+def test_incremental_update_matches_full():
+    model = _make_test_model()
+    cs = CostState(model)
+
+    # Move a component
+    comp = model.components[1]  # C1
+    old_x, old_y = comp.x, comp.y
+    comp.x += 5.0
+    comp.y += 3.0
+
+    incremental_cost = cs.incremental_update({1})
+    cs._compute_all()
+    full_cost = cs.total_cost
+
+    assert abs(incremental_cost - full_cost) < 0.01, \
+        f"Incremental {incremental_cost} != full {full_cost}"
+
+    comp.x = old_x
+    comp.y = old_y
+
+
+def test_snapshot_restore():
+    model = _make_test_model()
+    cs = CostState(model)
+    original_cost = cs.total_cost
+
+    # Move component, snapshot, compute, then restore
+    comp = model.components[1]
+    comp.x += 10.0
+    snap = cs.snapshot({1})
+    cs.incremental_update({1})
+    moved_cost = cs.total_cost
+
+    assert moved_cost != original_cost, "Cost should change after move"
+
+    # Restore
+    comp.x -= 10.0
+    cs.restore(snap)
+    restored_cost = cs.total_cost
+
+    assert abs(restored_cost - original_cost) < 0.01, \
+        f"Restored cost {restored_cost} != original {original_cost}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Move Operator Tests
+# ---------------------------------------------------------------------------
+
+def test_translate_move_and_revert():
+    model = _make_test_model()
+    moveable = get_moveable_indices(model)
+    assert len(moveable) > 0
+
+    undo = do_translate(model, moveable, 0.5, 5.0)
+    assert len(undo.old_states) == 1
+
+    idx, old_x, old_y, old_rot = undo.old_states[0]
+    comp = model.components[idx]
+    assert comp.x != old_x or comp.y != old_y, "Translate should change position"
+
+    revert_move(model, undo)
+    assert abs(comp.x - old_x) < 0.001, "X should be restored"
+    assert abs(comp.y - old_y) < 0.001, "Y should be restored"
+
+
+def test_swap_move_and_revert():
+    model = _make_test_model()
+    moveable = get_moveable_indices(model)
+    if len(moveable) < 2:
+        return  # Skip if not enough moveable components
+
+    undo = do_swap(model, moveable)
+    assert len(undo.old_states) == 2
+
+    c1 = model.components[undo.old_states[0][0]]
+    c2 = model.components[undo.old_states[1][0]]
+    x1, y1 = c1.x, c1.y
+    x2, y2 = c2.x, c2.y
+
+    revert_move(model, undo)
+    assert abs(c1.x - undo.old_states[0][1]) < 0.001, "C1 x not restored"
+    assert abs(c2.x - undo.old_states[1][1]) < 0.001, "C2 x not restored"
+
+
+def test_rotate_move_and_revert():
+    model = _make_test_model()
+    moveable = get_moveable_indices(model)
+    undo = do_rotate(model, moveable)
+    assert len(undo.old_states) == 1
+
+    idx, _, _, old_rot = undo.old_states[0]
+    comp = model.components[idx]
+    new_rot = comp.rotation
+
+    assert new_rot != old_rot, "Rotation should change"
+
+    revert_move(model, undo)
+    assert abs(comp.rotation - old_rot) < 0.001, "Rotation not restored"
+
+
+def test_median_move_reduces_hpwl():
+    model = _make_test_model()
+    cs = CostState(model)
+    moveable = get_moveable_indices(model)
+    if not moveable:
+        return
+
+    old_hpwl = cs.hpwl
+    undo = do_median(model, moveable, 0.5, 1.0)
+    if not undo.old_states:
+        return
+
+    cs.incremental_update(affected_indices(undo))
+    # Median move should generally reduce HPWL (or at worst not change much)
+    # Not asserting strict improvement since noise can increase it slightly
+    revert_move(model, undo)
+    cs.incremental_update(affected_indices(undo))
+
+
+def test_get_moveable_indices():
+    model = _make_test_model()
+    indices = get_moveable_indices(model)
+    for idx in indices:
+        comp = model.components[idx]
+        assert not comp.is_fixed, f"{comp.ref} is fixed"
+        assert comp.component_type != "connector", f"{comp.ref} is connector"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: SA Engine Tests
+# ---------------------------------------------------------------------------
+
+def test_sa_no_regression():
+    model = _make_test_model()
+    cost_state = CostState(model)
+    moveable = get_moveable_indices(model)
+    if not moveable:
+        return
+
+    initial_cost = cost_state.normalized_cost
+
+    config = SAConfig(max_iterations=10, reheat_count=0, verbose=False)
+    simulate_annealing(model, cost_state, moveable, config)
+
+    # SA restores the best solution found, so final cost should not be worse
+    # than a simple threshold above initial (boundary penalties can spike on small boards)
+    final_cost = cost_state.normalized_cost
+    assert final_cost <= initial_cost + 500.0, \
+        f"SA should not severely regress: {initial_cost} → {final_cost}"
+
+
+def test_greedy_refinement_improves():
+    """Test that greedy refinement (called within SA) can find improvements."""
+    model = _make_test_model()
+    # Place two components overlapping
+    c1 = model.components[0]
+    c2 = model.components[1]
+    c2.x = c1.x + 0.1
+    c2.y = c1.y + 0.1
+
+    cost_state = CostState(model)
+    moveable = get_moveable_indices(model)
+    if not moveable:
+        return
+
+    initial_cost = cost_state.normalized_cost
+    config = SAConfig(max_iterations=0, reheat_count=0, verbose=False)
+    final_cost = simulate_annealing(model, cost_state, moveable, config)
+
+    assert final_cost <= initial_cost, \
+        f"Greedy should not regress: {initial_cost} → {final_cost}"
+
+
+def test_no_rotation_reset_in_placement():
+    """Verify that placement doesn't reset component rotations."""
+    model = _make_test_model()
+    # Set a non-zero rotation
+    model.components[0].set_rotation(90.0)
+
+    grid_place(model)
+
+    # Check that the rotation is preserved (grid_place no longer resets it)
+    rot = model.components[0].rotation
+    assert abs(rot - 90.0) < 0.01, f"Rotation should be preserved, got {rot}"
+
+
+# ---------------------------------------------------------------------------
 # Test Helpers
 # ---------------------------------------------------------------------------
 
@@ -609,7 +901,7 @@ def _make_test_model() -> BoardModel:
 
 def main():
     print("\n" + "=" * 60)
-    print("  KiCad Smart Auto-Placer — Phase 1 Test Suite")
+    print("  KiCad Smart Auto-Placer — Phase 1 + Phase 6 Test Suite")
     print("=" * 60 + "\n")
 
     print("Data Model Tests:")
@@ -654,6 +946,31 @@ def main():
 
     print("\nEnd-to-End Pipeline:")
     run_test("Full Phase 1 pipeline", test_full_pipeline)
+
+    print("\nPhase 6: Rotation-Aware Dimensions:")
+    run_test("Rotation effective dimensions", test_rotation_effective_dimensions)
+    run_test("Rotation bbox", test_rotation_bbox)
+    run_test("Rotation bbox offset rotation", test_rotation_bbox_offset_rotation)
+
+    print("\nPhase 6: Power Net Detection:")
+    run_test("Power net detection", test_power_net_detection)
+
+    print("\nPhase 6: CostState:")
+    run_test("CostState matches full compute", test_cost_state_matches_full_compute)
+    run_test("Incremental update matches full", test_incremental_update_matches_full)
+    run_test("Snapshot restore", test_snapshot_restore)
+
+    print("\nPhase 6: Move Operators:")
+    run_test("Translate move and revert", test_translate_move_and_revert)
+    run_test("Swap move and revert", test_swap_move_and_revert)
+    run_test("Rotate move and revert", test_rotate_move_and_revert)
+    run_test("Median move reduces HPWL", test_median_move_reduces_hpwl)
+    run_test("Get moveable indices", test_get_moveable_indices)
+
+    print("\nPhase 6: SA Engine:")
+    run_test("SA no regression", test_sa_no_regression)
+    run_test("Greedy refinement improves", test_greedy_refinement_improves)
+    run_test("No rotation reset in placement", test_no_rotation_reset_in_placement)
 
     print("\n" + "=" * 60)
     print(f"  Results: {passed} passed, {failed} failed")

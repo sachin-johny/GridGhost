@@ -155,8 +155,6 @@ def _place_in_region(
         comp.y = y_min + (row + 0.5) * cell_h
         comp.x = max(x_min + comp.effective_width / 2.0, min(comp.x, x_max - comp.effective_width / 2.0))
         comp.y = max(y_min + comp.effective_height / 2.0, min(comp.y, y_max - comp.effective_height / 2.0))
-        # Reset rotation to 0 for initial placement
-        comp.rotation = 0.0
 
 
 def edge_aware_grid_place(
@@ -232,7 +230,6 @@ def _place_interior_components(
 
         comp.x = max(x_min + comp.effective_width / 2.0, min(center_x, x_max - comp.effective_width / 2.0))
         comp.y = max(y_min + comp.effective_height / 2.0, min(center_y, y_max - comp.effective_height / 2.0))
-        comp.rotation = 0.0
 
 
 def _place_connectors_on_perimeter(
@@ -292,13 +289,13 @@ def _place_connectors_on_perimeter(
         connector.x = x
         connector.y = y
         if edge == "left":
-            connector.rotation = 90.0
+            connector.set_rotation(90.0)
         elif edge == "right":
-            connector.rotation = 270.0
+            connector.set_rotation(270.0)
         elif edge == "top":
-            connector.rotation = 180.0
+            connector.set_rotation(180.0)
         else:
-            connector.rotation = 0.0
+            connector.set_rotation(0.0)
 
 
 def _orient_connector_outward(comp: Component, board) -> None:
