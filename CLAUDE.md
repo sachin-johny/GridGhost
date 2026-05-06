@@ -62,8 +62,7 @@ auto_placer/
 ├── engine/
 │   ├── net_clustering.py    # Hypergraph clustering, seed positions, greedy/Louvain
 │   ├── cost_function.py     # HPWL (clique/star), overlap/boundary penalties
-│   ├── grid_placement.py    # Grid & edge-aware placement algorithms
-│   └── simple_optimizer.py  # Greedy-swap optimizer for Phase 2
+│   └── grid_placement.py    # Grid, force-directed, and shelf-packing placement algorithms
 ├── legalization/
 │   └── legalizer.py         # Grid snap, boundary clamp, overlap resolution
 ├── profiles/
@@ -118,17 +117,13 @@ Cost weights and rule priorities pre-configured per board type:
 
 ```bash
 python -m auto_placer place <input.kicad_pcb> [options]
+  -a, --algorithm     # force-directed (default) | grid
   -p, --profile       # Board profile (default: generic)
   -m, --margin        # Board edge margin mm (default: 5.0)
-  -s, --spacing       # Component spacing factor (default: 1.3)
-  -g, --grid          # Legalization grid mm (default: 0.1)
-  --edge-aware        # Force edge-aware placement
-  --optimize          # Run Phase 2 greedy-swap optimizer
   --dry-run           # Don't write PCB file
-  --interactive       # Interactive profile tuning
+  --interactive       # Interactive profile weight tuning
 
 python -m auto_placer extract <input.kicad_pcb> [-o output.json]
-python -m auto_placer cost <board_model.json>
 python -m auto_placer profiles
 ```
 

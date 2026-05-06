@@ -3,16 +3,8 @@
 
 Usage:
     python -m auto_placer place <input.kicad_pcb> [options]
-    python -m auto_placer extract <input.kicad_pcb> [options]
+    python -m auto_placer extract <input.kicad_pcb> [-o output.json]
     python -m auto_placer profiles
-    python -m auto_placer cost <board_model.json> [options]
-
-Phase 1 implements:
-  - Board data extraction from .kicad_pcb → JSON intermediate model
-  - Net-based clustering + grid placement
-  - HPWL cost evaluation
-  - Legalization pass
-  - Placement application back to .kicad_pcb
 """
 
 from __future__ import annotations
@@ -21,14 +13,13 @@ import argparse
 import sys
 import os
 
-# Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.board_model import BoardModel
 from parsers.kicad_parser import KiCadParser
 from parsers.placement_writer import apply_placement, export_positions_json
 from engine.net_clustering import cluster_components, compute_seed_positions
-from engine.grid_placement import grid_place, edge_aware_grid_place, shelf_packing_place, force_directed_place
+from engine.grid_placement import grid_place, force_directed_place
 from engine.cost_function import CostFunction, total_hpwl, count_overlaps, count_out_of_bounds
 from legalization.legalizer import legalize
 from profiles.board_profiles import get_profile, list_profiles, BoardProfile
@@ -38,6 +29,8 @@ from utils.display import (
     print_component_table,
     print_cluster_info,
 )
+
+ALGORITHMS = ("force-directed", "grid")
 
 
 def cmd_extract(args) -> None:
@@ -49,7 +42,6 @@ def cmd_extract(args) -> None:
     print_board_summary(model, "Extraction Results")
     print_component_table(model)
 
-    # Save intermediate model
     output = args.output or args.input.replace(".kicad_pcb", "_model.json")
     model.to_json(output)
     print(f"Intermediate model saved to: {output}")
@@ -58,29 +50,25 @@ def cmd_extract(args) -> None:
 def cmd_place(args) -> None:
     """Run the full placement pipeline."""
     print(f"\n{'#' * 60}")
-    print(f"  KiCad Smart Auto-Placer — Phase 1")
+    print(f"  KiCad Smart Auto-Placer")
     print(f"{'#' * 60}\n")
 
     # Step 1: Extract
     print("Step 1: Extracting board data...")
-    parser = KiCadParser(args.input, bbox_margin=args.bbox_margin)
+    parser = KiCadParser(args.input, bbox_margin=0.5)
     model = parser.parse()
     print_board_summary(model, "After Extraction")
     print_component_table(model)
-    if args.verbose:
-        for c in model.components:
-            print(f"  {c.ref}: bbox_offset=({c.bbox_offset_x:.1f}, {c.bbox_offset_y:.1f})")
 
     # Step 2: Select board profile
     print("Step 2: Selecting board profile...")
     profile = get_profile(args.profile)
     print(f"  Profile: {profile.display_name}")
-    print(f"  Description: {profile.description}")
-    print(f"  Cost weights: alpha={profile.alpha}, beta={profile.beta}, gamma={profile.gamma}, delta={profile.delta}")
+    print(f"  Weights: alpha={profile.alpha}, beta={profile.beta}, gamma={profile.gamma}, delta={profile.delta}")
     if profile.active_rules():
         print("  Active rules:")
         for rule in profile.active_rules():
-            print(f"    • {rule.name} (weight={rule.weight}) — {rule.description}")
+            print(f"    - {rule.name} (weight={rule.weight})")
     print()
 
     # Step 3: Interactive tuning (if requested)
@@ -94,38 +82,15 @@ def cmd_place(args) -> None:
 
     # Step 5: Placement algorithm
     print("Step 4: Running placement algorithm...")
+    algorithm = args.algorithm
 
-    # Choose placement algorithm
-    if args.force_directed:
-        print("  Using force-directed placement (attractive + repulsive forces)")
-        force_directed_place(
-            model,
-            margin=args.margin,
-            iterations=args.fd_iterations,
-            k_attract=args.fd_attract,
-            k_repel=args.fd_repel,
-            min_spacing=args.fd_spacing,
-            verbose=args.verbose
-        )
-    elif args.shelf_packing:
-        print("  Using shelf-packing placement (non-overlapping rows)")
-        shelf_packing_place(
-            model,
-            margin=args.margin,
-            spacing=args.fd_spacing,
-            sort_by="size"
-        )
+    if algorithm == "force-directed":
+        print("  Algorithm: force-directed (attractive + repulsive forces)")
+        force_directed_place(model, margin=args.margin)
     else:
-        # Default: improved grid placement with better spacing
-        has_connectors = any(c.component_type == "connector" for c in model.components)
-        if args.edge_aware or has_connectors:
-            edge_aware_grid_place(model, margin=args.margin, spacing_factor=args.spacing)
-            if args.edge_aware:
-                print("  Using edge-aware placement (connectors near edges)")
-            else:
-                print("  Using edge-aware placement automatically for connector parts")
-        else:
-            grid_place(model, margin=args.margin, spacing_factor=args.spacing)
+        print("  Algorithm: grid (cluster-based seed placement)")
+        grid_place(model, margin=args.margin)
+
     print_board_summary(model, "After Placement")
 
     # Step 6: Cost evaluation
@@ -139,41 +104,28 @@ def cmd_place(args) -> None:
     costs = cost_fn.evaluate(model)
     print_cost_breakdown(costs, "Placement Cost (Pre-Legalization)")
 
-    # Optional Phase 2 optimization
-    if args.optimize:
-        print("Step 6: Running Phase 2 optimizer (greedy swap)...")
-        from engine.simple_optimizer import greedy_swap_optimize
-        model = greedy_swap_optimize(model, cost_fn, max_iters=10)
-        costs_opt = cost_fn.evaluate(model)
-        print_cost_breakdown(costs_opt, "Placement Cost (Post-Optimization)")
-
     # Step 7: Legalization
-    print("Step 7: Running legalization pass...")
-    legalize(model, grid_mm=args.grid, verbose=True)
+    print("Step 6: Running legalization...")
+    legalize(model, grid_mm=0.1, verbose=True)
     print_board_summary(model, "After Legalization")
 
     # Step 8: Final cost evaluation
     costs_after = cost_fn.evaluate(model)
     print_cost_breakdown(costs_after, "Placement Cost (Post-Legalization)")
-
-    # Show improvement
     improvement = costs["total"] - costs_after["total"]
     print(f"  Cost change from legalization: {improvement:+.2f}")
 
     # Step 9: Save outputs
     print("\nStep 7: Saving results...")
 
-    # Save intermediate model
-    model_json = args.output_json or args.input.replace(".kicad_pcb", "_placed_model.json")
+    model_json = args.input.replace(".kicad_pcb", "_placed_model.json")
     model.to_json(model_json)
     print(f"  Board model JSON: {model_json}")
 
-    # Save position map
     pos_json = args.input.replace(".kicad_pcb", "_positions.json")
     export_positions_json(model, pos_json)
     print(f"  Positions JSON: {pos_json}")
 
-    # Apply to PCB file
     if not args.dry_run:
         output_pcb = args.output or args.input.replace(".kicad_pcb", "_placed.kicad_pcb")
         apply_placement(model, args.input, output_pcb)
@@ -191,23 +143,6 @@ def cmd_place(args) -> None:
     print(f"{'#' * 60}\n")
 
 
-def cmd_cost(args) -> None:
-    """Evaluate cost of an existing board model."""
-    print(f"Loading: {args.input}")
-    model = BoardModel.from_json(args.input)
-
-    profile = get_profile(args.profile)
-    cost_fn = CostFunction(
-        alpha=profile.alpha,
-        beta=profile.beta,
-        gamma=profile.gamma,
-        delta=profile.delta,
-    )
-    costs = cost_fn.evaluate(model)
-    print_cost_breakdown(costs)
-    print_component_table(model)
-
-
 def cmd_profiles(args) -> None:
     """List available board profiles."""
     print(f"\n{'=' * 60}")
@@ -217,7 +152,7 @@ def cmd_profiles(args) -> None:
         print(f"  {profile.name}")
         print(f"    Display: {profile.display_name}")
         print(f"    Desc:    {profile.description}")
-        print(f"    Weights: α={profile.alpha}, β={profile.beta}, γ={profile.gamma}, δ={profile.delta}")
+        print(f"    Weights: alpha={profile.alpha}, beta={profile.beta}, gamma={profile.gamma}, delta={profile.delta}")
         if profile.rules:
             print(f"    Rules:")
             for rule in profile.rules:
@@ -231,8 +166,7 @@ def _interactive_tuning(profile: BoardProfile) -> None:
     print("\n  Interactive Profile Tuning")
     print("  (Press Enter to keep current value)\n")
 
-    # Tune cost weights
-    for attr, label in [("alpha", "HPWL (α)"), ("beta", "Overlap (β)"), ("gamma", "Boundary (γ)"), ("delta", "Constraint (δ)")]:
+    for attr, label in [("alpha", "HPWL (alpha)"), ("beta", "Overlap (beta)"), ("gamma", "Boundary (gamma)"), ("delta", "Constraint (delta)")]:
         current = getattr(profile, attr)
         val = input(f"  {label} weight [{current}]: ").strip()
         if val:
@@ -241,7 +175,6 @@ def _interactive_tuning(profile: BoardProfile) -> None:
             except ValueError:
                 print(f"    Invalid value, keeping {current}")
 
-    # Tune rule weights
     if profile.rules:
         print("\n  Constraint Rule Weights:")
         for rule in profile.rules:
@@ -258,49 +191,32 @@ def _interactive_tuning(profile: BoardProfile) -> None:
 def main():
     parser = argparse.ArgumentParser(
         prog="auto_placer",
-        description="KiCad Smart Auto-Placer — Constraint-aware PCB auto-placement",
+        description="KiCad Smart Auto-Placer - Constraint-aware PCB auto-placement",
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
-    # ---- extract ----
+    # extract
     p_extract = subparsers.add_parser("extract", help="Extract board data to JSON")
     p_extract.add_argument("input", help="Path to .kicad_pcb file")
     p_extract.add_argument("-o", "--output", help="Output JSON path")
 
-    # ---- place ----
-    p_place = subparsers.add_parser("place", help="Run placement pipeline")
+    # place
+    p_place = subparsers.add_parser("place", help="Auto-place components on a PCB")
     p_place.add_argument("input", help="Path to .kicad_pcb file")
     p_place.add_argument("-o", "--output", help="Output .kicad_pcb path")
-    p_place.add_argument("--output-json", help="Output board model JSON path")
     p_place.add_argument(
         "-p", "--profile", default="generic",
         choices=["mcu_peripheral", "power_supply", "rf_frontend", "mixed_signal", "generic", "small_board"],
-        help="Board profile (default: generic; use 'small_board' for dense boards to reduce congestion)",
+        help="Board profile (default: generic)",
     )
-    p_place.add_argument("-m", "--margin", type=float, default=5.0, help="Board edge margin in mm (default: 5.0)")
-    p_place.add_argument("-s", "--spacing", type=float, default=1.3, help="Component spacing factor (default: 1.3)")
-    p_place.add_argument("-g", "--grid", type=float, default=1.8, help="Legalization grid in mm (default: 1.8)")
-    p_place.add_argument("--edge-aware", action="store_true", help="Use edge-aware placement for connectors")
-    p_place.add_argument("--interactive", action="store_true", help="Interactive profile tuning")
-    p_place.add_argument("--optimize", action="store_true", help="Run Phase 2 optimizer after grid placement")
+    p_place.add_argument("-a", "--algorithm", default="force-directed", choices=ALGORITHMS,
+                         help="Placement algorithm (default: force-directed)")
+    p_place.add_argument("-m", "--margin", type=float, default=5.0,
+                         help="Board edge margin in mm (default: 5.0)")
     p_place.add_argument("--dry-run", action="store_true", help="Don't write PCB output file")
-    # New placement algorithms
-    p_place.add_argument("--force-directed", action="store_true", help="Use force-directed placement (recommended for small boards)")
-    p_place.add_argument("--shelf-packing", action="store_true", help="Use shelf-packing placement (guaranteed non-overlapping)")
-    p_place.add_argument("--verbose", action="store_true", help="Verbose output during placement")
-    # Force-directed parameters
-    p_place.add_argument("--fd-iterations", type=int, default=100, help="Force-directed iterations (default: 100)")
-    p_place.add_argument("--fd-attract", type=float, default=0.01, help="Attractive force coefficient (default: 0.01)")
-    p_place.add_argument("--fd-repel", type=float, default=500.0, help="Repulsive force coefficient (default: 500.0)")
-    p_place.add_argument("--fd-spacing", type=float, default=2.0, help="Minimum component spacing mm (default: 2.0)")
-    p_place.add_argument("--bbox-margin", type=float, default=0.5, help="Margin around component bounding box mm (default: 0.5)")
+    p_place.add_argument("--interactive", action="store_true", help="Interactive profile weight tuning")
 
-    # ---- cost ----
-    p_cost = subparsers.add_parser("cost", help="Evaluate placement cost")
-    p_cost.add_argument("input", help="Path to board model JSON")
-    p_cost.add_argument("-p", "--profile", default="generic", help="Board profile")
-
-    # ---- profiles ----
+    # profiles
     subparsers.add_parser("profiles", help="List available board profiles")
 
     args = parser.parse_args()
@@ -309,8 +225,6 @@ def main():
         cmd_extract(args)
     elif args.command == "place":
         cmd_place(args)
-    elif args.command == "cost":
-        cmd_cost(args)
     elif args.command == "profiles":
         cmd_profiles(args)
     else:
