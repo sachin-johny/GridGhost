@@ -4,3 +4,6 @@
 *.json
 milestone.md
 auto_placer_plan.md
+
+% donot ignore config.json 
+!config.json
