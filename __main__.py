@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.board_model import BoardModel
 from parsers.kicad_parser import KiCadParser
-from parsers.placement_writer import apply_placement, export_positions_json
+from parsers.placement_writer import apply_placement, export_positions_json, write_debug_bboxes
 from engine.net_clustering import cluster_components, compute_seed_positions
 from engine.grid_placement import grid_place, force_directed_place
 from engine.cost_function import CostFunction, total_hpwl, count_overlaps, count_out_of_bounds
@@ -183,8 +183,13 @@ def cmd_place(args) -> None:
         apply_placement(model, args.input, output_pcb)
         print(f"  Placed PCB: {output_pcb}")
 
+        if getattr(args, 'debug_bbox', False):
+            write_debug_bboxes(model, output_pcb)
+            print(f"  Debug bboxes written to Dwgs.User layer — enable that layer in KiCad to view")
     else:
         print("  [DRY RUN] Not writing PCB file")
+        if getattr(args, 'debug_bbox', False):
+            print("  [DRY RUN] Skipping debug bboxes (need PCB file to write to)")
 
     # Final summary
     print(f"\n{'#' * 60}")
@@ -272,6 +277,7 @@ def main():
     p_place.add_argument("--no-sa", action="store_true", help="Disable SA optimization after placement")
     p_place.add_argument("--sa-iterations", type=int, default=200, help="Max SA temperature steps (default: 200)")
     p_place.add_argument("--sa-reheat", type=int, default=2, help="Number of SA reheat rounds (default: 2)")
+    p_place.add_argument("--debug-bbox", action="store_true", help="Draw component bounding boxes on Dwgs.User layer for visual debugging")
 
     # profiles
     subparsers.add_parser("profiles", help="List available board profiles")

@@ -224,3 +224,55 @@ def export_positions_json(model: BoardModel, output_path: str) -> str:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(positions, indent=2), encoding="utf-8")
     return str(output)
+
+
+def write_debug_bboxes(model: BoardModel, pcb_path: str) -> str:
+    """Inject gr_rect bounding-box visuals on Dwgs.User layer for debugging.
+
+    Each component gets a rectangle matching its bbox property and a small
+    label with the ref designator so you can identify it in KiCad.
+    """
+    import uuid
+
+    pcb = Path(pcb_path)
+    text = pcb.read_text(encoding="utf-8")
+
+    # KiCad uses mm coordinates as floats
+    segments = []
+    for comp in model.components:
+        bx1, by1, bx2, by2 = comp.bbox
+        x1 = format_kicad_coord(bx1)
+        y1 = format_kicad_coord(by1)
+        x2 = format_kicad_coord(bx2)
+        y2 = format_kicad_coord(by2)
+        rect_uuid = str(uuid.uuid4())
+        segments.append(
+            f'  (gr_rect (start {x1} {y1}) (end {x2} {y2}) '
+            f'(stroke (width 0.1) (type solid)) (fill none) (layer "Dwgs.User") '
+            f'(tstamp "{rect_uuid}"))'
+        )
+        # Label at bottom-left corner
+        lx = format_kicad_coord(bx1)
+        ly = format_kicad_coord(by1 - 0.3)
+        text_uuid = str(uuid.uuid4())
+        segments.append(
+            f'  (gr_text "{comp.ref}" (at {lx} {ly}) '
+            f'(layer "Dwgs.User") (tstamp "{text_uuid}") '
+            f'(effects (font (size 0.8 0.8) (thickness 0.12))))'
+        )
+
+    debug_block = "\n".join(segments) + "\n"
+
+    # Insert before the final ')' of the kicad_pcb top-level expression.
+    # The file structure is: (kicad_pcb ... ) — we need our gr_* items
+    # inside that closing paren, otherwise KiCad ignores them.
+    text = text.rstrip()
+    # Find the last ')' that closes the root (kicad_pcb ...) expression
+    idx = text.rfind(')')
+    if idx < 0:
+        pcb.write_text(text + "\n" + debug_block, encoding="utf-8")
+        return str(pcb)
+    text = text[:idx] + debug_block + text[idx:]
+
+    pcb.write_text(text, encoding="utf-8")
+    return str(pcb)
