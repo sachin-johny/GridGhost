@@ -157,7 +157,9 @@ def cmd_place(args) -> None:
     # Step 7: Legalization
     print("Step 7: Running legalization...")
     lcfg = cfg.legalization
-    legalize(model, grid_mm=lcfg.grid_mm, max_iterations=lcfg.max_iterations,
+    n_total = len(model.components)
+    adaptive_max_iter = max(100, min(800, n_total * 5))
+    legalize(model, grid_mm=lcfg.grid_mm, max_iterations=adaptive_max_iter,
              push_strength=lcfg.push_strength, verbose=True)
     print_board_summary(model, "After Legalization")
 

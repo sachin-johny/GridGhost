@@ -17,6 +17,7 @@ from typing import Optional
 from models.board_model import BoardModel, Component
 from engine.net_clustering import compute_seed_positions, assign_cluster_positions, cluster_components
 from engine.cost_function import total_hpwl
+from legalization.legalizer import _push_apart, _enforce_boundary
 
 
 def grid_place(
@@ -50,13 +51,18 @@ def grid_place(
             comp.x = x
             comp.y = y
 
-    # Step 3: Refine placement with proper grid spacing within clusters
-    _refine_cluster_placement(model, margin, spacing_factor, sort_by)
-    
-    # Step 4: Force connectors to perimeter and apply strong repulsion to interior
+    # Step 3: Place connectors on perimeter first
     connectors = [c for c in model.components if c.component_type == "connector" and not c.is_fixed]
     _place_connectors_on_perimeter(connectors, model.board, margin)
-    _apply_strong_repulsion(model)
+
+    # Step 4: Refine interior-only components (exclude connectors)
+    _refine_cluster_placement(model, margin, spacing_factor, sort_by, exclude_types={"connector"})
+
+    # Step 5: Apply strong repulsion to interior components (exclude connectors)
+    _apply_strong_repulsion(model, exclude_types={"connector"})
+
+    # Step 6: Quick overlap resolve — connectors frozen, interior pushed away
+    _quick_overlap_resolve(model, frozen_types={"connector"})
 
     return model
 
@@ -66,11 +72,13 @@ def _refine_cluster_placement(
     margin: float,
     spacing_factor: float,
     sort_by: str,
+    exclude_types: set[str] | None = None,
 ) -> None:
     """Refine component positions within each cluster for proper spacing."""
     clusters = cluster_components(model)
     board = model.board
     comp_map = {c.ref: c for c in model.components}
+    exclude = exclude_types or set()
 
     # Calculate usable board area
     usable_x_min = board.x_min + margin
@@ -97,8 +105,9 @@ def _refine_cluster_placement(
         region_x_max = region_x_min + region_w
         region_y_max = region_y_min + region_h
 
-        # Sort components within cluster
-        components = [comp_map[r] for r in cluster_refs if r in comp_map]
+        # Sort components within cluster (skip excluded types)
+        components = [comp_map[r] for r in cluster_refs
+                      if r in comp_map and comp_map[r].component_type not in exclude]
 
         if sort_by == "connectivity":
             components.sort(key=lambda c: len(c.nets), reverse=True)
@@ -164,20 +173,9 @@ def edge_aware_grid_place(
 ) -> BoardModel:
     """Grid placement with edge-aware connector positioning.
 
-    Places connectors around the perimeter first, then spreads the
-    remaining components across the interior in one balanced grid.
+    Delegates to grid_place which now handles connectors first internally.
     """
-    board = model.board
-    connectors = [c for c in model.components if c.component_type == "connector"]
-    interior_components = [c for c in model.components if c.component_type != "connector"]
-
-    if connectors:
-        _place_connectors_on_perimeter(connectors, board, margin)
-
-    if interior_components:
-        _place_interior_components(interior_components, board, margin, spacing_factor)
-
-    return model
+    return grid_place(model, margin=margin, spacing_factor=spacing_factor)
 
 
 def _place_interior_components(
@@ -237,96 +235,235 @@ def _place_connectors_on_perimeter(
     board,
     margin: float,
 ) -> None:
-    """Place connectors evenly spaced around the board perimeter."""
+    """Place connectors on board perimeter using size-aware greedy best-fit.
+
+    Sorts connectors largest-first, places on the edge with the most
+    remaining space.  After placement, resolves any corner collisions
+    by pushing connectors along their assigned edges.
+    """
     if not connectors:
         return
-    
-    perimeter_margin = margin + 2.0  # Extra margin for connector placement
-    
-    # Calculate perimeter positions (in order: top, right, bottom, left)
-    perimeter_points = []
-    
-    # Top edge (left to right)
-    top_y = board.y_min + perimeter_margin
-    spacing = (board.x_max - board.x_min - 2 * perimeter_margin) / max(1, len(connectors))
-    for i in range(len(connectors)):
-        x = board.x_min + perimeter_margin + i * spacing
-        perimeter_points.append((x, top_y, "top"))
-    
-    # Right edge (top to bottom)
-    right_x = board.x_max - perimeter_margin
-    spacing = (board.y_max - board.y_min - 2 * perimeter_margin) / max(1, len(connectors))
-    for i in range(len(connectors)):
-        y = board.y_min + perimeter_margin + i * spacing
-        perimeter_points.append((right_x, y, "right"))
-    
-    # Bottom edge (right to left)
-    bottom_y = board.y_max - perimeter_margin
-    spacing = (board.x_max - board.x_min - 2 * perimeter_margin) / max(1, len(connectors))
-    for i in range(len(connectors)):
-        x = board.x_max - perimeter_margin - i * spacing
-        perimeter_points.append((x, bottom_y, "bottom"))
-    
-    # Left edge (bottom to top)
-    left_x = board.x_min + perimeter_margin
-    spacing = (board.y_max - board.y_min - 2 * perimeter_margin) / max(1, len(connectors))
-    for i in range(len(connectors)):
-        y = board.y_max - perimeter_margin - i * spacing
-        perimeter_points.append((left_x, y, "left"))
-    
-    # Distribute connectors around the perimeter
-    for i, connector in enumerate(connectors):
-        # Cycle through perimeter points if more connectors than calculated points
-        perimeter_idx = i % len(perimeter_points)
-        x, y, edge = perimeter_points[perimeter_idx]
-        
-        # Clamp to valid range
-        x = max(board.x_min + connector.effective_width / 2.0,
-                min(x, board.x_max - connector.effective_width / 2.0))
-        y = max(board.y_min + connector.effective_height / 2.0,
-                min(y, board.y_max - connector.effective_height / 2.0))
-        
-        connector.x = x
-        connector.y = y
-        if edge == "left":
-            connector.set_rotation(90.0)
-        elif edge == "right":
-            connector.set_rotation(270.0)
-        elif edge == "top":
-            connector.set_rotation(180.0)
+
+    gap = 1.5
+    perimeter_margin = margin + 2.0
+
+    edge_lengths = {
+        "top":    board.x_max - board.x_min - 2 * perimeter_margin,
+        "bottom": board.x_max - board.x_min - 2 * perimeter_margin,
+        "right":  board.y_max - board.y_min - 2 * perimeter_margin,
+        "left":   board.y_max - board.y_min - 2 * perimeter_margin,
+    }
+
+    edge_rotation = {"top": 180.0, "bottom": 0.0, "left": 90.0, "right": 270.0}
+
+    sorted_connectors = sorted(
+        connectors,
+        key=lambda c: max(c.effective_width, c.effective_height),
+        reverse=True,
+    )
+
+    # Track which edge each connector is assigned to
+    comp_edge = {}
+    edge_used = {e: 0.0 for e in edge_lengths}
+
+    for comp in sorted_connectors:
+        w, h = comp.effective_width, comp.effective_height
+
+        best_edge = None
+        best_remaining = -1.0
+        best_rotate = False
+        best_along = w
+
+        for edge, edge_len in edge_lengths.items():
+            remaining = edge_len - edge_used[edge]
+
+            if edge in ("top", "bottom"):
+                along, depth = w, h
+            else:
+                # Left/right edges: along-edge = y-direction. After default rotation
+                # (90°/270°), eff_h = w, so along-edge extent = w.
+                along, depth = w, h
+
+            if along + gap <= remaining and remaining > best_remaining:
+                best_edge = edge
+                best_remaining = remaining
+                best_rotate = False
+                best_along = along
+
+            if depth + gap <= remaining and remaining > best_remaining:
+                best_edge = edge
+                best_remaining = remaining
+                best_rotate = True
+                best_along = depth
+
+        if best_edge is not None:
+            edge_used[best_edge] += best_along + gap
+            rot = (edge_rotation[best_edge] + 90.0) % 360.0 if best_rotate else edge_rotation[best_edge]
+            comp.set_rotation(rot)
+            comp_edge[comp.ref] = best_edge
         else:
-            connector.set_rotation(0.0)
+            comp.set_rotation(0.0)
+            comp_edge[comp.ref] = None
+
+        w = comp.effective_width
+        h = comp.effective_height
+        edge = best_edge if best_edge else "bottom"
+
+        if edge == "top":
+            start = board.x_min + perimeter_margin + edge_used[edge] - best_along - gap
+            cx = start + best_along / 2.0
+            cy = board.y_min + perimeter_margin + h / 2.0
+        elif edge == "bottom":
+            start = board.x_min + perimeter_margin + edge_used[edge] - best_along - gap
+            cx = start + best_along / 2.0
+            cy = board.y_max - perimeter_margin - h / 2.0
+        elif edge == "left":
+            start = board.y_min + perimeter_margin + edge_used[edge] - best_along - gap
+            cx = board.x_min + perimeter_margin + w / 2.0
+            cy = start + best_along / 2.0
+        else:  # right
+            start = board.y_min + perimeter_margin + edge_used[edge] - best_along - gap
+            cx = board.x_max - perimeter_margin - w / 2.0
+            cy = start + best_along / 2.0
+
+        if best_edge is None:
+            cx = board.x_min + w / 2.0 + margin
+            cy = board.y_max - h / 2.0 - margin
+
+        comp.x = max(board.x_min + w / 2.0, min(cx, board.x_max - w / 2.0))
+        comp.y = max(board.y_min + h / 2.0, min(cy, board.y_max - h / 2.0))
+
+    # Resolve corner collisions between connectors on adjacent edges
+    _resolve_corner_collisions(connectors, comp_edge, board, perimeter_margin, gap)
+
+
+def _resolve_corner_collisions(
+    connectors: list[Component],
+    comp_edge: dict[str, str | None],
+    board,
+    perimeter_margin: float,
+    gap: float,
+) -> None:
+    """Push connectors along their edges to resolve corner overlaps.
+
+    For each overlapping pair on adjacent edges, push the connector closer
+    to the shared corner by just enough to clear the overlap plus a gap.
+    """
+    adjacent = {frozenset(e) for e in [("top", "left"), ("top", "right"), ("bottom", "left"), ("bottom", "right")]}
+    ref_map = {c.ref: c for c in connectors}
+
+    for _ in range(20):
+        resolved_any = False
+        for i, c1 in enumerate(connectors):
+            e1 = comp_edge.get(c1.ref)
+            if e1 is None:
+                continue
+            for c2 in connectors[i + 1:]:
+                e2 = comp_edge.get(c2.ref)
+                if e2 is None:
+                    continue
+                if not c1.overlaps(c2):
+                    continue
+                if frozenset({e1, e2}) not in adjacent:
+                    continue
+
+                # Compute overlap on each axis
+                ax1, ay1, ax2, ay2 = c1.bbox
+                bx1, by1, bx2, by2 = c2.bbox
+                ox = min(ax2, bx2) - max(ax1, bx1)
+                oy = min(ay2, by2) - max(ay1, by1)
+
+                # Determine which corner they're near and push direction
+                # For each connector, push along its edge away from the corner
+                for comp, edge, other_comp in [(c1, e1, c2), (c2, e2, c1)]:
+                    push_x, push_y = 0.0, 0.0
+
+                    if edge == "top":
+                        # Determine if near left or right corner
+                        if comp.x < other_comp.x:
+                            push_x = -(ox + gap)  # push left (away from right corner)
+                        else:
+                            push_x = ox + gap  # push right (away from left corner)
+                    elif edge == "bottom":
+                        if comp.x < other_comp.x:
+                            push_x = -(ox + gap)
+                        else:
+                            push_x = ox + gap
+                    elif edge == "left":
+                        if comp.y < other_comp.y:
+                            push_y = -(oy + gap)
+                        else:
+                            push_y = oy + gap
+                    elif edge == "right":
+                        if comp.y < other_comp.y:
+                            push_y = -(oy + gap)
+                        else:
+                            push_y = oy + gap
+
+                    # Apply push with clamping
+                    old_x, old_y = comp.x, comp.y
+                    if push_x != 0:
+                        comp.x += push_x
+                        comp.x = max(board.x_min + comp.effective_width / 2.0,
+                                     min(comp.x, board.x_max - comp.effective_width / 2.0))
+                    if push_y != 0:
+                        comp.y += push_y
+                        comp.y = max(board.y_min + comp.effective_height / 2.0,
+                                     min(comp.y, board.y_max - comp.effective_height / 2.0))
+
+                    # Check if this created a new overlap with any same-edge connector
+                    creates_new_overlap = False
+                    for c3 in connectors:
+                        if c3 is comp or c3 is other_comp:
+                            continue
+                        if comp_edge.get(c3.ref) == edge and comp.overlaps(c3):
+                            creates_new_overlap = True
+                            break
+
+                    if creates_new_overlap:
+                        comp.x, comp.y = old_x, old_y  # revert
+                    else:
+                        resolved_any = True
+
+                # If pushing both failed to resolve, try pushing just one further
+                if c1.overlaps(c2):
+                    resolved_any = True  # mark as attempted, move on
+
+        if not resolved_any:
+            break
 
 
 def _orient_connector_outward(comp: Component, board) -> None:
     pass  # Removed (now handled in _place_connectors_on_perimeter)
 
 
-def _apply_strong_repulsion(model: BoardModel) -> None:
-    """Apply strong repulsive forces between interior components (R, C, U)."""
-    interior = [c for c in model.components if c.component_type in ("resistor", "capacitor", "ic") and not c.is_fixed]
-    if len(interior) < 2:
+def _apply_strong_repulsion(model: BoardModel, exclude_types: set[str] | None = None) -> None:
+    """Apply strong repulsive forces between non-fixed, non-excluded components."""
+    exclude = exclude_types or set()
+    movable = [c for c in model.components if not c.is_fixed and c.component_type not in exclude]
+    if len(movable) < 2:
         return
 
-    min_distances = {"resistor": 10.0, "capacitor": 8.0, "ic": 12.0}
     board = model.board
+    max_iters = max(50, min(500, len(movable) * 10))
 
-    for _ in range(150):
+    for iteration in range(max_iters):
         moved = False
-        for i, ca in enumerate(interior):
-            for cb in interior[i+1:]:
+        for i, ca in enumerate(movable):
+            for cb in movable[i+1:]:
                 dx = cb.x - ca.x
                 dy = cb.y - ca.y
                 dist = (dx**2 + dy**2) ** 0.5
-                min_d = max(min_distances.get(ca.component_type, 10), min_distances.get(cb.component_type, 10))
+                min_d = max(ca.effective_width, ca.effective_height) * 0.8
+                min_d = max(min_d, max(cb.effective_width, cb.effective_height) * 0.8)
 
                 if dist < min_d:
                     if dist < 0.1:
-                        dx, dy = math.cos(_ * 0.3), math.sin(_ * 0.3)
+                        dx, dy = math.cos(iteration * 0.3), math.sin(iteration * 0.3)
                     else:
                         dx, dy = dx/dist, dy/dist
 
-                    push = (min_d - dist) * 2.0 + 1.0  # Strong push
+                    push = (min_d - dist) * 2.0 + 1.0
                     ca.x = max(board.x_min + ca.effective_width/2, min(ca.x - push*dx, board.x_max - ca.effective_width/2))
                     ca.y = max(board.y_min + ca.effective_height/2, min(ca.y - push*dy, board.y_max - ca.effective_height/2))
                     cb.x = max(board.x_min + cb.effective_width/2, min(cb.x + push*dx, board.x_max - cb.effective_width/2))
@@ -334,6 +471,46 @@ def _apply_strong_repulsion(model: BoardModel) -> None:
                     moved = True
 
         if not moved:
+            break
+
+
+def _quick_overlap_resolve(model: BoardModel, grid_mm: float = 0.1, max_iterations: int = 20,
+                           frozen_types: set[str] | None = None) -> None:
+    """Lightweight overlap cleanup using legalizer push-apart.
+
+    Gives SA a cleaner starting point without a full legalization pass.
+    Components matching frozen_types (e.g. connectors on perimeter) are treated
+    as immovable — overlapping interior components get pushed away from them.
+    """
+    frozen = frozen_types or set()
+    all_components = list(model.components)
+
+    for _ in range(max_iterations):
+        overlap_count = 0
+        for i, c1 in enumerate(all_components):
+            for c2 in all_components[i + 1:]:
+                if not c1.overlaps(c2):
+                    continue
+                c1_frozen = c1.is_fixed or c1.component_type in frozen
+                c2_frozen = c2.is_fixed or c2.component_type in frozen
+                if c1_frozen and c2_frozen:
+                    continue
+                overlap_count += 1
+                if c1_frozen:
+                    # Temporarily mark c1 as fixed so _push_apart only moves c2
+                    c1.is_fixed = True
+                    _push_apart(c1, c2, 1.0, grid_mm)
+                    c1.is_fixed = False
+                elif c2_frozen:
+                    c2.is_fixed = True
+                    _push_apart(c1, c2, 1.0, grid_mm)
+                    c2.is_fixed = False
+                else:
+                    _push_apart(c1, c2, 1.0, grid_mm)
+
+        _enforce_boundary(model)
+
+        if overlap_count == 0:
             break
 
 
