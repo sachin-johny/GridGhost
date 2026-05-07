@@ -201,8 +201,37 @@ def _update_position(fp_block: str, comp: Component) -> str:
 
     # Reconstruct the block
     if len(pad_split) > 1:
+        if comp.rotation != 0.0:
+            pad_section = _add_pad_rotation(pad_split[1], round(comp.rotation))
+            return header + "(pad " + pad_section
         return header + "(pad " + pad_split[1]
     return header
+
+
+def _add_pad_rotation(pad_section: str, rotation: int) -> str:
+    """Add explicit rotation to pad (at ...) expressions.
+
+    When a footprint is rotated, KiCad applies the rotation to courtyard/
+    silkscreen but not to pads. This function sets the rotation on each pad's
+    (at X Y [R]) so copper layers match the courtyard orientation.
+
+    Pads that already have an explicit rotation (3-arg at) get it replaced.
+    Pads with 2-arg (at X Y) get the rotation appended.
+    """
+    def _replace_at(m: re.Match) -> str:
+        x, y = m.group(1), m.group(2)
+        return f"(at {x} {y} {rotation})"
+
+    # Match (at X Y) or (at X Y R) at pad-body indentation level.
+    # Pad (at ...) is always a direct child of the pad block, typically
+    # indented with 3 tabs. We match any (at ...) with only numeric args —
+    # nested property (at ...) would have a string arg (e.g. in fp_* primitives)
+    # which this regex excludes.
+    return re.sub(
+        r'\(\s*at\s+([-\d.]+)\s+([-\d.]+)(?:\s+[-\d.]+)?\s*\)',
+        _replace_at,
+        pad_section,
+    )
 
 
 def export_positions_json(model: BoardModel, output_path: str) -> str:
