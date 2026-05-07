@@ -135,9 +135,9 @@ def cmd_place(args) -> None:
             verbose=True,
         )
         sa_result = run_sa(model, config=sa_config, verbose=True)
-        print(f"  SA: cost {sa_result['initial_cost']:.1f} → {sa_result['final_cost']:.1f} "
-              f"(Δ={sa_result['improvement']:.1f})")
-        print(f"  SA: HPWL {sa_result['initial_hpwl']:.1f} → {sa_result['final_hpwl']:.1f}")
+        print(f"  SA: cost {sa_result['initial_cost']:.1f} -> {sa_result['final_cost']:.1f} "
+              f"(delta={sa_result['improvement']:.1f})")
+        print(f"  SA: HPWL {sa_result['initial_hpwl']:.1f} -> {sa_result['final_hpwl']:.1f}")
         print(f"  SA: overlaps={sa_result['overlap_count']}")
         print_board_summary(model, "After SA Optimization")
     else:

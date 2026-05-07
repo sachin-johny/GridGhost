@@ -124,10 +124,10 @@ def test_pad_absolute_pos():
     assert abs(ax - 11.0) < 0.01, f"Expected x=11.0, got {ax}"
     assert abs(ay - 10.0) < 0.01, f"Expected y=10.0, got {ay}"
 
-    # 90° rotation
+    # 90° clockwise rotation (KiCad convention): (1,0) → (0,-1)
     ax, ay = pad.absolute_pos(10.0, 10.0, 90.0)
     assert abs(ax - 10.0) < 0.01, f"Expected x=10.0, got {ax}"
-    assert abs(ay - 11.0) < 0.01, f"Expected y=11.0, got {ay}"
+    assert abs(ay - 9.0) < 0.01, f"Expected y=9.0, got {ay}"
 
 
 def test_board_model_serialization():
@@ -607,9 +607,9 @@ def test_rotation_bbox_offset_rotation():
     bbox90 = c.bbox
     cx90 = (bbox90[0] + bbox90[2]) / 2
     cy90 = (bbox90[1] + bbox90[3]) / 2
-    # Offset should rotate: (1, 0.5) → (-0.5, 1) at 90°
-    assert abs(cx90 - 49.5) < 0.01, f"90° cx={cx90}, expected 49.5"
-    assert abs(cy90 - 51.0) < 0.01, f"90° cy={cy90}, expected 51.0"
+    # Offset should rotate clockwise (KiCad convention): (1, 0.5) → (0.5, -1) at 90°
+    assert abs(cx90 - 50.5) < 0.01, f"90° cx={cx90}, expected 50.5"
+    assert abs(cy90 - 49.0) < 0.01, f"90° cy={cy90}, expected 49.0"
 
 
 # ---------------------------------------------------------------------------

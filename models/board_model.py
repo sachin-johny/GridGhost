@@ -24,7 +24,7 @@ class Pad:
         """Return absolute pad position given component position and rotation."""
         import math
         rad = math.radians(rotation)
-        cos_r, sin_r = math.cos(rad), math.sin(rad)
+        cos_r, sin_r = math.cos(rad), -math.sin(rad)  # KiCad uses clockwise-positive rotation
         abs_x = comp_x + self.x * cos_r - self.y * sin_r
         abs_y = comp_y + self.x * sin_r + self.y * cos_r
         return abs_x, abs_y
@@ -60,7 +60,7 @@ class Component:
     def _update_trig(self):
         rad = math.radians(self.rotation)
         self._cos_a = math.cos(rad)
-        self._sin_a = math.sin(rad)
+        self._sin_a = -math.sin(rad)  # KiCad uses clockwise-positive rotation
 
     def set_rotation(self, angle: float):
         self.rotation = angle % 360.0
