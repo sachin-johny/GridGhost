@@ -21,7 +21,7 @@ from models.board_model import BoardModel, Component
 
 def format_kicad_coord(mm: float) -> str:
     """Format a coordinate value for KiCad PCB file (millimeters as float).
-    
+
     KiCad stores coordinates as floating-point millimeters.
     Round to 6 decimal places for micrometer precision.
     """
@@ -171,27 +171,28 @@ def _update_position(fp_block: str, comp: Component) -> str:
     x_str = format_kicad_coord(comp.x)
     y_str = format_kicad_coord(comp.y)
 
-    # Find and replace the (at ...) at the footprint level (not pad level)
-    # The footprint-level (at ...) comes before any (pad ...) expressions
-
-    # Strategy: find the first (at ...) that's at the top level of the footprint
-    # (i.e., not nested inside a pad or fp_text)
-
-    # For simplicity, we replace the first (at X Y [R]) in the footprint
-    # header (before any pad definitions)
-
     # Split at first (pad to isolate header
     pad_split = re.split(r'\(\s*pad\s', fp_block, maxsplit=1)
     header = pad_split[0]
 
+    # Extract original footprint rotation from the header before replacing
+    orig_match = re.search(
+        r'\(\s*at\s+[-\d.]+\s+[-\d.]+(?:\s+([-\d.]+))?\s*\)',
+        header,
+    )
+    orig_rotation = float(orig_match.group(1)) if orig_match and orig_match.group(1) else 0.0
+
+    # Compute rotation delta that pads need
+    new_rotation = round(comp.rotation)
+    rotation_delta = (new_rotation - round(orig_rotation)) % 360
+
     # Build new (at ...) expression
     if comp.rotation != 0.0:
-        new_at = f"(at {x_str} {y_str} {round(comp.rotation)})"
+        new_at = f"(at {x_str} {y_str} {new_rotation})"
     else:
         new_at = f"(at {x_str} {y_str})"
 
     # Replace the (at ...) in the header
-    # Match the footprint-level at expression
     header = re.sub(
         r'\(\s*at\s+[-\d.]+\s+[-\d.]+(?:\s+[-\d.]+)?\s*\)',
         new_at,
@@ -201,34 +202,31 @@ def _update_position(fp_block: str, comp: Component) -> str:
 
     # Reconstruct the block
     if len(pad_split) > 1:
-        if comp.rotation != 0.0:
-            pad_section = _add_pad_rotation(pad_split[1], round(comp.rotation))
+        if rotation_delta != 0:
+            pad_section = _add_pad_rotation(pad_split[1], rotation_delta)
             return header + "(pad " + pad_section
         return header + "(pad " + pad_split[1]
     return header
 
 
-def _add_pad_rotation(pad_section: str, rotation: int) -> str:
-    """Add explicit rotation to pad (at ...) expressions.
+def _add_pad_rotation(pad_section: str, rotation_delta: int) -> str:
+    """Add rotation delta to pad (at ...) expressions.
 
-    When a footprint is rotated, KiCad applies the rotation to courtyard/
-    silkscreen but not to pads. This function sets the rotation on each pad's
-    (at X Y [R]) so copper layers match the courtyard orientation.
+    When a footprint's rotation changes, KiCad applies the change to courtyard/
+    silkscreen but not to pads. This function adjusts each pad's (at X Y [R])
+    by adding the rotation delta so copper layers match the courtyard orientation.
 
-    Pads that already have an explicit rotation (3-arg at) get it replaced.
-    Pads with 2-arg (at X Y) get the rotation appended.
+    Pads that already have an explicit rotation (3-arg at) get the delta added.
+    Pads with 2-arg (at X Y) get the delta appended as a new third arg.
     """
     def _replace_at(m: re.Match) -> str:
         x, y = m.group(1), m.group(2)
-        return f"(at {x} {y} {rotation})"
+        existing_rot = float(m.group(3)) if m.group(3) else 0.0
+        new_rot = round((existing_rot + rotation_delta) % 360)
+        return f"(at {x} {y} {new_rot})"
 
-    # Match (at X Y) or (at X Y R) at pad-body indentation level.
-    # Pad (at ...) is always a direct child of the pad block, typically
-    # indented with 3 tabs. We match any (at ...) with only numeric args —
-    # nested property (at ...) would have a string arg (e.g. in fp_* primitives)
-    # which this regex excludes.
     return re.sub(
-        r'\(\s*at\s+([-\d.]+)\s+([-\d.]+)(?:\s+[-\d.]+)?\s*\)',
+        r'\(\s*at\s+([-\d.]+)\s+([-\d.]+)(?:\s+([-\d.]+))?\s*\)',
         _replace_at,
         pad_section,
     )
