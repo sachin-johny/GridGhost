@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""KiCad Smart Auto-Placer — CLI Interface.
+"""GridGhost — CLI Interface.
 
 Usage:
-    python -m auto_placer place <input.kicad_pcb> [options]
-    python -m auto_placer extract <input.kicad_pcb> [-o output.json]
-    python -m auto_placer profiles
+    python gridghost.py place <input.kicad_pcb> [options]
+    python gridghost.py extract <input.kicad_pcb> [-o output.json]
+    python gridghost.py profiles
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ def cmd_place(args) -> None:
     _apply_config_to_globals(cfg)
 
     print(f"\n{'#' * 60}")
-    print(f"  KiCad Smart Auto-Placer")
+    print(f"  GridGhost")
     print(f"{'#' * 60}\n")
 
     # Step 1: Extract
@@ -250,8 +250,8 @@ def _interactive_tuning(profile: BoardProfile) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="auto_placer",
-        description="KiCad Smart Auto-Placer - Constraint-aware PCB auto-placement",
+        prog="gridghost",
+        description="GridGhost - Constraint-aware PCB auto-placement for KiCad",
     )
     parser.add_argument("--config", default=None, help="Path to config.json (default: config.json in script dir)")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")

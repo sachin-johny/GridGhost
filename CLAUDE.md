@@ -1,10 +1,10 @@
-# KiCad Smart Auto-Placer
+# GridGhost
 
 External PCB auto-placement optimization engine for KiCad. Separates data extraction from optimization for better performance and flexibility.
 
 ## Project Status (Current: Phase 6 Complete)
 
-**Last Updated:** 2026-05-06
+**Last Updated:** 2026-05-07
 
 ### What Works
 - Full pipeline end-to-end: extraction → net clustering → placement → SA optimization → legalization → result saving
@@ -56,7 +56,7 @@ KiCad .kicad_pcb
 ```
 auto_placer/
 ├── __init__.py          # Package init, version 0.1.0
-├── __main__.py          # CLI entry point (extract/place/cost/profiles commands)
+├── gridghost.py        # CLI entry point (place/extract/profiles commands)
 ├── models/
 │   └── board_model.py   # Core data models: BoardModel, Component, Net, Pad, BoardOutline
 │                        # All coordinates in mm. bbox/overlaps/effective dimensions included.
@@ -123,7 +123,7 @@ Cost weights and rule priorities pre-configured per board type:
 ## CLI Usage
 
 ```bash
-python -m auto_placer place <input.kicad_pcb> [options]
+python gridghost.py place <input.kicad_pcb> [options]
   -a, --algorithm     # force-directed (default) | grid
   -p, --profile       # Board profile (default: generic)
   -m, --margin        # Board edge margin mm (default: 5.0)
@@ -133,8 +133,8 @@ python -m auto_placer place <input.kicad_pcb> [options]
   --sa-iterations N   # Max SA temperature steps (default: 200)
   --sa-reheat N       # Number of SA reheat rounds (default: 2)
 
-python -m auto_placer extract <input.kicad_pcb> [-o output.json]
-python -m auto_placer profiles
+python gridghost.py extract <input.kicad_pcb> [-o output.json]
+python gridghost.py profiles
 ```
 
 ---

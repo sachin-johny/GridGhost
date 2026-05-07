@@ -138,7 +138,7 @@ def load_config(config_path: str | None = None) -> Config:
 
     Searches for config.json in:
     1. Explicit path (if config_path provided)
-    2. Same directory as the script (__main__.py)
+    2. Same directory as the script (gridghost.py)
 
     Falls back to built-in defaults if no file found.
     """
