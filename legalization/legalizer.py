@@ -64,9 +64,13 @@ def legalize(
 
 
 def _snap_to_grid(model: BoardModel, grid_mm: float) -> None:
-    """Round all component positions to the nearest grid point."""
+    """Round all component positions to the nearest grid point.
+    
+    Connectors are NOT snapped - they keep their exact perimeter positions.
+    """
     for comp in model.components:
-        if comp.is_fixed:
+        # Skip fixed components AND connectors
+        if comp.is_fixed or getattr(comp, 'component_type', '') == "connector":
             continue
         comp.x = round(comp.x / grid_mm) * grid_mm
         comp.y = round(comp.y / grid_mm) * grid_mm
@@ -75,16 +79,25 @@ def _snap_to_grid(model: BoardModel, grid_mm: float) -> None:
 
 
 def _enforce_boundary(model: BoardModel) -> None:
-    """Clamp component positions so their bounding boxes stay within the board."""
+    """Clamp component positions so their bounding boxes stay within the board.
+    
+    Connectors are treated as fixed - they stay where placed on perimeter.
+    """
     board = model.board
     for comp in model.components:
-        if comp.is_fixed:
+        # Skip fixed components AND connectors (connectors stay on perimeter)
+        if comp.is_fixed or getattr(comp, 'component_type', '') == "connector":
             continue
         half_w = comp.effective_width / 2.0
         half_h = comp.effective_height / 2.0
 
         comp.x = max(board.x_min + half_w, min(comp.x, board.x_max - half_w))
         comp.y = max(board.y_min + half_h, min(comp.y, board.y_max - half_h))
+
+
+def _is_connector(comp: Component) -> bool:
+    """Check if a component is a connector."""
+    return getattr(comp, 'component_type', '') == "connector"
 
 
 def _resolve_overlaps(
@@ -99,6 +112,9 @@ def _resolve_overlaps(
     Uses a force-directed push-apart strategy: for each overlapping pair,
     compute the overlap direction and push both components away from each other.
     Increases push_strength adaptively if progress stalls.
+    
+    Connectors are treated as fixed - they stay on perimeter and only interior
+    components get pushed away from them.
     """
     prev_overlap_count = float("inf")
     stall_iterations = 0
@@ -116,12 +132,21 @@ def _resolve_overlaps(
                 if not c1.overlaps(c2):
                     continue
 
-                # Cannot resolve if both are fixed.
-                if c1.is_fixed and c2.is_fixed:
+                # Cannot resolve if both are fixed or both are connectors
+                c1_fixed = c1.is_fixed or _is_connector(c1)
+                c2_fixed = c2.is_fixed or _is_connector(c2)
+                if c1_fixed and c2_fixed:
                     continue
 
                 overlap_count += 1
-                _push_apart(c1, c2, adaptive_strength, grid_mm)
+                
+                # If one is a connector, only move the non-connector
+                if c1_fixed:
+                    _push_apart_one(c2, c1, adaptive_strength, grid_mm)
+                elif c2_fixed:
+                    _push_apart_one(c1, c2, adaptive_strength, grid_mm)
+                else:
+                    _push_apart(c1, c2, adaptive_strength, grid_mm)
 
         # Keep everything inside board after each sweep.
         _enforce_boundary(model)
@@ -145,6 +170,47 @@ def _resolve_overlaps(
         if verbose:
             print(f"  Overlap resolution: max iterations ({max_iterations}) reached, "
                   f"{_count_overlaps(model)} overlaps remaining")
+
+
+def _push_apart_one(movable: Component, fixed: Component, strength: float, grid_mm: float) -> None:
+    """Push the movable component away from a fixed component (connector).
+    
+    Args:
+        movable: Component to move (interior component)
+        fixed: Fixed component to move away from (connector on perimeter)
+        strength: Multiplier for push distance
+        grid_mm: Minimum movement (1.5x grid unit)
+    """
+    # Compute overlap on each axis
+    ax1, ay1, ax2, ay2 = movable.bbox
+    bx1, by1, bx2, by2 = fixed.bbox
+
+    overlap_x = min(ax2, bx2) - max(ax1, bx1)
+    overlap_y = min(ay2, by2) - max(ay1, by1)
+
+    if overlap_x <= 0 or overlap_y <= 0:
+        return  # No actual overlap
+
+    # Ensure minimum push distance = 1.5x grid unit to guarantee progress
+    push_mm = max(grid_mm * 1.5, 0.15)
+
+    # Push along axis of minimum separation for minimal displacement
+    if overlap_x <= overlap_y:
+        # Push along X axis
+        push_x = max(overlap_x * strength, push_mm)
+        push_y = 0
+    else:
+        # Push along Y axis
+        push_x = 0
+        push_y = max(overlap_y * strength, push_mm)
+
+    # Determine push direction: move movable away from fixed
+    dx = 1 if movable.x >= fixed.x else -1
+    dy = 1 if movable.y >= fixed.y else -1
+
+    # Apply push to movable component only
+    movable.x += dx * push_x
+    movable.y += dy * push_y
 
 
 def _push_apart(c1: Component, c2: Component, strength: float, grid_mm: float) -> None:

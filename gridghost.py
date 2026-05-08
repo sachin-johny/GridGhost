@@ -20,6 +20,7 @@ from parsers.kicad_parser import KiCadParser
 from parsers.placement_writer import apply_placement, export_positions_json, write_debug_bboxes
 from engine.net_clustering import cluster_components, compute_seed_positions
 from engine.grid_placement import grid_place, force_directed_place
+from engine.smart_placement import smart_grid_place
 from engine.cost_function import CostFunction, total_hpwl, count_overlaps, count_out_of_bounds
 from engine.annealer import run_sa, SAConfig
 from legalization.legalizer import legalize
@@ -118,7 +119,7 @@ def cmd_place(args) -> None:
         )
     else:
         print("  Algorithm: grid (cluster-based seed placement)")
-        grid_place(
+        smart_grid_place(
             model,
             margin=args.margin if args.margin is not None else pcfg.margin,
             spacing_factor=pcfg.spacing_factor,
