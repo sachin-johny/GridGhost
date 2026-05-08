@@ -13,10 +13,28 @@ import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Set, TYPE_CHECKING
+from typing import Optional, List, Dict, Set, Tuple, TYPE_CHECKING
+
+from engine.net_clustering import cluster_components, assign_cluster_positions
 
 if TYPE_CHECKING:
     from models.board_model import BoardModel, Component, BoardOutline
+
+
+# =============================================================================
+# VERTICAL CONNECTOR DETECTION
+# =============================================================================
+
+def _is_vertical_connector(comp: "Component") -> bool:
+    """Return True if connector should be treated as interior (vertical/THT)."""
+    fp  = getattr(comp, 'footprint', '') or ''
+    val = getattr(comp, 'value', '')    or ''
+    name = fp + ' ' + val
+    if re.search(r'Horizontal|Angled|Side', name, re.IGNORECASE):
+        return False
+    if re.search(r'Vertical|THT', name, re.IGNORECASE):
+        return True
+    return not re.search(r'Horizontal|Angled|Edge|Side', name, re.IGNORECASE)
 
 
 # =============================================================================
@@ -121,6 +139,8 @@ def smart_grid_place(
     model: "BoardModel",
     margin: float = 5.0,
     spacing_factor: float = 1.3,
+    sa_iterations: int = 2000,
+    min_connector_gap: float = 2.0,
 ) -> "BoardModel":
     """Smart PCB placement: interior first, connectors around interior bbox perimeter.
 
@@ -128,29 +148,47 @@ def smart_grid_place(
         model: BoardModel with components to place
         margin: Margin from board edges in mm
         spacing_factor: Spacing multiplier for interior components
+        sa_iterations: SA iterations for interior optimization
+        min_connector_gap: Minimum gap between adjacent connectors
 
     Returns:
         BoardModel with all components placed
     """
-    # Separate components
-    connectors = [c for c in model.components
-                  if getattr(c, 'component_type', '') == "connector" and not c.is_fixed]
-    interior = [c for c in model.components
-                if getattr(c, 'component_type', '') != "connector" and not c.is_fixed]
+    # Phase 1: Classify — vertical connectors go with interior
+    edge_connectors = [
+        c for c in model.components
+        if getattr(c, 'component_type', '') == "connector"
+        and not c.is_fixed
+        and not _is_vertical_connector(c)
+    ]
+    interior = [
+        c for c in model.components
+        if not c.is_fixed and (
+            getattr(c, 'component_type', '') != "connector"
+            or _is_vertical_connector(c)
+        )
+    ]
 
-    # Step 1: Place interior components (full board area)
+    # Phase 2: Net-cluster-based interior placement
     if interior:
         _place_interior(model, interior, margin, spacing_factor)
 
-    # Step 2: Compute bounding box around interior components
+    # Phase 3: SA optimization (HPWL minimization, no connectors present)
+    if interior:
+        _optimize_interior_sa(model, interior, margin, n_iter=sa_iterations)
+
+    # Phase 4: Interior bbox computed AFTER optimization
     ib = _compute_interior_bbox(interior, model.board, margin)
 
-    # Step 3: Place connectors on perimeter of interior bbox
-    if connectors:
-        _place_connectors_perimeter(model, connectors, margin, ib)
+    # Phase 5: Place edge connectors on exterior of interior bbox
+    if edge_connectors:
+        _place_connectors_perimeter(
+            model, edge_connectors, margin, ib,
+            min_connector_gap=min_connector_gap,
+        )
 
-    # Step 4: Resolve any remaining overlaps (connectors fixed, interior pushed inward)
-    _resolve_all_overlaps(model, margin)
+    # Phase 6: Overlap resolution — push inward, clamp to interior bbox
+    _resolve_all_overlaps(model, interior, margin, ib)
 
     return model
 
@@ -165,49 +203,109 @@ def _place_interior(
     margin: float,
     spacing_factor: float,
 ) -> None:
-    """Place interior components in efficient grid layout across full board area."""
-    board = model.board
+    """Net-cluster based interior placement.
 
+    Groups ICs with their decoupling caps/resistors via cluster_components(),
+    assigns each cluster its own sub-region, then places within cluster
+    with the most-connected component at center and passives radiating outward.
+    """
+    board = model.board
     x_min = board.x_min + margin
     x_max = board.x_max - margin
     y_min = board.y_min + margin
     y_max = board.y_max - margin
+    interior_refs = {c.ref for c in interior}
 
-    n = len(interior)
-    region_w = x_max - x_min
-    region_h = y_max - y_min
+    try:
+        clusters = cluster_components(model)
+        for cl in clusters:
+            cl['components'] = [c for c in cl['components']
+                                 if c.ref in interior_refs]
+        clusters = [cl for cl in clusters if cl['components']]
+        region_map = assign_cluster_positions(model, clusters)
+    except Exception:
+        clusters  = [{'id': 'all', 'components': interior}]
+        region_map = {'all': (x_min, y_min, x_max, y_max)}
 
-    # Aspect-ratio aware grid
-    aspect = region_w / max(region_h, 1e-9)
-    cols = max(1, min(n, int(round(math.sqrt(n * aspect)))))
-    rows = max(1, int(math.ceil(n / cols)))
+    placed_refs: Set[str] = set()
 
-    cell_w = region_w / cols
-    cell_h = region_h / rows
+    for cluster in clusters:
+        cl_id  = cluster['id']
+        region = region_map.get(cl_id, (x_min, y_min, x_max, y_max))
+        rx_min, ry_min, rx_max, ry_max = region
+        comps  = cluster['components']
+        if not comps:
+            continue
 
-    # Sort by size (larger first for centering)
-    interior_sorted = sorted(interior, key=lambda c: c.effective_width * c.effective_height, reverse=True)
+        def connectivity_score(c):
+            n_nets = sum(
+                1 for net in model.nets
+                if any(ref == c.ref for ref, _ in net.pins)
+            )
+            type_priority = {
+                'ic': 100, 'mcu': 100, 'regulator': 80,
+                'resistor': 10, 'capacitor': 5, 'inductor': 8,
+            }
+            t = getattr(c, 'component_type', 'other')
+            return n_nets * 10 + type_priority.get(t, 20)
 
-    for idx, comp in enumerate(interior_sorted):
-        col = idx % cols
-        row = idx // cols
+        comps_sorted = sorted(comps, key=connectivity_score, reverse=True)
+        _place_cluster_grid(comps_sorted, rx_min, ry_min, rx_max, ry_max)
+        placed_refs.update(c.ref for c in comps)
 
-        # Center of cell
-        cx = x_min + (col + 0.5) * cell_w
-        cy = y_min + (row + 0.5) * cell_h
+    # Fallback: any component not covered by a cluster
+    unplaced = [c for c in interior if c.ref not in placed_refs]
+    if unplaced:
+        _place_cluster_grid(unplaced, x_min, y_min, x_max, y_max)
 
-        # Offset for odd rows
-        if row % 2 == 1:
-            cx += cell_w * 0.08
-
-        # Clamp to bounds
-        w2 = comp.effective_width / 2
-        h2 = comp.effective_height / 2
-        comp.x = max(x_min + w2, min(cx, x_max - w2))
-        comp.y = max(y_min + h2, min(cy, y_max - h2))
-
-    # Apply repulsion
     _apply_repulsion(interior, x_min, x_max, y_min, y_max, spacing_factor)
+
+
+def _place_cluster_grid(
+    comps: List["Component"],
+    rx_min: float, ry_min: float,
+    rx_max: float, ry_max: float,
+) -> None:
+    """Grid layout for one cluster's components in a sub-region.
+
+    Index-0 (most connected) lands near the center cell;
+    remaining components fill outward.
+    """
+    n = len(comps)
+    if n == 0:
+        return
+    rw = rx_max - rx_min
+    rh = ry_max - ry_min
+    if rw <= 0 or rh <= 0:
+        return
+    if n == 1:
+        c = comps[0]
+        c.x = (rx_min + rx_max) / 2
+        c.y = (ry_min + ry_max) / 2
+        return
+
+    aspect = rw / max(rh, 1e-9)
+    cols   = max(1, min(n, int(round(math.sqrt(n * aspect)))))
+    rows   = max(1, math.ceil(n / cols))
+    cell_w = rw / cols
+    cell_h = rh / rows
+
+    center_col = cols // 2
+    center_row = rows // 2
+    order = sorted(
+        range(cols * rows),
+        key=lambda slot: abs(slot % cols - center_col) + abs(slot // cols - center_row),
+    )
+
+    for comp_idx, comp in enumerate(comps):
+        slot    = order[comp_idx] if comp_idx < len(order) else comp_idx
+        col     = slot % cols
+        row     = slot // cols
+        cx      = rx_min + (col + 0.5) * cell_w
+        cy      = ry_min + (row + 0.5) * cell_h
+        w2, h2  = comp.effective_width / 2, comp.effective_height / 2
+        comp.x  = max(rx_min + w2, min(cx, rx_max - w2))
+        comp.y  = max(ry_min + h2, min(cy, ry_max - h2))
 
 
 def _apply_repulsion(
@@ -252,6 +350,67 @@ def _apply_repulsion(
 
         if not moved:
             break
+
+
+# =============================================================================
+# SA OPTIMIZATION
+# =============================================================================
+
+def _compute_hpwl(model: "BoardModel") -> float:
+    """Half-perimeter wire length across all nets."""
+    total = 0.0
+    for net in model.nets:
+        xs, ys = [], []
+        for ref, _ in net.pins:
+            c = model.get_component(ref)
+            if c:
+                xs.append(c.x)
+                ys.append(c.y)
+        if len(xs) >= 2:
+            total += (max(xs) - min(xs)) + (max(ys) - min(ys))
+    return total
+
+
+def _optimize_interior_sa(
+    model: "BoardModel",
+    interior: List["Component"],
+    margin: float,
+    T_start: float = 5.0,
+    T_end: float = 0.1,
+    n_iter: int = 2000,
+) -> None:
+    """Simulated annealing to minimize HPWL for interior components."""
+    import random
+    board = model.board
+    x_min, x_max = board.x_min + margin, board.x_max - margin
+    y_min, y_max = board.y_min + margin, board.y_max - margin
+
+    cost    = _compute_hpwl(model)
+    T       = T_start
+    cooling = (T_end / T_start) ** (1.0 / max(n_iter, 1))
+    rng     = random.Random(42)
+
+    for _ in range(n_iter):
+        comp        = rng.choice(interior)
+        old_x, old_y = comp.x, comp.y
+
+        step    = T * 2.0
+        comp.x  = max(x_min + comp.effective_width  / 2,
+                      min(old_x + rng.uniform(-step, step),
+                          x_max - comp.effective_width  / 2))
+        comp.y  = max(y_min + comp.effective_height / 2,
+                      min(old_y + rng.uniform(-step, step),
+                          y_max - comp.effective_height / 2))
+
+        new_cost = _compute_hpwl(model)
+        delta    = new_cost - cost
+
+        if delta < 0 or rng.random() < math.exp(-delta / max(T, 1e-9)):
+            cost = new_cost
+        else:
+            comp.x, comp.y = old_x, old_y
+
+        T *= cooling
 
 
 # =============================================================================
@@ -384,6 +543,7 @@ def _place_connectors_perimeter(
     connectors: List["Component"],
     margin: float,
     interior_bbox: tuple[float, float, float, float],
+    min_connector_gap: float = 2.0,
 ) -> None:
     """Place connectors on perimeter of interior bbox, facing outward.
 
@@ -555,13 +715,14 @@ def _place_connectors_perimeter(
 
                 comp_edge[comp.ref] = edge
 
-                # Advance position by the along-edge extent
+                # Advance position by the along-edge extent + enforced gap
+                gap_to_use = max(gap, min_connector_gap)
                 if edge in ("bottom", "top"):
-                    pos += w + gap
+                    pos += w + gap_to_use
                 else:
-                    pos += h + gap
+                    pos += h + gap_to_use
 
-            pos += gap * 0.5
+            pos += gap_to_use * 0.5
 
     _resolve_corners(connectors, comp_edge, board, margin, gap)
 
@@ -619,11 +780,27 @@ def _resolve_corners(
 # FINAL OVERLAP RESOLUTION
 # =============================================================================
 
-def _resolve_all_overlaps(model: "BoardModel", margin: float) -> None:
-    """Final pass to resolve overlaps. Connectors are fixed, only interior components move."""
-    connector_ids = {id(c) for c in model.components
-                     if getattr(c, 'component_type', '') == "connector"}
-    board = model.board
+def _resolve_all_overlaps(
+    model: "BoardModel",
+    interior: List["Component"],
+    margin: float,
+    ib: tuple[float, float, float, float],
+    ib_margin: float = 1.0,
+) -> None:
+    """Resolve overlaps. Interior components are pushed toward interior bbox center."""
+    connector_ids = {
+        id(c) for c in model.components
+        if getattr(c, 'component_type', '') == "connector"
+        and not _is_vertical_connector(c)
+    }
+
+    ib_x_min, ib_y_min, ib_x_max, ib_y_max = ib
+    clamp_x_min = ib_x_min + ib_margin
+    clamp_x_max = ib_x_max - ib_margin
+    clamp_y_min = ib_y_min + ib_margin
+    clamp_y_max = ib_y_max - ib_margin
+    ib_cx = (ib_x_min + ib_x_max) / 2
+    ib_cy = (ib_y_min + ib_y_max) / 2
 
     for iteration in range(50):
         overlap_found = False
@@ -644,10 +821,9 @@ def _resolve_all_overlaps(model: "BoardModel", margin: float) -> None:
                     continue
 
                 overlap_found = True
-                dx = c2.x - c1.x
-                dy = c2.y - c1.y
+                dx   = c2.x - c1.x
+                dy   = c2.y - c1.y
                 dist = math.sqrt(dx * dx + dy * dy)
-
                 if dist < 0.1:
                     dx, dy = 1.0, 0.0
                 else:
@@ -656,27 +832,53 @@ def _resolve_all_overlaps(model: "BoardModel", margin: float) -> None:
                 push = 0.5
 
                 if c1_is_conn:
-                    c2.x = max(board.x_min + c2.effective_width/2,
-                              min(c2.x + push * dx * 2, board.x_max - c2.effective_width/2))
-                    c2.y = max(board.y_min + c2.effective_height/2,
-                              min(c2.y + push * dy * 2, board.y_max - c2.effective_height/2))
+                    tx = ib_cx - c2.x
+                    ty = ib_cy - c2.y
+                    td = math.sqrt(tx * tx + ty * ty)
+                    tx, ty = (tx / td, ty / td) if td > 0.1 else (-dx, -dy)
+                    c2.x += push * 2 * tx
+                    c2.y += push * 2 * ty
+                    _clamp_to_interior(c2, clamp_x_min, clamp_x_max,
+                                           clamp_y_min, clamp_y_max)
+
                 elif c2_is_conn:
-                    c1.x = max(board.x_min + c1.effective_width/2,
-                              min(c1.x - push * dx * 2, board.x_max - c1.effective_width/2))
-                    c1.y = max(board.y_min + c1.effective_height/2,
-                              min(c1.y - push * dy * 2, board.y_max - c1.effective_height/2))
+                    tx = ib_cx - c1.x
+                    ty = ib_cy - c1.y
+                    td = math.sqrt(tx * tx + ty * ty)
+                    tx, ty = (tx / td, ty / td) if td > 0.1 else (dx, dy)
+                    c1.x += push * 2 * tx
+                    c1.y += push * 2 * ty
+                    _clamp_to_interior(c1, clamp_x_min, clamp_x_max,
+                                           clamp_y_min, clamp_y_max)
+
                 else:
-                    c1.x = max(board.x_min + c1.effective_width/2,
-                              min(c1.x - push * dx, board.x_max - c1.effective_width/2))
-                    c1.y = max(board.y_min + c1.effective_height/2,
-                              min(c1.y - push * dy, board.y_max - c1.effective_height/2))
-                    c2.x = max(board.x_min + c2.effective_width/2,
-                              min(c2.x + push * dx, board.x_max - c2.effective_width/2))
-                    c2.y = max(board.y_min + c2.effective_height/2,
-                              min(c2.y + push * dy, board.y_max - c2.effective_height/2))
+                    c1.x = max(clamp_x_min + c1.effective_width  / 2,
+                               min(c1.x - push * dx,
+                                   clamp_x_max - c1.effective_width  / 2))
+                    c1.y = max(clamp_y_min + c1.effective_height / 2,
+                               min(c1.y - push * dy,
+                                   clamp_y_max - c1.effective_height / 2))
+                    c2.x = max(clamp_x_min + c2.effective_width  / 2,
+                               min(c2.x + push * dx,
+                                   clamp_x_max - c2.effective_width  / 2))
+                    c2.y = max(clamp_y_min + c2.effective_height / 2,
+                               min(c2.y + push * dy,
+                                   clamp_y_max - c2.effective_height / 2))
 
         if not overlap_found:
             break
+
+
+def _clamp_to_interior(
+    comp: "Component",
+    x_min: float, x_max: float,
+    y_min: float, y_max: float,
+) -> None:
+    """Clamp a component's center to stay within the interior bbox."""
+    w2 = comp.effective_width  / 2
+    h2 = comp.effective_height / 2
+    comp.x = max(x_min + w2, min(comp.x, x_max - w2))
+    comp.y = max(y_min + h2, min(comp.y, y_max - h2))
 
 
 # =============================================================================
