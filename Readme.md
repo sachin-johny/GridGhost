@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="logo.png" alt="GridGhost Logo" width="200" />
+  <img src="logo.png" alt="GridGhost Logo" width="150" />
   <h2>GridGhost</h2>
   <p>External PCB auto-placement optimization engine for KiCad.</p>
   <p>Extracts component data from `.kicad_pcb` files, optimizes placement using net-aware clustering, simulated annealing, and constraint-driven legalization, then writes results back.</p>
@@ -132,6 +132,7 @@ auto_placer/
 │   └── test_phase1.py       # 42 tests
 ├── config.json              # Runtime configuration
 ├── CLAUDE.md                # AI assistant context
+├── logo.png                 # Project logo
 └── README.md                # This file
 ```
 
