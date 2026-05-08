@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Set, Tuple, TYPE_CHECKING
 
 from engine.net_clustering import cluster_components, assign_cluster_positions
+from engine.cost_state import _is_power_net
 
 if TYPE_CHECKING:
     from models.board_model import BoardModel, Component, BoardOutline
@@ -206,8 +207,8 @@ def _place_interior(
     """Net-cluster based interior placement.
 
     Groups ICs with their decoupling caps/resistors via cluster_components(),
-    assigns each cluster its own sub-region, then places within cluster
-    with the most-connected component at center and passives radiating outward.
+    assigns each cluster its own sub-region. Within each cluster, components
+    are ordered so each IC is immediately followed by its associated passives.
     """
     board = model.board
     x_min = board.x_min + margin
@@ -215,50 +216,246 @@ def _place_interior(
     y_min = board.y_min + margin
     y_max = board.y_max - margin
     interior_refs = {c.ref for c in interior}
+    ref_to_comp = {c.ref: c for c in interior}
+
+    # Get cluster ref-lists and compute sub-regions
+    clusters = None
+    regions: Dict[int, tuple] = {}
 
     try:
         clusters = cluster_components(model)
-        for cl in clusters:
-            cl['components'] = [c for c in cl['components']
-                                 if c.ref in interior_refs]
-        clusters = [cl for cl in clusters if cl['components']]
-        region_map = assign_cluster_positions(model, clusters)
+        clusters = [
+            [r for r in cl if r in interior_refs]
+            for cl in clusters
+        ]
+        clusters = [cl for cl in clusters if cl]
+
+        # Merge cap-only clusters into clusters with their power-domain ICs
+        _merge_orphan_caps(clusters, model, interior_refs)
+
+        n_cl = len(clusters)
+        cols = max(1, int(math.ceil(math.sqrt(n_cl))))
+        rows = max(1, int(math.ceil(n_cl / cols)))
+        rw = (x_max - x_min) / cols
+        rh = (y_max - y_min) / rows
+        for idx in range(n_cl):
+            c = idx % cols
+            r = idx // cols
+            regions[idx] = (x_min + c * rw, y_min + r * rh,
+                           x_min + (c + 1) * rw, y_min + (r + 1) * rh)
     except Exception:
-        clusters  = [{'id': 'all', 'components': interior}]
-        region_map = {'all': (x_min, y_min, x_max, y_max)}
+        clusters = None
 
     placed_refs: Set[str] = set()
 
-    for cluster in clusters:
-        cl_id  = cluster['id']
-        region = region_map.get(cl_id, (x_min, y_min, x_max, y_max))
-        rx_min, ry_min, rx_max, ry_max = region
-        comps  = cluster['components']
-        if not comps:
-            continue
+    if clusters:
+        for idx, cl_refs in enumerate(clusters):
+            rx_min, ry_min, rx_max, ry_max = regions.get(
+                idx, (x_min, y_min, x_max, y_max))
+            comps = [ref_to_comp[r] for r in cl_refs if r in ref_to_comp]
+            if not comps:
+                continue
 
-        def connectivity_score(c):
-            n_nets = sum(
-                1 for net in model.nets
-                if any(ref == c.ref for ref, _ in net.pins)
-            )
-            type_priority = {
-                'ic': 100, 'mcu': 100, 'regulator': 80,
-                'resistor': 10, 'capacitor': 5, 'inductor': 8,
-            }
-            t = getattr(c, 'component_type', 'other')
-            return n_nets * 10 + type_priority.get(t, 20)
-
-        comps_sorted = sorted(comps, key=connectivity_score, reverse=True)
-        _place_cluster_grid(comps_sorted, rx_min, ry_min, rx_max, ry_max)
-        placed_refs.update(c.ref for c in comps)
+            grouped = _group_by_ic_affinity(model, comps)
+            _place_cluster_grid(grouped, rx_min, ry_min, rx_max, ry_max)
+            placed_refs.update(c.ref for c in comps)
 
     # Fallback: any component not covered by a cluster
     unplaced = [c for c in interior if c.ref not in placed_refs]
     if unplaced:
-        _place_cluster_grid(unplaced, x_min, y_min, x_max, y_max)
+        grouped = _group_by_ic_affinity(model, unplaced)
+        _place_cluster_grid(grouped, x_min, y_min, x_max, y_max)
 
     _apply_repulsion(interior, x_min, x_max, y_min, y_max, spacing_factor)
+
+
+def _merge_orphan_caps(
+    clusters: List[List[str]],
+    model: "BoardModel",
+    interior_refs: Set[str],
+) -> None:
+    """Move caps in clusters without ICs into clusters with their power-domain ICs."""
+    ic_types = {'ic', 'mcu', 'regulator'}
+
+    # Identify which clusters have ICs
+    cluster_has_ics: Dict[int, bool] = {}
+    cluster_ic_refs: Dict[int, Set[str]] = {}
+    for i, cl in enumerate(clusters):
+        ic_refs = set()
+        for r in cl:
+            comp = model.get_component(r)
+            if comp and getattr(comp, 'component_type', '') in ic_types:
+                ic_refs.add(r)
+        cluster_has_ics[i] = bool(ic_refs)
+        cluster_ic_refs[i] = ic_refs
+
+    # Build power domains across all interior components
+    domains = _build_power_domains(model, interior_refs)
+
+    # For each cap-only cluster, find the best IC cluster via power domains
+    orphan_indices = [i for i, has_ics in cluster_has_ics.items() if not has_ics]
+
+    for orphan_idx in orphan_indices:
+        caps_to_move: Dict[str, int] = {}  # cap_ref -> target_cluster_idx
+        remaining_refs = list(clusters[orphan_idx])
+
+        for cap_ref in remaining_refs:
+            comp = model.get_component(cap_ref)
+            if not comp or getattr(comp, 'component_type', '') != 'capacitor':
+                continue
+            # Find which cluster has ICs on the same power rail as this cap
+            best_cluster = None
+            best_count = 0
+            for net_name, (domain_ics, domain_caps) in domains.items():
+                if cap_ref not in domain_caps:
+                    continue
+                # This cap belongs to this power domain — find cluster with most domain ICs
+                for ci, has_ics in cluster_has_ics.items():
+                    if not has_ics:
+                        continue
+                    overlap = len(cluster_ic_refs[ci] & set(domain_ics))
+                    if overlap > best_count:
+                        best_count = overlap
+                        best_cluster = ci
+                break  # cap found its domain
+
+            if best_cluster is not None:
+                caps_to_move[cap_ref] = best_cluster
+
+        # Move caps to their target clusters
+        for cap_ref, target_idx in caps_to_move.items():
+            clusters[orphan_idx].remove(cap_ref)
+            clusters[target_idx].append(cap_ref)
+
+    # Remove now-empty clusters
+    clusters[:] = [cl for cl in clusters if cl]
+
+
+def _build_power_domains(
+    model: "BoardModel",
+    comp_refs: Set[str],
+) -> Dict[str, Tuple[List[str], List[str]]]:
+    """Identify power domains: non-GND power nets → (IC refs, cap refs).
+
+    Returns {net_name: ([ic_refs], [cap_refs])} for domains that have
+    both ICs and capacitors. GND is excluded since every component
+    shares it — no discriminative power.
+    """
+    ic_types = {'ic', 'mcu', 'regulator'}
+    ref_type: Dict[str, str] = {}
+    for c in model.components:
+        if c.ref in comp_refs:
+            ref_type[c.ref] = getattr(c, 'component_type', '')
+
+    # net_name → sets of refs
+    net_ics: Dict[str, List[str]] = defaultdict(list)
+    net_caps: Dict[str, List[str]] = defaultdict(list)
+
+    for net in model.nets:
+        name = getattr(net, 'name', '') or ''
+        if not _is_power_net(name):
+            continue
+        # Exclude GND — everything shares it
+        clean = name.lstrip('/').upper()
+        if any(clean.startswith(p) for p in ('GND', 'AGND', 'DGND', 'PGND', 'SGND', 'VSS')):
+            continue
+
+        for ref, _ in net.pins:
+            if ref not in comp_refs:
+                continue
+            ctype = ref_type.get(ref, '')
+            if ctype in ic_types:
+                net_ics[name].append(ref)
+            elif ctype == 'capacitor':
+                net_caps[name].append(ref)
+
+    domains: Dict[str, Tuple[List[str], List[str]]] = {}
+    for name in net_ics:
+        if name in net_caps and net_ics[name] and net_caps[name]:
+            domains[name] = (net_ics[name], net_caps[name])
+    return domains
+
+
+def _group_by_ic_affinity(
+    model: "BoardModel",
+    comps: List["Component"],
+) -> List["Component"]:
+    """Order components so each IC is immediately followed by its closest passives.
+
+    Phase A: Power-domain round-robin assigns decoupling caps to ICs sharing
+    the same rail (one cap per IC per rail, balanced).
+    Phase B: Remaining passives use shared-net affinity scoring.
+
+    Output: [IC1, passive1a, passive1b, IC2, passive2a, ...]
+    """
+    ic_types = {'ic', 'mcu', 'regulator'}
+    ics = [c for c in comps if getattr(c, 'component_type', '') in ic_types]
+    passives = [c for c in comps if getattr(c, 'component_type', '') not in ic_types]
+
+    if not ics:
+        return comps
+
+    comp_refs = {c.ref for c in comps}
+    ic_affinity: Dict[str, List["Component"]] = {ic.ref: [ic] for ic in ics}
+    ref_to_comp = {c.ref: c for c in comps}
+    assigned_passives: Set[str] = set()
+
+    # Phase A: Power-domain round-robin
+    domains = _build_power_domains(model, comp_refs)
+    for _net_name, (domain_ics, domain_caps) in domains.items():
+        # Sort ICs by fewest assigned caps first (balanced distribution)
+        domain_ics_sorted = sorted(
+            domain_ics,
+            key=lambda r: sum(1 for p in ic_affinity.get(r, [])
+                              if getattr(p, 'component_type', '') == 'capacitor'),
+        )
+        cap_idx = 0
+        for cap_ref in domain_caps:
+            if cap_ref not in comp_refs or cap_ref in assigned_passives:
+                continue
+            # Round-robin: assign to IC with fewest caps
+            target_ic = domain_ics_sorted[cap_idx % len(domain_ics_sorted)]
+            cap_comp = ref_to_comp.get(cap_ref)
+            if cap_comp and target_ic in ic_affinity:
+                ic_affinity[target_ic].append(cap_comp)
+                assigned_passives.add(cap_ref)
+            cap_idx += 1
+
+    # Phase B: Shared-net affinity for remaining passives
+    remaining = [p for p in passives if p.ref not in assigned_passives]
+
+    ref_nets: Dict[str, Set[int]] = {}
+    for ni, net in enumerate(model.nets):
+        for ref, _ in net.pins:
+            ref_nets.setdefault(ref, set()).add(ni)
+
+    ic_refs = [ic.ref for ic in ics]
+    unassigned: List["Component"] = []
+
+    for p in remaining:
+        p_nets = ref_nets.get(p.ref, set())
+        p_total = max(len(p_nets), 1)
+        best_ic = None
+        best_score = -1.0
+        for ic_ref in ic_refs:
+            shared = len(p_nets & ref_nets.get(ic_ref, set()))
+            score = shared / p_total
+            if score > best_score or (score == best_score and best_ic is not None
+                                       and len(ic_affinity[ic_ref]) < len(ic_affinity[best_ic])):
+                best_score = score
+                best_ic = ic_ref
+        if best_ic and best_score > 0:
+            ic_affinity[best_ic].append(p)
+        else:
+            unassigned.append(p)
+
+    sorted_ics = sorted(ic_refs, key=lambda r: len(ref_nets.get(r, set())), reverse=True)
+
+    result = []
+    for ic_ref in sorted_ics:
+        result.extend(ic_affinity[ic_ref])
+    result.extend(unassigned)
+    return result
 
 
 def _place_cluster_grid(
@@ -268,8 +465,9 @@ def _place_cluster_grid(
 ) -> None:
     """Grid layout for one cluster's components in a sub-region.
 
-    Index-0 (most connected) lands near the center cell;
-    remaining components fill outward.
+    Components are ordered by IC-affinity (IC followed by its passives).
+    ICs are placed in a center-first grid; passives are placed in a tight
+    ring around their parent IC within the IC's cell.
     """
     n = len(comps)
     if n == 0:
@@ -284,9 +482,37 @@ def _place_cluster_grid(
         c.y = (ry_min + ry_max) / 2
         return
 
+    ic_types = {'ic', 'mcu', 'regulator'}
+
+    # Build IC groups: [(ic, [passive1, passive2, ...]), ...]
+    ic_groups: List[tuple] = []
+    current_ic = None
+    current_passives: List["Component"] = []
+    standalone: List["Component"] = []
+
+    for comp in comps:
+        if getattr(comp, 'component_type', '') in ic_types:
+            if current_ic is not None:
+                ic_groups.append((current_ic, current_passives))
+            current_ic = comp
+            current_passives = []
+        else:
+            if current_ic is not None:
+                current_passives.append(comp)
+            else:
+                standalone.append(comp)
+
+    if current_ic is not None:
+        ic_groups.append((current_ic, current_passives))
+
+    # Add standalone components (no IC in group) as single-slot entries
+    for comp in standalone:
+        ic_groups.append((comp, []))
+
+    n_groups = len(ic_groups)
     aspect = rw / max(rh, 1e-9)
-    cols   = max(1, min(n, int(round(math.sqrt(n * aspect)))))
-    rows   = max(1, math.ceil(n / cols))
+    cols   = max(1, min(n_groups, int(round(math.sqrt(n_groups * aspect)))))
+    rows   = max(1, math.ceil(n_groups / cols))
     cell_w = rw / cols
     cell_h = rh / rows
 
@@ -297,15 +523,32 @@ def _place_cluster_grid(
         key=lambda slot: abs(slot % cols - center_col) + abs(slot // cols - center_row),
     )
 
-    for comp_idx, comp in enumerate(comps):
-        slot    = order[comp_idx] if comp_idx < len(order) else comp_idx
-        col     = slot % cols
-        row     = slot // cols
-        cx      = rx_min + (col + 0.5) * cell_w
-        cy      = ry_min + (row + 0.5) * cell_h
-        w2, h2  = comp.effective_width / 2, comp.effective_height / 2
-        comp.x  = max(rx_min + w2, min(cx, rx_max - w2))
-        comp.y  = max(ry_min + h2, min(cy, ry_max - h2))
+    for group_idx, (ic_comp, passives) in enumerate(ic_groups):
+        slot = order[group_idx] if group_idx < len(order) else group_idx
+        col  = slot % cols
+        row  = slot // cols
+
+        # IC goes at cell center
+        cx = rx_min + (col + 0.5) * cell_w
+        cy = ry_min + (row + 0.5) * cell_h
+        ic_comp.x = cx
+        ic_comp.y = cy
+
+        # Place passives in a tight ring around the IC
+        if passives:
+            ic_radius = max(ic_comp.effective_width, ic_comp.effective_height) / 2
+            ring_r = ic_radius + 4.0  # 4mm gap from IC edge for manual tuning room
+            for pi, p in enumerate(passives):
+                angle = 2 * math.pi * pi / len(passives)
+                px = cx + ring_r * math.cos(angle)
+                py = cy + ring_r * math.sin(angle)
+                w2 = p.effective_width / 2
+                h2 = p.effective_height / 2
+                # Clamp to cell
+                p.x = max(rx_min + col * cell_w + w2,
+                          min(px, rx_min + (col + 1) * cell_w - w2))
+                p.y = max(ry_min + row * cell_h + h2,
+                          min(py, ry_min + (row + 1) * cell_h - h2))
 
 
 def _apply_repulsion(
@@ -315,7 +558,7 @@ def _apply_repulsion(
     spacing_factor: float,
 ) -> None:
     """Push components apart to reduce overlaps."""
-    for iteration in range(100):
+    for iteration in range(150):
         moved = False
 
         for i, ca in enumerate(components):
@@ -327,7 +570,7 @@ def _apply_repulsion(
                 min_dist = max(
                     ca.effective_width, ca.effective_height,
                     cb.effective_width, cb.effective_height
-                ) * spacing_factor * 0.5
+                ) * spacing_factor * 0.8
 
                 if dist < min_dist:
                     if dist < 0.1:
@@ -336,7 +579,7 @@ def _apply_repulsion(
                     else:
                         dx, dy = dx / dist, dy / dist
 
-                    push = (min_dist - dist) * 0.5 + 0.3
+                    push = (min_dist - dist) * 0.6 + 0.5
 
                     ca.x = max(x_min + ca.effective_width/2,
                               min(ca.x - push * dx, x_max - ca.effective_width/2))
@@ -371,6 +614,16 @@ def _compute_hpwl(model: "BoardModel") -> float:
     return total
 
 
+def _compute_overlap_cost(components: List["Component"]) -> float:
+    """Total overlap area between components — penalizes condensation."""
+    total = 0.0
+    for i, ca in enumerate(components):
+        for cb in components[i + 1:]:
+            if ca.overlaps(cb):
+                total += ca.overlap_area(cb)
+    return total
+
+
 def _optimize_interior_sa(
     model: "BoardModel",
     interior: List["Component"],
@@ -378,14 +631,21 @@ def _optimize_interior_sa(
     T_start: float = 5.0,
     T_end: float = 0.1,
     n_iter: int = 2000,
+    overlap_weight: float = 10.0,
 ) -> None:
-    """Simulated annealing to minimize HPWL for interior components."""
+    """Simulated annealing to minimize HPWL + overlap penalty for interior components.
+
+    The overlap penalty prevents the SA from condensing everything to the
+    center (which minimizes HPWL but creates overlaps).
+    """
     import random
     board = model.board
     x_min, x_max = board.x_min + margin, board.x_max - margin
     y_min, y_max = board.y_min + margin, board.y_max - margin
 
-    cost    = _compute_hpwl(model)
+    hpwl = _compute_hpwl(model)
+    overlap = _compute_overlap_cost(interior)
+    cost    = hpwl + overlap_weight * overlap
     T       = T_start
     cooling = (T_end / T_start) ** (1.0 / max(n_iter, 1))
     rng     = random.Random(42)
@@ -402,8 +662,10 @@ def _optimize_interior_sa(
                       min(old_y + rng.uniform(-step, step),
                           y_max - comp.effective_height / 2))
 
-        new_cost = _compute_hpwl(model)
-        delta    = new_cost - cost
+        new_hpwl    = _compute_hpwl(model)
+        new_overlap = _compute_overlap_cost(interior)
+        new_cost    = new_hpwl + overlap_weight * new_overlap
+        delta       = new_cost - cost
 
         if delta < 0 or rng.random() < math.exp(-delta / max(T, 1e-9)):
             cost = new_cost
