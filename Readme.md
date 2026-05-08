@@ -1,6 +1,9 @@
-# GridGhost
-
-External PCB auto-placement optimization engine for KiCad. Extracts component data from `.kicad_pcb` files, optimizes placement using net-aware clustering, simulated annealing, and constraint-driven legalization, then writes results back.
+<div align="center">
+  <img src="logo.png" alt="GridGhost Logo" width="200" />
+  <h2>GridGhost</h2>
+  <p>External PCB auto-placement optimization engine for KiCad.</p>
+  <p>Extracts component data from `.kicad_pcb` files, optimizes placement using net-aware clustering, simulated annealing, and constraint-driven legalization, then writes results back.</p>
+</div>
 
 ## Features
 
