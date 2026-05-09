@@ -32,7 +32,7 @@ class AnnealerConfig:
     reheat_decay: float = 0.5
     calibration_samples: int = 200
     initial_accept_rate: float = 0.95
-    penalty_scale_min: float = 0.10
+    penalty_scale_min: float = 0.80
     min_temperature: float = 1e-6
     freeze_threshold: float = 0.01
     greedy_nudge_distances: tuple[float, ...] = (0.05, 0.1, 0.2, 0.5, 1.0)

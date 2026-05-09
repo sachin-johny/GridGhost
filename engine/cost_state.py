@@ -188,7 +188,7 @@ class CostState:
         top = max(0.0, board.y_min - bbox[1])
         bottom = max(0.0, bbox[3] - board.y_max)
         overflow = left + right + top + bottom
-        return overflow ** 2
+        return overflow  # linear ramp (quadratic too aggressive for SA)
 
     # ------------------------------------------------------------------
     # Incremental update

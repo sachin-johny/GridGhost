@@ -18,12 +18,18 @@ import networkx as nx
 from models.board_model import BoardModel, Component, BoardOutline
 
 
+from engine.cost_state import _is_power_net
+
+
 def build_net_hypergraph(model: BoardModel) -> nx.Graph:
     """Build a weighted graph where nodes are components and edges represent shared nets.
 
     Edge weight = number of shared nets between two components.
     This captures connectivity intensity — components sharing many nets
     should be placed close together.
+
+    Power/ground nets are excluded because they connect nearly everything,
+    destroying cluster structure (would merge 60/68 components into one cluster).
     """
     G = nx.Graph()
 
@@ -32,8 +38,11 @@ def build_net_hypergraph(model: BoardModel) -> nx.Graph:
         if not comp.is_fixed:
             G.add_node(comp.ref, component=comp)
 
-    # Add edges for shared nets
+    # Add edges for shared nets (skip power nets)
     for net in model.nets:
+        # Skip power nets — they connect everything and destroy cluster structure
+        if _is_power_net(net.name):
+            continue
         refs = list(net.component_refs)
         # Only consider nets with 2+ movable components
         movable_refs = [r for r in refs if G.has_node(r)]

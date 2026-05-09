@@ -719,13 +719,16 @@ def _apply_repulsion(
 # =============================================================================
 
 def _compute_hpwl(model: "BoardModel", interior_refs: Set[str] | None = None) -> float:
-    """Half-perimeter wire length across all nets.
+    """Half-perimeter wire length across all non-power nets.
 
     When interior_refs is provided, only counts positions of components in
     that set — excludes edge connectors whose positions aren't finalized yet.
+    Power nets are skipped — their HPWL is nearly constant regardless of placement.
     """
     total = 0.0
     for net in model.nets:
+        if _is_power_net(net.name):
+            continue
         xs, ys = [], []
         for ref, _ in net.pins:
             if interior_refs is not None and ref not in interior_refs:

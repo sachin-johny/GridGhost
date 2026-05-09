@@ -21,6 +21,7 @@ import numpy as np
 from models.board_model import BoardModel, Component, Net
 from profiles.board_profiles import ConstraintRule
 from engine.constraint_evaluator import evaluate_constraint_penalties
+from engine.cost_state import _is_power_net
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +71,10 @@ def total_hpwl(model: BoardModel) -> float:
     comp_map = {c.ref: c for c in model.components}
 
     for net in model.nets:
+        # Skip power nets — their HPWL is nearly constant regardless of placement,
+        # and SA also skips them, so we need consistent reporting.
+        if _is_power_net(net.name):
+            continue
         pins = []
         for ref, pad_name in net.pins:
             comp = comp_map.get(ref)
@@ -137,9 +142,9 @@ def total_boundary_penalty(model: BoardModel) -> float:
         top_overflow = max(0.0, board.y_min - y_min)
         bottom_overflow = max(0.0, y_max - board.y_max)
 
-        # Quadratic penalty (proportional to square of distance outside)
+        # Linear penalty (proportional to distance outside)
         overflow = left_overflow + right_overflow + top_overflow + bottom_overflow
-        total += overflow ** 2
+        total += overflow
 
     return total
 

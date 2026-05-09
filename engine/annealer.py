@@ -11,7 +11,7 @@ import random
 from dataclasses import dataclass, field
 
 from models.board_model import BoardModel
-from engine.cost_state import CostState
+from engine.cost_state import CostState, OVERLAP_WEIGHT, BOUNDARY_WEIGHT, CONSTRAINT_WEIGHT
 from engine.moves import (
     select_move_type, get_moveable_indices,
     do_translate, do_swap, do_rotate, do_median,
@@ -26,7 +26,7 @@ class SAConfig:
     reheat_ratio: float = 0.30
     calibration_samples: int = 200
     initial_accept_rate: float = 0.95
-    penalty_scale_min: float = 0.10
+    penalty_scale_min: float = 0.80  # high floor: don't let SA ignore penalties at hot T
     min_temperature: float = 1e-6
     freeze_threshold: float = 0.01
     greedy_nudge_distances: tuple[float, ...] = (0.05, 0.1, 0.2, 0.5, 1.0)
@@ -52,9 +52,16 @@ def _calibrate_t0(
     moveable_indices: list[int],
     config: SAConfig,
 ) -> float:
-    """Auto-calibrate initial temperature by sampling random moves."""
+    """Auto-calibrate initial temperature by sampling random moves.
+
+    Uses the SAME window as the first SA step (max_window) so the
+    calibration deltas match actual SA move magnitudes. Previously used
+    0.1*board which underestimated deltas, making T0 too low and
+    accept rate at T0 only ~0.40 instead of 0.95.
+    """
     board = model.board
-    window = max(board.width, board.height) * 0.1
+    # Use the same window the first SA step will use (max_window)
+    window = max(board.width, board.height) * 0.15
     deltas = []
 
     for _ in range(config.calibration_samples):
@@ -97,9 +104,9 @@ def _run_sa_pass(
     """Run one SA pass. Returns final temperature."""
     T = t0
     n_moveable = len(moveable_indices)
-    moves_per_temp = max(50, 10 * n_moveable)
+    moves_per_temp = max(200, 20 * n_moveable)
     board = model.board
-    max_window = max(board.width, board.height) * 0.3
+    max_window = max(board.width, board.height) * 0.15
     min_window = max(board.width, board.height) * 0.005
     max_iter = max_iter_override or config.max_iterations
 
@@ -136,7 +143,10 @@ def _run_sa_pass(
             snap = cost_state.snapshot(moved)
 
             new_cost = cost_state.incremental_update(moved)
-            old_cost = snap['hpwl'] + 50.0 * sum(snap['pair_overlaps'].values()) * scale + 50.0 * sum(snap['comp_boundary'].values()) * scale
+            old_cost = (snap['hpwl']
+                        + OVERLAP_WEIGHT * sum(snap['pair_overlaps'].values()) * scale
+                        + BOUNDARY_WEIGHT * sum(snap['comp_boundary'].values()) * scale
+                        + CONSTRAINT_WEIGHT * snap['constraint_total'] * scale)
 
             delta = new_cost - old_cost
 
@@ -156,13 +166,13 @@ def _run_sa_pass(
         if config.verbose and step % 20 == 0:
             print(f"    T={T:.4f} accept={accept_rate:.2f} cost={cost_state.normalized_cost:.1f} hpwl={cost_state.hpwl:.1f}")
 
-        # Adaptive cooling
+        # Adaptive cooling — slow schedule to prevent premature freezing
         if accept_rate > 0.6:
-            T *= 0.80
-        elif accept_rate > 0.3:
-            T *= 0.90
-        else:
             T *= 0.95
+        elif accept_rate > 0.3:
+            T *= 0.97
+        else:
+            T *= 0.99
 
         T = max(T, config.min_temperature)
 
@@ -190,6 +200,10 @@ def _greedy_refine(
 
     improved = True
     sweep = 0
+    # Track best cost/positions across sweeps to prevent oscillation
+    best_sweep_cost = cost_state.normalized_cost
+    best_sweep_positions = _save_positions(model, moveable_indices)
+
     while improved:
         improved = False
         sweep += 1
@@ -226,11 +240,21 @@ def _greedy_refine(
                     comp.set_rotation(base_rot)
                     cost_state.incremental_update({idx})
 
+        cur_cost = cost_state.normalized_cost
+        if cur_cost < best_sweep_cost:
+            best_sweep_cost = cur_cost
+            best_sweep_positions = _save_positions(model, moveable_indices)
+
         if config.verbose and improved:
-            print(f"    Greedy sweep {sweep}: cost={cost_state.normalized_cost:.1f}")
+            print(f"    Greedy sweep {sweep}: cost={cur_cost:.1f}")
 
         if sweep >= 5:
             break
+
+    # Restore best sweep result (prevents oscillation)
+    if cost_state.normalized_cost > best_sweep_cost:
+        _restore_positions(model, best_sweep_positions)
+        cost_state._compute_all()
 
 
 def simulate_annealing(

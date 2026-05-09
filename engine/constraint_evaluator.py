@@ -140,7 +140,7 @@ def penalty_decoupling_proximity(
                 continue
             dist = _center_distance(ic, cap)
             excess = max(0.0, dist - max_dist)
-            total += excess * excess  # quadratic ramp
+            total += excess  # linear ramp (quadratic too aggressive for SA)
 
     return total
 
@@ -195,7 +195,7 @@ def penalty_crystal_mcu(
             continue
         dist = _center_distance(crystal, ic)
         excess = max(0.0, dist - max_dist)
-        total += excess * excess
+        total += excess
 
     return total
 
@@ -228,7 +228,7 @@ def penalty_connector_edge(
             continue
         d = _distance_to_nearest_edge(comp, board)
         excess = max(0.0, d - max_edge_dist)
-        total += excess * excess
+        total += excess
 
     return total
 
@@ -283,7 +283,7 @@ def penalty_thermal_grouping(
                     continue
                 dist = _center_distance(c1, c2)
                 excess = max(0.0, dist - max_dist)
-                total += excess * excess
+                total += excess
 
     return total
 
@@ -381,7 +381,7 @@ def penalty_bulk_cap_input(
                 d = _center_distance(cap, conn)
                 min_dist = min(min_dist, d)
         excess = max(0.0, min_dist - max_dist)
-        total += excess * excess
+        total += excess
 
     return total
 
@@ -480,10 +480,10 @@ def penalty_analog_digital_separation(
         total = 0.0
         for comp in analogs:
             excess = max(0.0, comp.x - midline - separation_margin)
-            total += excess * excess
+            total += excess
         for comp in digitals:
             excess = max(0.0, midline - separation_margin - comp.x)
-            total += excess * excess
+            total += excess
     else:
         if a_cy <= d_cy:
             analog_y, digital_y = a_cy, d_cy
@@ -493,10 +493,10 @@ def penalty_analog_digital_separation(
         total = 0.0
         for comp in analogs:
             excess = max(0.0, comp.y - midline - separation_margin)
-            total += excess * excess
+            total += excess
         for comp in digitals:
             excess = max(0.0, midline - separation_margin - comp.y)
-            total += excess * excess
+            total += excess
 
     return total
 

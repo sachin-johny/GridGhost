@@ -134,8 +134,12 @@ def cmd_place(args) -> None:
     # Step 5.5: SA optimization (if enabled)
     if not args.no_sa:
         print("Step 5: Running SA optimization...")
-        # Sync constraint weight from profile's delta into CostState
+        # Sync profile weights into CostState module-level constants
+        # SA needs stiff overlap/boundary penalties for feasibility,
+        # so we floor them rather than using the low profile values directly.
         import engine.cost_state as cs
+        cs.OVERLAP_WEIGHT = max(profile.beta, 10.0)   # floor at 10 for SA feasibility
+        cs.BOUNDARY_WEIGHT = max(profile.gamma, 5.0)  # floor at 5 for SA feasibility
         cs.CONSTRAINT_WEIGHT = profile.delta
         sa_config = SAConfig(
             max_iterations=args.sa_iterations,
