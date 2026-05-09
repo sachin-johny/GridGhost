@@ -26,7 +26,7 @@ def print_board_summary(model: BoardModel, title: str = "Board Summary") -> None
 
 
 def print_cost_breakdown(costs: dict, title: str = "Cost Breakdown") -> None:
-    """Print a formatted cost breakdown."""
+    """Print a formatted cost breakdown, including per-rule constraint details."""
     print(f"\n{'-' * 50}")
     print(f"  {title}")
     print(f"{'-' * 50}")
@@ -34,6 +34,12 @@ def print_cost_breakdown(costs: dict, title: str = "Cost Breakdown") -> None:
     print(f"  Overlap penalty:   {costs['overlap']:.2f}")
     print(f"  Boundary penalty:  {costs['boundary']:.2f}")
     print(f"  Constraint penalty:{costs['constraint']:.2f}")
+    # Show per-rule constraint breakdown if present
+    constraint_keys = [k for k in costs if k.startswith('constraint_') and k != 'constraint']
+    if constraint_keys:
+        for k in sorted(constraint_keys):
+            rule_name = k[len('constraint_'):]
+            print(f"    {rule_name}: {costs[k]:.4f}")
     print(f"  {'-' * 29}")
     print(f"  TOTAL COST:        {costs['total']:.2f}")
     print(f"  Overlaps:          {costs['overlap_count']}")

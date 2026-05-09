@@ -12,9 +12,12 @@ from bisect import bisect_left, insort
 from itertools import combinations
 
 from models.board_model import BoardModel
+from profiles.board_profiles import ConstraintRule
+from engine.constraint_evaluator import evaluate_constraint_penalties
 
 OVERLAP_WEIGHT = 50.0
 BOUNDARY_WEIGHT = 50.0
+CONSTRAINT_WEIGHT = 4.0  # delta — matches BoardProfile default
 
 _POWER_PREFIXES = (
     'GND', 'AGND', 'DGND', 'PGND', 'SGND',
@@ -39,10 +42,12 @@ class CostState:
     boundary penalties. Supports O(k) incremental updates and O(k) snapshot/restore.
     """
 
-    def __init__(self, model: BoardModel, power_net_prefixes=None):
+    def __init__(self, model: BoardModel, power_net_prefixes=None,
+                 rules: list[ConstraintRule] | None = None):
         self.model = model
         self._comps = model.components
         self._n = len(self._comps)
+        self._rules = rules or []
 
         # Build net -> set of component indices
         self._net_indices: dict[str, list[int]] = {}
@@ -70,6 +75,10 @@ class CostState:
         self._comp_boundary: list[float] = [0.0] * self._n
         # Sorted xmin index for fast overlap neighbor lookup
         self._xmin_items: list[tuple[float, int]] = []
+
+        # Constraint penalty cache (recomputed incrementally)
+        self._constraint_total: float = 0.0
+        self._constraint_breakdown: dict[str, float] = {}
 
         # Penalty scaling (annealer controls this)
         self._penalty_scale = 1.0
@@ -110,6 +119,15 @@ class CostState:
         board = self.model.board
         for i in range(self._n):
             self._comp_boundary[i] = self._compute_boundary(self._comps[i].bbox, board)
+
+        # Constraint penalties
+        if self._rules:
+            self._constraint_total, self._constraint_breakdown = (
+                evaluate_constraint_penalties(self.model, self._rules)
+            )
+        else:
+            self._constraint_total = 0.0
+            self._constraint_breakdown = {}
 
     # ------------------------------------------------------------------
     # Per-item computation helpers
@@ -229,6 +247,15 @@ class CostState:
         for i in moved_indices:
             self._comp_boundary[i] = self._compute_boundary(self._comps[i].bbox, board)
 
+        # Constraint penalties — recompute only if rules are active
+        # (constraint penalty touches many components, so we do a full
+        # recompute rather than trying incremental updates.  This is O(R)
+        # where R = number of rules, typically 2-4, so it's negligible.)
+        if self._rules:
+            self._constraint_total, self._constraint_breakdown = (
+                evaluate_constraint_penalties(self.model, self._rules)
+            )
+
         return self.total_cost
 
     # ------------------------------------------------------------------
@@ -253,6 +280,8 @@ class CostState:
             'hpwl': self._hpwl_sum(),
             'overlap_penalty': self._overlap_sum(),
             'boundary_penalty': self._boundary_sum(),
+            'constraint_total': self._constraint_total,
+            'constraint_breakdown': dict(self._constraint_breakdown),
             'net_hpwl': saved_net_hpwl,
             'pair_overlaps': saved_pair_overlaps,
             'comp_boundary': saved_boundary,
@@ -276,6 +305,10 @@ class CostState:
         # Restore boundary
         for i, val in snap['comp_boundary'].items():
             self._comp_boundary[i] = val
+
+        # Restore constraint cache
+        self._constraint_total = snap.get('constraint_total', 0.0)
+        self._constraint_breakdown = snap.get('constraint_breakdown', {})
 
         # Restore xmin index
         for i, bbox in snap['saved_bbox'].items():
@@ -306,12 +339,16 @@ class CostState:
         hpwl = self._hpwl_sum()
         overlap = OVERLAP_WEIGHT * self._overlap_sum() * self._penalty_scale
         boundary = BOUNDARY_WEIGHT * self._boundary_sum() * self._penalty_scale
-        return hpwl + overlap + boundary
+        constraint = CONSTRAINT_WEIGHT * self._constraint_total * self._penalty_scale
+        return hpwl + overlap + boundary + constraint
 
     @property
     def normalized_cost(self) -> float:
         """Unscaled cost for best-solution tracking."""
-        return self._hpwl_sum() + OVERLAP_WEIGHT * self._overlap_sum() + BOUNDARY_WEIGHT * self._boundary_sum()
+        return (self._hpwl_sum()
+                + OVERLAP_WEIGHT * self._overlap_sum()
+                + BOUNDARY_WEIGHT * self._boundary_sum()
+                + CONSTRAINT_WEIGHT * self._constraint_total)
 
     @property
     def hpwl(self) -> float:

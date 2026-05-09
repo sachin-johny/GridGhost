@@ -1,12 +1,14 @@
 """HPWL (Half-Perimeter Wirelength) cost function and related penalties.
 
 Implements the cost function from the plan:
-    Total Cost = α·W_HPWL + β·P_overlap + γ·P_boundary + δ·Σ(wk·Ck)
+    Total Cost = alpha·W_HPWL + beta·P_overlap + gamma·P_boundary + delta·Σ(wk·Ck)
 
 For Phase 1, we implement:
 - W_HPWL with clique/star net models
 - P_overlap (component overlap penalty)
 - P_boundary (out-of-bounds penalty)
+- δ·Σ(wk·Ck) — constraint rule penalties (decoupling proximity, connector
+  edge, thermal grouping, etc.) via constraint_evaluator module.
 """
 
 from __future__ import annotations
@@ -17,6 +19,8 @@ from itertools import combinations
 import numpy as np
 
 from models.board_model import BoardModel, Component, Net
+from profiles.board_profiles import ConstraintRule
+from engine.constraint_evaluator import evaluate_constraint_penalties
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +164,11 @@ class CostFunction:
     """Weighted cost function for placement evaluation.
 
     Total Cost = α·W_HPWL + β·P_overlap + γ·P_boundary + δ·Σ(wk·Ck)
+
+    The δ·Σ(wk·Ck) term evaluates each active constraint rule from the
+    board profile and sums rule.weight × rule_penalty.  Pass a list of
+    ConstraintRule objects via `rules=` to activate this term; otherwise
+    it degrades gracefully to 0.0 (backward compatible).
     """
 
     def __init__(
@@ -168,19 +177,24 @@ class CostFunction:
         beta: float = 5.0,     # Overlap penalty weight
         gamma: float = 3.0,    # Boundary penalty weight
         delta: float = 4.0,    # Constraint penalty weight
+        rules: list[ConstraintRule] | None = None,  # Board profile constraint rules
     ):
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
         self.delta = delta
+        self.rules = rules or []
 
     def evaluate(self, model: BoardModel) -> dict[str, float]:
         """Evaluate all cost terms and return a detailed breakdown."""
         hpwl = total_hpwl(model)
         overlap = total_overlap_penalty(model)
         boundary = total_boundary_penalty(model)
-        # Constraint penalties (Phase 4 — placeholder)
-        constraint = 0.0
+
+        # Constraint penalties — fully implemented via constraint_evaluator
+        constraint, constraint_breakdown = evaluate_constraint_penalties(
+            model, self.rules
+        )
 
         total = (
             self.alpha * hpwl +
@@ -189,7 +203,7 @@ class CostFunction:
             self.delta * constraint
         )
 
-        return {
+        result = {
             "total": total,
             "hpwl": hpwl,
             "overlap": overlap,
@@ -198,6 +212,11 @@ class CostFunction:
             "overlap_count": count_overlaps(model),
             "oob_count": count_out_of_bounds(model),
         }
+        # Merge per-rule breakdown so display code can show details
+        for rule_name, rule_penalty in constraint_breakdown.items():
+            result[f"constraint_{rule_name}"] = rule_penalty
+
+        return result
 
     def cost(self, model: BoardModel) -> float:
         """Return the scalar total cost."""

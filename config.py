@@ -47,6 +47,7 @@ class AnnealerConfig:
 class CostConfig:
     overlap_weight: float = 50.0
     boundary_weight: float = 50.0
+    constraint_weight: float = 4.0  # delta — overridden by profile.delta at runtime
 
 
 @dataclass

@@ -38,16 +38,19 @@ ALGORITHMS = ("force-directed", "grid")
 
 def _apply_config_to_globals(cfg: Config) -> None:
     """Push config values into module-level constants used by cost_state."""
-    global _OVERLAP_WEIGHT_BACKUP, _BOUNDARY_WEIGHT_BACKUP
+    global _OVERLAP_WEIGHT_BACKUP, _BOUNDARY_WEIGHT_BACKUP, _CONSTRAINT_WEIGHT_BACKUP
     import engine.cost_state as cs
     _OVERLAP_WEIGHT_BACKUP = cs.OVERLAP_WEIGHT
     _BOUNDARY_WEIGHT_BACKUP = cs.BOUNDARY_WEIGHT
+    _CONSTRAINT_WEIGHT_BACKUP = cs.CONSTRAINT_WEIGHT
     cs.OVERLAP_WEIGHT = cfg.cost.overlap_weight
     cs.BOUNDARY_WEIGHT = cfg.cost.boundary_weight
+    # CONSTRAINT_WEIGHT is set by the profile's delta weight — not from config
 
 
 _OVERLAP_WEIGHT_BACKUP = 50.0
 _BOUNDARY_WEIGHT_BACKUP = 50.0
+_CONSTRAINT_WEIGHT_BACKUP = 4.0
 
 
 def cmd_extract(args) -> None:
@@ -123,6 +126,7 @@ def cmd_place(args) -> None:
             model,
             margin=args.margin if args.margin is not None else pcfg.margin,
             spacing_factor=pcfg.spacing_factor,
+            rules=profile.rules,
         )
 
     print_board_summary(model, "After Placement")
@@ -130,12 +134,15 @@ def cmd_place(args) -> None:
     # Step 5.5: SA optimization (if enabled)
     if not args.no_sa:
         print("Step 5: Running SA optimization...")
+        # Sync constraint weight from profile's delta into CostState
+        import engine.cost_state as cs
+        cs.CONSTRAINT_WEIGHT = profile.delta
         sa_config = SAConfig(
             max_iterations=args.sa_iterations,
             reheat_count=args.sa_reheat,
             verbose=True,
         )
-        sa_result = run_sa(model, config=sa_config, verbose=True)
+        sa_result = run_sa(model, config=sa_config, verbose=True, rules=profile.rules)
         print(f"  SA: cost {sa_result['initial_cost']:.1f} -> {sa_result['final_cost']:.1f} "
               f"(delta={sa_result['improvement']:.1f})")
         print(f"  SA: HPWL {sa_result['initial_hpwl']:.1f} -> {sa_result['final_hpwl']:.1f}")
@@ -151,6 +158,7 @@ def cmd_place(args) -> None:
         beta=profile.beta,
         gamma=profile.gamma,
         delta=profile.delta,
+        rules=profile.rules,
     )
     costs = cost_fn.evaluate(model)
     print_cost_breakdown(costs, "Placement Cost (Pre-Legalization)")
@@ -281,9 +289,9 @@ def main():
     p_place.add_argument("input", help="Path to .kicad_pcb file")
     p_place.add_argument("-o", "--output", help="Output .kicad_pcb path")
     p_place.add_argument(
-        "-p", "--profile", default="generic",
+        "-p", "--profile", default="mcu_peripheral",
         choices=["mcu_peripheral", "power_supply", "rf_frontend", "mixed_signal", "generic", "small_board"],
-        help="Board profile (default: generic)",
+        help="Board profile (default: mcu_peripheral)",
     )
     p_place.add_argument("-a", "--algorithm", default="grid", choices=ALGORITHMS,
                          help="Placement algorithm (default: grid)")

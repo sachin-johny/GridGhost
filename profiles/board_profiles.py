@@ -94,7 +94,7 @@ BUILTIN_PROFILES: dict[str, BoardProfile] = {
         rules=[
             ConstraintRule("decoupling_proximity", weight=4.0, params={"max_distance_mm": 5.0}),
             ConstraintRule("crystal_mcu", weight=3.0, params={"max_distance_mm": 10.0}),
-            ConstraintRule("connector_edge", weight=2.0),
+            ConstraintRule("connector_edge", weight=2.0, params={"max_edge_distance_mm": 15.0}),
         ],
     ),
     "power_supply": BoardProfile(

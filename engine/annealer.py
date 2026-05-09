@@ -281,14 +281,22 @@ def run_sa(
     profile_weights: dict | None = None,
     config: SAConfig | None = None,
     verbose: bool = True,
+    rules: list | None = None,
 ) -> dict:
-    """High-level entry point: build CostState, get moveable indices, run SA."""
+    """High-level entry point: build CostState, get moveable indices, run SA.
+
+    Args:
+        rules: Optional list of ConstraintRule objects from board profile.
+               When provided, constraint penalties are included in the SA
+               cost function so the annealer respects placement constraints
+               (decoupling proximity, connector edge, etc.).
+    """
     if config is None:
         config = SAConfig(verbose=verbose)
     elif verbose and not config.verbose:
         config = SAConfig(**{**config.__dict__, 'verbose': True})
 
-    cost_state = CostState(model)
+    cost_state = CostState(model, rules=rules)
     moveable_indices = get_moveable_indices(model)
 
     initial_cost = cost_state.normalized_cost

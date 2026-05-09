@@ -247,6 +247,7 @@ def smart_grid_place(
     spacing_factor: float = 1.3,
     sa_iterations: int = 2000,
     min_connector_gap: float = 2.0,
+    rules: list | None = None,
 ) -> "BoardModel":
     """Smart PCB placement: interior first, connectors around interior bbox perimeter.
 
@@ -256,6 +257,10 @@ def smart_grid_place(
         spacing_factor: Spacing multiplier for interior components
         sa_iterations: SA iterations for interior optimization
         min_connector_gap: Minimum gap between adjacent connectors
+        rules: Optional list of ConstraintRule objects.  When provided (typical
+            case: from board profile), the interior SA optimizer includes
+            constraint penalties in its cost function, so decoupling caps
+            stay near their ICs, connectors respect edge rules, etc.
 
     Returns:
         BoardModel with all components placed
@@ -281,7 +286,7 @@ def smart_grid_place(
 
     # Phase 3: SA optimization (HPWL minimization, no connectors present)
     if interior:
-        _optimize_interior_sa(model, interior, margin, n_iter=sa_iterations)
+        _optimize_interior_sa(model, interior, margin, n_iter=sa_iterations, rules=rules)
 
     # Phase 3.5: recentre interior cluster in usable board area
     if interior:
@@ -752,11 +757,14 @@ def _optimize_interior_sa(
     T_end: float = 0.1,
     n_iter: int = 2000,
     overlap_weight: float = 10.0,
+    rules: list | None = None,
 ) -> None:
-    """Simulated annealing to minimize HPWL + overlap penalty for interior components.
+    """Simulated annealing to minimize HPWL + overlap + constraint penalty for interior components.
 
     The overlap penalty prevents the SA from condensing everything to the
     center (which minimizes HPWL but creates overlaps).
+    Constraint penalties (when rules are provided) keep decoupling caps
+    near their ICs, enforce connector edge rules, etc.
     """
     import random
     board = model.board
@@ -770,7 +778,16 @@ def _optimize_interior_sa(
 
     hpwl = _compute_hpwl(model, interior_refs)
     overlap = _compute_overlap_cost(interior)
-    cost    = hpwl + overlap_weight * overlap
+
+    # Constraint penalty for interior SA
+    constraint = 0.0
+    constraint_weight = 4.0  # moderate — don't dominate over HPWL+overlap
+    if rules:
+        from engine.constraint_evaluator import evaluate_constraint_penalties
+        constraint_raw, _ = evaluate_constraint_penalties(model, rules)
+        constraint = constraint_raw
+
+    cost = hpwl + overlap_weight * overlap + constraint_weight * constraint
     T       = T_start
     cooling = (T_end / T_start) ** (1.0 / max(n_iter, 1))
     rng     = random.Random(42)
@@ -789,7 +806,12 @@ def _optimize_interior_sa(
 
         new_hpwl    = _compute_hpwl(model, interior_refs)
         new_overlap = _compute_overlap_cost(interior)
-        new_cost    = new_hpwl + overlap_weight * new_overlap
+        new_constraint = 0.0
+        if rules:
+            from engine.constraint_evaluator import evaluate_constraint_penalties
+            new_constraint_raw, _ = evaluate_constraint_penalties(model, rules)
+            new_constraint = new_constraint_raw
+        new_cost = new_hpwl + overlap_weight * new_overlap + constraint_weight * new_constraint
         delta       = new_cost - cost
 
         if delta < 0 or rng.random() < math.exp(-delta / max(T, 1e-9)):
