@@ -160,8 +160,22 @@ def cmd_place(args) -> None:
     lcfg = cfg.legalization
     n_total = len(model.components)
     adaptive_max_iter = max(100, min(800, n_total * 5))
+
+    # Compute interior bbox for legalizer so it clamps interior components
+    # away from edge connectors
+    from engine.smart_placement import _is_vertical_connector, _compute_interior_bbox
+    interior_comps = [
+        c for c in model.components
+        if not c.is_fixed and (
+            getattr(c, 'component_type', '') != 'connector'
+            or _is_vertical_connector(c)
+        )
+    ]
+    interior_bbox = _compute_interior_bbox(interior_comps, model.board, 5.0) if interior_comps else None
+
     legalize(model, grid_mm=lcfg.grid_mm, max_iterations=adaptive_max_iter,
-             push_strength=lcfg.push_strength, verbose=True)
+             push_strength=lcfg.push_strength, verbose=True,
+             interior_bbox=interior_bbox)
     print_board_summary(model, "After Legalization")
 
     # Step 8: Final cost evaluation

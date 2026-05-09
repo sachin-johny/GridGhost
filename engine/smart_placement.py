@@ -133,6 +133,85 @@ def _compute_connector_rotation(comp: "Component", edge: str) -> float:
 
 
 # =============================================================================
+# ROTATION-AWARE CONNECTOR SPACING
+# =============================================================================
+
+def _connector_along_edge_extent(
+    comp: "Component", edge: str, mating_margin: float = 5.0,
+) -> float:
+    """Compute the center-to-center spacing a connector needs along an edge.
+
+    Accounts for rotation: after computing the best rotation for the edge,
+    the along-edge extent is the dimension parallel to that edge, plus
+    mating_margin for physical clearance.
+    """
+    rot = _compute_connector_rotation(comp, edge)
+    old_rot = getattr(comp, 'rotation', 0.0)
+    comp.set_rotation(rot)
+    w = comp.effective_width
+    h = comp.effective_height
+    comp.set_rotation(old_rot)
+
+    along = w if edge in ("bottom", "top") else h
+    return along + mating_margin
+
+
+def _estimate_min_edge_space(
+    connectors: List["Component"], mating_margin: float = 5.0,
+) -> float:
+    """Estimate minimum space needed on one edge for N/4 connectors.
+
+    Uses average along-edge extent (sampling all 4 edges) since exact
+    edge assignment isn't known yet.
+    """
+    if not connectors:
+        return 0.0
+    total = 0.0
+    for c in connectors:
+        extents = [_connector_along_edge_extent(c, e, mating_margin)
+                   for e in ("bottom", "right", "top", "left")]
+        total += sum(extents) / 4.0
+    return total / 2
+
+
+def _expand_interior_for_connectors(
+    ib: tuple[float, float, float, float],
+    connectors: List["Component"],
+    board: "BoardOutline",
+    margin: float,
+    min_gap: float = 2.0,
+    mating_margin: float = 5.0,
+) -> tuple[float, float, float, float]:
+    """Expand interior bbox so connectors have room on each edge.
+
+    When SA condenses interior components, the resulting bbox can be too small
+    for connectors to fit with proper mating clearance. This expands the bbox
+    symmetrically within board bounds, using rotation-aware spacing.
+    """
+    if not connectors:
+        return ib
+
+    ib_x_min, ib_y_min, ib_x_max, ib_y_max = ib
+
+    min_per_edge = _estimate_min_edge_space(connectors, mating_margin)
+
+    width = ib_x_max - ib_x_min
+    height = ib_y_max - ib_y_min
+
+    if width < min_per_edge:
+        expand = (min_per_edge - width) / 2
+        ib_x_min = max(board.x_min + margin, ib_x_min - expand)
+        ib_x_max = min(board.x_max - margin, ib_x_max + expand)
+
+    if height < min_per_edge:
+        expand = (min_per_edge - height) / 2
+        ib_y_min = max(board.y_min + margin, ib_y_min - expand)
+        ib_y_max = min(board.y_max - margin, ib_y_max + expand)
+
+    return (ib_x_min, ib_y_min, ib_x_max, ib_y_max)
+
+
+# =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 
@@ -180,6 +259,11 @@ def smart_grid_place(
 
     # Phase 4: Interior bbox computed AFTER optimization
     ib = _compute_interior_bbox(interior, model.board, margin)
+
+    # Phase 4.5: Expand bbox so connectors have room on edges
+    if edge_connectors:
+        ib = _expand_interior_for_connectors(
+            ib, edge_connectors, model.board, margin, min_connector_gap)
 
     # Phase 5: Place edge connectors on exterior of interior bbox
     if edge_connectors:
@@ -599,12 +683,18 @@ def _apply_repulsion(
 # SA OPTIMIZATION
 # =============================================================================
 
-def _compute_hpwl(model: "BoardModel") -> float:
-    """Half-perimeter wire length across all nets."""
+def _compute_hpwl(model: "BoardModel", interior_refs: Set[str] | None = None) -> float:
+    """Half-perimeter wire length across all nets.
+
+    When interior_refs is provided, only counts positions of components in
+    that set — excludes edge connectors whose positions aren't finalized yet.
+    """
     total = 0.0
     for net in model.nets:
         xs, ys = [], []
         for ref, _ in net.pins:
+            if interior_refs is not None and ref not in interior_refs:
+                continue
             c = model.get_component(ref)
             if c:
                 xs.append(c.x)
@@ -643,7 +733,12 @@ def _optimize_interior_sa(
     x_min, x_max = board.x_min + margin, board.x_max - margin
     y_min, y_max = board.y_min + margin, board.y_max - margin
 
-    hpwl = _compute_hpwl(model)
+    # Only optimize HPWL between interior components — exclude edge connectors
+    # whose positions aren't finalized yet (prevents SA from pulling toward
+    # original connector positions in the KiCad file).
+    interior_refs = {c.ref for c in interior}
+
+    hpwl = _compute_hpwl(model, interior_refs)
     overlap = _compute_overlap_cost(interior)
     cost    = hpwl + overlap_weight * overlap
     T       = T_start
@@ -662,7 +757,7 @@ def _optimize_interior_sa(
                       min(old_y + rng.uniform(-step, step),
                           y_max - comp.effective_height / 2))
 
-        new_hpwl    = _compute_hpwl(model)
+        new_hpwl    = _compute_hpwl(model, interior_refs)
         new_overlap = _compute_overlap_cost(interior)
         new_cost    = new_hpwl + overlap_weight * new_overlap
         delta       = new_cost - cost
@@ -806,6 +901,7 @@ def _place_connectors_perimeter(
     margin: float,
     interior_bbox: tuple[float, float, float, float],
     min_connector_gap: float = 2.0,
+    mating_margin: float = 5.0,
 ) -> None:
     """Place connectors on perimeter of interior bbox, facing outward.
 
@@ -814,11 +910,24 @@ def _place_connectors_perimeter(
     2. Compute net-weighted center for each group
     3. Divide into 4 batches, assign each to nearest edge
     4. Place with per-connector rotation from pad analysis
+    5. Space using post-rotation along-edge extent + mating margin
     """
     ib_x_min, ib_y_min, ib_x_max, ib_y_max = interior_bbox
     board = model.board
-    gap = 1.5
-    conn_margin = 5.0
+    gap = max(1.5, min_connector_gap)
+
+    # Adaptive margin per edge: use less if space between interior bbox and
+    # board edge is tight. Ensures connectors stay within board bounds.
+    default_conn_margin = 5.0
+    edge_space = {
+        "bottom": board.y_max - ib_y_max,
+        "right":  board.x_max - ib_x_max,
+        "top":    ib_y_min - board.y_min,
+        "left":   ib_x_min - board.x_min,
+    }
+    conn_margin = {}
+    for edge_name, space in edge_space.items():
+        conn_margin[edge_name] = min(default_conn_margin, max(1.0, space * 0.4))
 
     groups = _group_connectors(connectors)
     if not groups:
@@ -912,7 +1021,11 @@ def _place_connectors_perimeter(
 
         scored.sort()
         for _, ei, edge in scored:
-            batch_width = sum(groups[gi].total_width for gi in batches[bi]) + gap * max(0, len(batches[bi]) - 1)
+            # Estimate batch width with mating margin for fit check
+            batch_width = sum(
+                _connector_along_edge_extent(c, edge, mating_margin)
+                for gi in batches[bi] for c in groups[gi].connectors
+            ) + gap * max(0, len(batches[bi]) - 1)
             if batch_width <= edge_lengths[edge] or not edge_taken:
                 batch_edge[bi] = edge
                 edge_taken.add(ei)
@@ -944,7 +1057,13 @@ def _place_connectors_perimeter(
         available = edge_lengths[edge]
 
         batch_groups = [groups[gi] for gi in batch]
-        total_needed = sum(g.total_width for g in batch_groups) + gap * max(0, len(batch_groups) - 1)
+        # Compute total space needed using rotation-aware per-connector spacing
+        total_needed = 0.0
+        for g in batch_groups:
+            for comp in g.connectors:
+                total_needed += _connector_along_edge_extent(comp, edge, mating_margin)
+            total_needed += gap
+        total_needed = max(0, total_needed - gap)  # no trailing gap
 
         offset = max(0.0, (available - total_needed) / 2.0)
         pos = offset
@@ -957,34 +1076,47 @@ def _place_connectors_perimeter(
 
                 w = comp.effective_width   # X-extent after rotation
                 h = comp.effective_height  # Y-extent after rotation
+                em = conn_margin[edge]
+
+                # Along-edge extent = dimension parallel to the edge
+                along = w if edge in ("bottom", "top") else h
 
                 if edge == "bottom":
-                    cx = ib_x_min + pos + w / 2
-                    cy = ib_y_max + conn_margin + h / 2
+                    cx = ib_x_min + pos + along / 2
+                    cy = ib_y_max + em + h / 2
                 elif edge == "top":
-                    cx = ib_x_min + pos + w / 2
-                    cy = ib_y_min - conn_margin - h / 2
+                    cx = ib_x_min + pos + along / 2
+                    cy = ib_y_min - em - h / 2
                 elif edge == "left":
-                    cx = ib_x_min - conn_margin - w / 2
-                    cy = ib_y_min + pos + h / 2
+                    cx = ib_x_min - em - w / 2
+                    cy = ib_y_min + pos + along / 2
                 else:  # right
-                    cx = ib_x_max + conn_margin + w / 2
-                    cy = ib_y_min + pos + h / 2
+                    cx = ib_x_max + em + w / 2
+                    cy = ib_y_min + pos + along / 2
 
-                # Clamp to board bounds
-                comp.x = max(board.x_min + w / 2, min(cx, board.x_max - w / 2))
-                comp.y = max(board.y_min + h / 2, min(cy, board.y_max - h / 2))
+                comp.x = cx
+                comp.y = cy
+
+                # Bbox-aware clamp: adjust position so actual bbox stays
+                # within board (accounts for bbox_offset from footprint origin)
+                b = comp.bbox
+                if b[0] < board.x_min:
+                    comp.x += board.x_min - b[0]
+                elif b[2] > board.x_max:
+                    comp.x -= b[2] - board.x_max
+                b = comp.bbox
+                if b[1] < board.y_min:
+                    comp.y += board.y_min - b[1]
+                elif b[3] > board.y_max:
+                    comp.y -= b[3] - board.y_max
 
                 comp_edge[comp.ref] = edge
 
-                # Advance position by the along-edge extent + enforced gap
-                gap_to_use = max(gap, min_connector_gap)
-                if edge in ("bottom", "top"):
-                    pos += w + gap_to_use
-                else:
-                    pos += h + gap_to_use
+                # Advance by along-edge extent + mating margin
+                # mating_margin ensures physical space for cable/mating
+                pos += along + mating_margin
 
-            pos += gap_to_use * 0.5
+            pos += gap
 
     _resolve_corners(connectors, comp_edge, board, margin, gap)
 

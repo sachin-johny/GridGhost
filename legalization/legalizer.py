@@ -12,10 +12,25 @@ gradient/energy signals.
 
 from __future__ import annotations
 
+import re
 import math
 from typing import Optional
 
 from models.board_model import BoardModel, Component, BoardOutline
+
+
+def _is_edge_connector(comp: Component) -> bool:
+    """True for horizontal/edge-mount connectors placed on the board perimeter."""
+    if getattr(comp, 'component_type', '') != "connector":
+        return False
+    fp  = getattr(comp, 'footprint', '') or ''
+    val = getattr(comp, 'value', '') or ''
+    name = fp + ' ' + val
+    if re.search(r'Vertical|THT', name, re.IGNORECASE):
+        return False
+    if re.search(r'Horizontal|Angled|Side', name, re.IGNORECASE):
+        return True
+    return not re.search(r'Vertical|THT', name, re.IGNORECASE)
 
 
 def legalize(
@@ -24,6 +39,7 @@ def legalize(
     max_iterations: int = 300,
     push_strength: float = 1,
     verbose: bool = False,
+    interior_bbox: tuple[float, float, float, float] | None = None,
 ) -> BoardModel:
     """Full legalization pipeline.
 
@@ -33,6 +49,8 @@ def legalize(
         max_iterations: Max iterations for overlap resolution (300 for dense designs)
         push_strength: How far to push overlapping components (fraction of overlap, 0.8 is aggressive)
         verbose: Print progress information
+        interior_bbox: Optional (x_min, y_min, x_max, y_max) to clamp interior
+            components inside, keeping them away from edge connectors.
 
     Returns:
         BoardModel with legalized component positions
@@ -46,14 +64,14 @@ def legalize(
     _snap_to_grid(model, grid_mm)
 
     # Step 2: Enforce board boundary
-    _enforce_boundary(model)
+    _enforce_boundary(model, interior_bbox)
 
     # Step 3: Resolve overlaps
-    _resolve_overlaps(model, max_iterations, push_strength, grid_mm, verbose)
+    _resolve_overlaps(model, max_iterations, push_strength, grid_mm, verbose, interior_bbox)
 
     # Step 4: Final grid snap and boundary check
     _snap_to_grid(model, grid_mm)
-    _enforce_boundary(model)
+    _enforce_boundary(model, interior_bbox)
 
     if verbose:
         overlaps_after = _count_overlaps(model)
@@ -65,12 +83,13 @@ def legalize(
 
 def _snap_to_grid(model: BoardModel, grid_mm: float) -> None:
     """Round all component positions to the nearest grid point.
-    
-    Connectors are NOT snapped - they keep their exact perimeter positions.
+
+    Edge connectors keep their exact perimeter positions.
+    Vertical connectors (treated as interior) ARE snapped.
     """
     for comp in model.components:
-        # Skip fixed components AND connectors
-        if comp.is_fixed or getattr(comp, 'component_type', '') == "connector":
+        # Skip fixed components AND edge connectors
+        if comp.is_fixed or _is_edge_connector(comp):
             continue
         comp.x = round(comp.x / grid_mm) * grid_mm
         comp.y = round(comp.y / grid_mm) * grid_mm
@@ -78,26 +97,37 @@ def _snap_to_grid(model: BoardModel, grid_mm: float) -> None:
         comp.rotation = round(comp.rotation / 90.0) * 90.0
 
 
-def _enforce_boundary(model: BoardModel) -> None:
-    """Clamp component positions so their bounding boxes stay within the board.
-    
-    Connectors are treated as fixed - they stay where placed on perimeter.
+def _enforce_boundary(
+    model: BoardModel,
+    interior_bbox: tuple[float, float, float, float] | None = None,
+) -> None:
+    """Clamp component positions so their bounding boxes stay within bounds.
+
+    Edge connectors are treated as fixed — they stay where placed on perimeter.
+    Other components are clamped to the interior bbox if provided, otherwise
+    to board bounds.
     """
     board = model.board
     for comp in model.components:
-        # Skip fixed components AND connectors (connectors stay on perimeter)
-        if comp.is_fixed or getattr(comp, 'component_type', '') == "connector":
+        # Skip fixed components AND edge connectors
+        if comp.is_fixed or _is_edge_connector(comp):
             continue
         half_w = comp.effective_width / 2.0
         half_h = comp.effective_height / 2.0
 
-        comp.x = max(board.x_min + half_w, min(comp.x, board.x_max - half_w))
-        comp.y = max(board.y_min + half_h, min(comp.y, board.y_max - half_h))
+        if interior_bbox:
+            x_min = interior_bbox[0] + half_w
+            x_max = interior_bbox[2] - half_w
+            y_min = interior_bbox[1] + half_h
+            y_max = interior_bbox[3] - half_h
+        else:
+            x_min = board.x_min + half_w
+            x_max = board.x_max - half_w
+            y_min = board.y_min + half_h
+            y_max = board.y_max - half_h
 
-
-def _is_connector(comp: Component) -> bool:
-    """Check if a component is a connector."""
-    return getattr(comp, 'component_type', '') == "connector"
+        comp.x = max(x_min, min(comp.x, x_max))
+        comp.y = max(y_min, min(comp.y, y_max))
 
 
 def _resolve_overlaps(
@@ -106,15 +136,17 @@ def _resolve_overlaps(
     push_strength: float,
     grid_mm: float,
     verbose: bool,
+    interior_bbox: tuple[float, float, float, float] | None = None,
 ) -> None:
     """Iteratively resolve component overlaps by pushing components apart.
 
     Uses a force-directed push-apart strategy: for each overlapping pair,
     compute the overlap direction and push both components away from each other.
     Increases push_strength adaptively if progress stalls.
-    
-    Connectors are treated as fixed - they stay on perimeter and only interior
-    components get pushed away from them.
+
+    Edge connectors are treated as fixed — they stay on perimeter and only
+    interior components (including vertical connectors) get pushed away.
+    If interior_bbox is provided, interior components are clamped inside it.
     """
     prev_overlap_count = float("inf")
     stall_iterations = 0
@@ -132,15 +164,15 @@ def _resolve_overlaps(
                 if not c1.overlaps(c2):
                     continue
 
-                # Cannot resolve if both are fixed or both are connectors
-                c1_fixed = c1.is_fixed or _is_connector(c1)
-                c2_fixed = c2.is_fixed or _is_connector(c2)
+                # Cannot resolve if both are fixed or both are edge connectors
+                c1_fixed = c1.is_fixed or _is_edge_connector(c1)
+                c2_fixed = c2.is_fixed or _is_edge_connector(c2)
                 if c1_fixed and c2_fixed:
                     continue
 
                 overlap_count += 1
-                
-                # If one is a connector, only move the non-connector
+
+                # If one is an edge connector, only move the other
                 if c1_fixed:
                     _push_apart_one(c2, c1, adaptive_strength, grid_mm)
                 elif c2_fixed:
@@ -148,8 +180,8 @@ def _resolve_overlaps(
                 else:
                     _push_apart(c1, c2, adaptive_strength, grid_mm)
 
-        # Keep everything inside board after each sweep.
-        _enforce_boundary(model)
+        # Keep everything inside bounds after each sweep
+        _enforce_boundary(model, interior_bbox)
 
         # Detect stalling and increase push strength
         if overlap_count >= prev_overlap_count:
@@ -173,11 +205,11 @@ def _resolve_overlaps(
 
 
 def _push_apart_one(movable: Component, fixed: Component, strength: float, grid_mm: float) -> None:
-    """Push the movable component away from a fixed component (connector).
-    
+    """Push the movable component away from a fixed component (edge connector).
+
     Args:
         movable: Component to move (interior component)
-        fixed: Fixed component to move away from (connector on perimeter)
+        fixed: Fixed component to move away from (edge connector on perimeter)
         strength: Multiplier for push distance
         grid_mm: Minimum movement (1.5x grid unit)
     """
@@ -196,11 +228,9 @@ def _push_apart_one(movable: Component, fixed: Component, strength: float, grid_
 
     # Push along axis of minimum separation for minimal displacement
     if overlap_x <= overlap_y:
-        # Push along X axis
         push_x = max(overlap_x * strength, push_mm)
         push_y = 0
     else:
-        # Push along Y axis
         push_x = 0
         push_y = max(overlap_y * strength, push_mm)
 
@@ -208,7 +238,6 @@ def _push_apart_one(movable: Component, fixed: Component, strength: float, grid_
     dx = 1 if movable.x >= fixed.x else -1
     dy = 1 if movable.y >= fixed.y else -1
 
-    # Apply push to movable component only
     movable.x += dx * push_x
     movable.y += dy * push_y
 
