@@ -131,6 +131,30 @@ def _compute_connector_rotation(comp: "Component", edge: str) -> float:
 
     return best_theta
 
+def pad_bbox(comp: "Component", pad_margin: float = 0.2) -> tuple[float, float, float, float]:
+    """Bounding box around all pads in board coords, with small margin.
+
+    Used for connectors: pads must stay inside board, body can overhang.
+    """
+    if not comp.pads:
+        # Fall back to component bbox if no pads
+        return comp.bbox
+
+    xs, ys = [], []
+    for p in comp.pads:
+        px, py = p.absolute_pos(comp.x, comp.y, comp.rotation)
+        xs.append(px)
+        ys.append(py)
+    
+    # xs and ys provide pad centers; add offset for edge location
+    pad_edge_margin = 3.5
+
+    min_x = min(xs) - pad_edge_margin - pad_margin
+    max_x = max(xs) + pad_edge_margin + pad_margin
+    min_y = min(ys) - pad_edge_margin - pad_margin
+    max_y = max(ys) + pad_edge_margin + pad_margin
+
+    return (min_x, min_y, max_x, max_y)
 
 # =============================================================================
 # ROTATION-AWARE CONNECTOR SPACING
@@ -1161,12 +1185,16 @@ def _place_connectors_perimeter(
 
                 # Bbox-aware clamp: adjust position so actual bbox stays
                 # within board (accounts for bbox_offset from footprint origin)
-                b = comp.bbox
+                if getattr(comp, "component_type", "") == "connector":
+                    b = pad_bbox(comp)
+                else:
+                    b = comp.bbox
+
                 if b[0] < board.x_min:
                     comp.x += board.x_min - b[0]
                 elif b[2] > board.x_max:
                     comp.x -= b[2] - board.x_max
-                b = comp.bbox
+                # b = comp.bbox
                 if b[1] < board.y_min:
                     comp.y += board.y_min - b[1]
                 elif b[3] > board.y_max:
