@@ -285,8 +285,8 @@ def main():
         choices=["mcu_peripheral", "power_supply", "rf_frontend", "mixed_signal", "generic", "small_board"],
         help="Board profile (default: generic)",
     )
-    p_place.add_argument("-a", "--algorithm", default="force-directed", choices=ALGORITHMS,
-                         help="Placement algorithm (default: force-directed)")
+    p_place.add_argument("-a", "--algorithm", default="grid", choices=ALGORITHMS,
+                         help="Placement algorithm (default: grid)")
     p_place.add_argument("-m", "--margin", type=float, default=None,
                          help="Board edge margin in mm (default: from config, else 5.0)")
     p_place.add_argument("--dry-run", action="store_true", help="Don't write PCB output file")
