@@ -174,9 +174,9 @@ def _resolve_overlaps(
 
                 # If one is an edge connector, only move the other
                 if c1_fixed:
-                    _push_apart_one(c2, c1, adaptive_strength, grid_mm)
+                    _push_apart_one(c2, c1, adaptive_strength, grid_mm, board=model.board)
                 elif c2_fixed:
-                    _push_apart_one(c1, c2, adaptive_strength, grid_mm)
+                    _push_apart_one(c1, c2, adaptive_strength, grid_mm, board=model.board)
                 else:
                     _push_apart(c1, c2, adaptive_strength, grid_mm)
 
@@ -204,7 +204,13 @@ def _resolve_overlaps(
                   f"{_count_overlaps(model)} overlaps remaining")
 
 
-def _push_apart_one(movable: Component, fixed: Component, strength: float, grid_mm: float) -> None:
+def _push_apart_one(
+    movable: Component,
+    fixed: Component,
+    strength: float,
+    grid_mm: float,
+    board: BoardOutline | None = None,
+) -> None:
     """Push the movable component away from a fixed component (edge connector).
 
     Args:
@@ -225,6 +231,23 @@ def _push_apart_one(movable: Component, fixed: Component, strength: float, grid_
 
     # Ensure minimum push distance = 1.5x grid unit to guarantee progress
     push_mm = max(grid_mm * 1.5, 0.15)
+
+    # Edge connectors live on the perimeter, so move interior parts toward the
+    # board center instead of letting the generic minimum-overlap axis push them
+    # sideways into another perimeter part.
+    if board is not None and _is_edge_connector(fixed):
+        board_cx = (board.x_min + board.x_max) / 2.0
+        board_cy = (board.y_min + board.y_max) / 2.0
+        center_dx = 1 if board_cx >= fixed.x else -1
+        center_dy = 1 if board_cy >= fixed.y else -1
+
+        if abs(board_cx - fixed.x) >= abs(board_cy - fixed.y):
+            push_x = max(overlap_x * strength, push_mm)
+            movable.x += center_dx * push_x
+        else:
+            push_y = max(overlap_y * strength, push_mm)
+            movable.y += center_dy * push_y
+        return
 
     # Push along axis of minimum separation for minimal displacement
     if overlap_x <= overlap_y:
