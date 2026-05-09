@@ -194,6 +194,8 @@ def _expand_interior_for_connectors(
     ib_x_min, ib_y_min, ib_x_max, ib_y_max = ib
 
     min_per_edge = _estimate_min_edge_space(connectors, mating_margin)
+    extra_edge_margin = 2.0  # Additional buffer beyond estimated connector space to avoid edge overlaps (later need to added to config)
+    min_per_edge += extra_edge_margin
 
     width = ib_x_max - ib_x_min
     height = ib_y_max - ib_y_min
@@ -256,6 +258,10 @@ def smart_grid_place(
     # Phase 3: SA optimization (HPWL minimization, no connectors present)
     if interior:
         _optimize_interior_sa(model, interior, margin, n_iter=sa_iterations)
+
+    # Phase 3.5: recentre interior cluster in usable board area
+    if interior:
+        _recentre_interior_cluster(model, interior, margin)
 
     # Phase 4: Interior bbox computed AFTER optimization
     ib = _compute_interior_bbox(interior, model.board, margin)
@@ -890,6 +896,62 @@ def _group_connectors(connectors: List["Component"]) -> List[ConnectorGroup]:
 
     return sorted(groups, key=lambda g: g.priority, reverse=True)
 
+def _recentre_interior_cluster(
+    model: "BoardModel",
+    interior: list["Component"],
+    margin: float,
+) -> None:
+    """Shift all interior components so their centroid is near the board center.
+
+    This reduces cases where the SA-condensed interior cluster hugs a corner
+    of the usable area, which in turn makes connector placement/corner
+    handling more stable.
+    """
+    if not interior:
+        return
+
+    board = model.board
+
+    # Usable area for interiors (same as in _place_interior)
+    ux_min = board.x_min + margin
+    ux_max = board.x_max - margin
+    uy_min = board.y_min + margin
+    uy_max = board.y_max - margin
+
+    # Current centroid of interior components
+    sx = sy = 0.0
+    n = 0
+    for c in interior:
+        sx += c.x
+        sy += c.y
+        n += 1
+    if n == 0:
+        return
+
+    cx = sx / n
+    cy = sy / n
+
+    # Target center = center of usable area
+    tx = (ux_min + ux_max) / 2.0
+    ty = (uy_min + uy_max) / 2.0
+
+    dx = tx - cx
+    dy = ty - cy
+
+    if abs(dx) < 1e-3 and abs(dy) < 1e-3:
+        return  # already centered enough
+
+    # Translate all interior components by (dx, dy), clamped to usable area
+    for c in interior:
+        new_x = c.x + dx
+        new_y = c.y + dy
+
+        # Clamp component centers so their courtyards stay inside usable area
+        half_w = c.effective_width / 2.0
+        half_h = c.effective_height / 2.0
+
+        c.x = max(ux_min + half_w, min(new_x, ux_max - half_w))
+        c.y = max(uy_min + half_h, min(new_y, uy_max - half_h))
 
 # =============================================================================
 # CONNECTOR PERIMETER PLACEMENT

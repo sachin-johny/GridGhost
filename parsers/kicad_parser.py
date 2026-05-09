@@ -307,7 +307,7 @@ def _infer_board_from_components(components: list[Component]) -> BoardOutline:
         max_x = max(max_x, comp.x + half_w)
         max_y = max(max_y, comp.y + half_h)
 
-    padding = max(5.0, max(max_x - min_x, max_y - min_y) * 0.15)
+    padding = max(8.0, max(max_x - min_x, max_y - min_y) * 0.25)
     return BoardOutline(
         x_min=min_x - padding,
         y_min=min_y - padding,
