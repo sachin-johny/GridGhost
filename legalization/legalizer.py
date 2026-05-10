@@ -340,10 +340,12 @@ def _count_overlaps(model: BoardModel) -> int:
 
 
 def _count_oob(model: BoardModel) -> int:
-    """Count out-of-bounds components."""
+    """Count out-of-bounds components, excluding edge connectors."""
     count = 0
     board = model.board
     for comp in model.components:
+        if comp.is_edge_connector:
+            continue
         x1, y1, x2, y2 = comp.bbox
         if x1 < board.x_min or x2 > board.x_max or y1 < board.y_min or y2 > board.y_max:
             count += 1

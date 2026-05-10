@@ -150,10 +150,17 @@ def total_boundary_penalty(model: BoardModel) -> float:
 
 
 def count_out_of_bounds(model: BoardModel) -> int:
-    """Count components whose bounding box extends outside the board."""
+    """Count components whose bounding box extends outside the board.
+
+    Edge connectors are excluded: they are intentionally placed with pads
+    on the board edge and body overhanging.  Their pads are inside the
+    board boundary, so they are not truly out-of-bounds.
+    """
     count = 0
     board = model.board
     for comp in model.components:
+        if comp.is_edge_connector:
+            continue
         x_min, y_min, x_max, y_max = comp.bbox
         if (x_min < board.x_min or x_max > board.x_max or
                 y_min < board.y_min or y_max > board.y_max):
