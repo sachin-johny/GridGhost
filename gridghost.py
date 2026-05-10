@@ -48,8 +48,8 @@ def _apply_config_to_globals(cfg: Config) -> None:
     # CONSTRAINT_WEIGHT is set by the profile's delta weight — not from config
 
 
-_OVERLAP_WEIGHT_BACKUP = 50.0
-_BOUNDARY_WEIGHT_BACKUP = 50.0
+_OVERLAP_WEIGHT_BACKUP = 10.0
+_BOUNDARY_WEIGHT_BACKUP = 2.0
 _CONSTRAINT_WEIGHT_BACKUP = 4.0
 
 
@@ -134,12 +134,21 @@ def cmd_place(args) -> None:
     # Step 5.5: SA optimization (if enabled)
     if not args.no_sa:
         print("Step 5: Running SA optimization...")
-        # Sync profile weights into CostState module-level constants
-        # SA needs stiff overlap/boundary penalties for feasibility,
-        # so we floor them rather than using the low profile values directly.
+        # Sync profile weights into CostState module-level constants.
+        #
+        # SA strategy (v8): moderate penalty discount, faster runtime, overlap resolver.
+        # - Hot SA (penalty_scale ≈ 0.65): overlap = 10*0.65 = 6.5, boundary = 2*0.65 = 1.3
+        #   HPWL dominates but overlap penalty is strong enough to limit overlaps.
+        # - Cold SA (penalty_scale ≈ 1.0): overlap = 10, boundary = 2
+        #   Overlaps are expensive, SA naturally resolves them.
+        # - Faster runtime: 200 steps, 2 reheats, 0.97 near-freeze cooling,
+        #   earlier freeze detection (T < 5% T0 instead of 1% T0).
+        # - Greedy: hard overlap rejection (small moves, no exploration needed).
+        # - Overlap resolver: after greedy, force-resolve any remaining overlaps.
+        # - Legalizer: grid snap + boundary cleanup (overlaps already resolved).
         import engine.cost_state as cs
-        cs.OVERLAP_WEIGHT = max(profile.beta, 10.0)   # floor at 10 for SA feasibility
-        cs.BOUNDARY_WEIGHT = max(profile.gamma, 5.0)  # floor at 5 for SA feasibility
+        cs.OVERLAP_WEIGHT = max(profile.beta, 10.0)    # moderate — SA explores, legalizer resolves
+        cs.BOUNDARY_WEIGHT = max(profile.gamma, 2.0)   # low — HPWL dominates
         cs.CONSTRAINT_WEIGHT = profile.delta
         sa_config = SAConfig(
             max_iterations=args.sa_iterations,
@@ -190,6 +199,20 @@ def cmd_place(args) -> None:
              interior_bbox=interior_bbox)
     print_board_summary(model, "After Legalization")
 
+    # Step 7.5: Post-legalization overlap resolution
+    # The legalizer can create new overlaps when it pushes components apart
+    # or clamps them to boundaries. Run the overlap resolver again to fix these.
+    post_legal_overlaps = count_overlaps(model)
+    if post_legal_overlaps > 0:
+        print(f"  Post-legalization overlap resolution ({post_legal_overlaps} overlaps)...")
+        from engine.annealer import _resolve_overlaps_greedy as _resolve_ovl
+        from engine.cost_state import CostState as PostLegalCostState
+        from engine.moves import get_moveable_indices as get_moveable
+        post_legal_cost_state = PostLegalCostState(model, rules=profile.rules)
+        post_legal_moveable = get_moveable(model)
+        _resolve_ovl(model, post_legal_cost_state, post_legal_moveable, SAConfig(verbose=True))
+        print_board_summary(model, "After Post-Legalization Overlap Resolution")
+
     # Step 8: Final cost evaluation
     costs_after = cost_fn.evaluate(model)
     print_cost_breakdown(costs_after, "Placement Cost (Post-Legalization)")
@@ -213,8 +236,8 @@ def cmd_place(args) -> None:
         print(f"  Placed PCB: {output_pcb}")
 
         if getattr(args, 'debug_bbox', False):
-            write_debug_bboxes(model, output_pcb)
-            print(f"  Debug bboxes written to Dwgs.User layer — enable that layer in KiCad to view")
+            write_debug_bboxes(model, output_pcb, interior_bbox=interior_bbox)
+            print(f"  Debug bboxes (board outline + interior bbox + component bboxes) written to Dwgs.User layer")
     else:
         print("  [DRY RUN] Not writing PCB file")
         if getattr(args, 'debug_bbox', False):

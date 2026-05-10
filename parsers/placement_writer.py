@@ -253,11 +253,21 @@ def export_positions_json(model: BoardModel, output_path: str) -> str:
     return str(output)
 
 
-def write_debug_bboxes(model: BoardModel, pcb_path: str) -> str:
+def write_debug_bboxes(
+    model: BoardModel,
+    pcb_path: str,
+    interior_bbox: tuple[float, float, float, float] | None = None,
+) -> str:
     """Inject gr_rect bounding-box visuals on Dwgs.User layer for debugging.
 
     Each component gets a rectangle matching its bbox property and a small
     label with the ref designator so you can identify it in KiCad.
+
+    Additionally draws:
+    - Board outline rect (dashed, wider stroke) so you can see the
+      effective board boundary — especially useful when no Edge.Cuts
+      geometry exists and the outline was inferred from components.
+    - Interior bbox rect (if provided) showing the connector-free zone.
     """
     import uuid
 
@@ -266,6 +276,52 @@ def write_debug_bboxes(model: BoardModel, pcb_path: str) -> str:
 
     # KiCad uses mm coordinates as floats
     segments = []
+
+    # --- Board outline rect ---
+    board = model.board
+    bx1 = format_kicad_coord(board.x_min)
+    by1 = format_kicad_coord(board.y_min)
+    bx2 = format_kicad_coord(board.x_max)
+    by2 = format_kicad_coord(board.y_max)
+    board_uuid = str(uuid.uuid4())
+    segments.append(
+        f'  (gr_rect (start {bx1} {by1}) (end {bx2} {by2}) '
+        f'(stroke (width 0.3) (type dash)) (fill none) (layer "Dwgs.User") '
+        f'(tstamp "{board_uuid}"))'
+    )
+    # Label at top-left corner of board outline
+    blx = format_kicad_coord(board.x_min)
+    bly = format_kicad_coord(board.y_min - 0.5)
+    board_text_uuid = str(uuid.uuid4())
+    segments.append(
+        f'  (gr_text "BOARD_OUTLINE" (at {blx} {bly}) '
+        f'(layer "Dwgs.User") (tstamp "{board_text_uuid}") '
+        f'(effects (font (size 1.0 1.0) (thickness 0.15))))'
+    )
+
+    # --- Interior bbox rect (if provided) ---
+    if interior_bbox is not None:
+        ib_x1, ib_y1, ib_x2, ib_y2 = interior_bbox
+        ix1 = format_kicad_coord(ib_x1)
+        iy1 = format_kicad_coord(ib_y1)
+        ix2 = format_kicad_coord(ib_x2)
+        iy2 = format_kicad_coord(ib_y2)
+        ib_uuid = str(uuid.uuid4())
+        segments.append(
+            f'  (gr_rect (start {ix1} {iy1}) (end {ix2} {iy2}) '
+            f'(stroke (width 0.25) (type dot)) (fill none) (layer "Dwgs.User") '
+            f'(tstamp "{ib_uuid}"))'
+        )
+        ilx = format_kicad_coord(ib_x1)
+        ily = format_kicad_coord(ib_y1 - 0.5)
+        ib_text_uuid = str(uuid.uuid4())
+        segments.append(
+            f'  (gr_text "INTERIOR_BBOX" (at {ilx} {ily}) '
+            f'(layer "Dwgs.User") (tstamp "{ib_text_uuid}") '
+            f'(effects (font (size 1.0 1.0) (thickness 0.15))))'
+        )
+
+    # --- Component bboxes ---
     for comp in model.components:
         bx1, by1, bx2, by2 = comp.bbox
         x1 = format_kicad_coord(bx1)

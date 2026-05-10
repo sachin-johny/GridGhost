@@ -2,7 +2,7 @@
 
 Implements Phase 0 seeding strategy from the plan:
   1. Build net hypergraph
-  2. Cluster by shared nets (greedy)
+  2. Cluster by shared nets (greedy + power-rail edges)
   3. Assign cluster centroids to board regions
   4. Return as initial positions for optimizer
 """
@@ -28,27 +28,30 @@ def build_net_hypergraph(model: BoardModel) -> nx.Graph:
     This captures connectivity intensity — components sharing many nets
     should be placed close together.
 
-    Power/ground nets are excluded because they connect nearly everything,
-    destroying cluster structure (would merge 60/68 components into one cluster).
+    Power/ground nets are excluded from signal edges because they connect
+    nearly everything, destroying cluster structure.  However, power-rail
+    edges are added separately (with lower weight) so that decoupling caps
+    cluster with the ICs that share their power rail — this is the key
+    insight from the user's suggestion: use +3V3, +12V labels to link
+    caps to their ICs.
     """
     G = nx.Graph()
 
     # Add all movable components as nodes
+    comp_type_map: dict[str, str] = {}
     for comp in model.components:
         if not comp.is_fixed:
             G.add_node(comp.ref, component=comp)
+            comp_type_map[comp.ref] = getattr(comp, 'component_type', 'generic')
 
-    # Add edges for shared nets (skip power nets)
+    # Add edges for shared signal nets (skip power nets)
     for net in model.nets:
-        # Skip power nets — they connect everything and destroy cluster structure
         if _is_power_net(net.name):
             continue
         refs = list(net.component_refs)
-        # Only consider nets with 2+ movable components
         movable_refs = [r for r in refs if G.has_node(r)]
         if len(movable_refs) < 2:
             continue
-        # Add edges between all pairs on this net (clique model for small nets)
         for i, r1 in enumerate(movable_refs):
             for r2 in movable_refs[i + 1:]:
                 if G.has_edge(r1, r2):
@@ -56,7 +59,97 @@ def build_net_hypergraph(model: BoardModel) -> nx.Graph:
                 else:
                     G.add_edge(r1, r2, weight=1)
 
+    # Add power-rail edges: link decoupling caps to ICs that share
+    # the same non-GND power rail.  This prevents caps from becoming
+    # isolated nodes (since they typically only connect to VCC/GND
+    # and have no signal-net edges).
+    _add_power_rail_edges(G, model, comp_type_map)
+
     return G
+
+
+def _add_power_rail_edges(
+    G: nx.Graph,
+    model: BoardModel,
+    comp_type_map: dict[str, str],
+) -> None:
+    """Add edges between decoupling caps and ICs sharing the same power rail.
+
+    Non-GND power rails (e.g. +3V3, +12V, VCC) are discriminative: only
+    specific ICs and their decoupling caps share each rail.  Adding edges
+    with weight < 1.0 gives these connections influence without letting
+    them dominate the signal-net structure.
+
+    Fallback: caps that share NO power rail with any IC (but share signal
+    nets) also get edges to those ICs.  This handles cases like U3 where
+    the cap is connected via signal nets only, or where the power rail
+    naming doesn't match the expected patterns.
+    """
+    ic_types = {'ic', 'mcu', 'regulator'}
+
+    # Track which caps got at least one power-rail edge
+    caps_with_power_edge: set[str] = set()
+
+    for net in model.nets:
+        if not _is_power_net(net.name):
+            continue
+        # Exclude GND — every component shares it, no discriminative power
+        clean = net.name.lstrip('/').upper()
+        if any(clean.startswith(p) for p in ('GND', 'AGND', 'DGND', 'PGND', 'SGND', 'VSS')):
+            continue
+
+        refs = list(net.component_refs)
+        movable_refs = [r for r in refs if G.has_node(r)]
+
+        ic_refs = [r for r in movable_refs if comp_type_map.get(r) in ic_types]
+        cap_refs = [r for r in movable_refs if comp_type_map.get(r) == 'capacitor']
+
+        if not ic_refs or not cap_refs:
+            continue
+
+        # Add edges between each cap and each IC on this rail.
+        # Weight < 1.0 so power-rail edges are weaker than signal edges,
+        # but strong enough to pull caps toward their IC's cluster.
+        power_edge_weight = 0.5
+        for cap_ref in cap_refs:
+            for ic_ref in ic_refs:
+                if G.has_edge(cap_ref, ic_ref):
+                    G[cap_ref][ic_ref]["weight"] += power_edge_weight
+                else:
+                    G.add_edge(cap_ref, ic_ref, weight=power_edge_weight)
+                caps_with_power_edge.add(cap_ref)
+
+    # Fallback: for caps that got NO power-rail edge, create edges to
+    # ICs they share ANY net with (including signal nets).  This handles
+    # the U3 case where its decoupling cap isn't on the same named power
+    # rail or the cap only connects via GND + a signal net.
+    cap_refs_all = [r for r in G.nodes() if comp_type_map.get(r) == 'capacitor']
+    ic_refs_all = [r for r in G.nodes() if comp_type_map.get(r) in ic_types]
+
+    # Build net→refs mapping for fallback
+    net_members: dict[str, set[str]] = defaultdict(set)
+    for net in model.nets:
+        for ref in net.component_refs:
+            if G.has_node(ref):
+                net_members[net.name].add(ref)
+
+    fallback_weight = 0.3  # weaker than power-rail edges
+    for cap_ref in cap_refs_all:
+        if cap_ref in caps_with_power_edge:
+            continue  # already has a power-rail edge, skip
+
+        # Find ICs that share any net with this cap
+        for net_name, members in net_members.items():
+            if cap_ref not in members:
+                continue
+            for ic_ref in ic_refs_all:
+                if ic_ref not in members:
+                    continue
+                # Cap and IC share this net — add edge if not already present
+                if G.has_edge(cap_ref, ic_ref):
+                    G[cap_ref][ic_ref]["weight"] += fallback_weight
+                else:
+                    G.add_edge(cap_ref, ic_ref, weight=fallback_weight)
 
 
 def cluster_components(
@@ -86,7 +179,6 @@ def cluster_components(
 
     # Auto-calculate cluster count
     if n_clusters is None:
-        # Rough heuristic: sqrt of component count, min 2, max 10
         n_clusters = max(2, min(10, int(math.sqrt(len(movable_refs)))))
 
     # Handle isolated nodes (components with no shared nets)
@@ -97,25 +189,107 @@ def cluster_components(
     else:
         clusters = _greedy_clustering(G, n_clusters)
 
-    # Add isolated components to the smallest cluster
+    # Add isolated components to the smallest cluster — but only if they
+    # aren't already assigned.  Isolated nodes (degree 0) ARE in G.nodes()
+    # so they get assigned by greedy/louvain first; without this check they
+    # get added a second time, causing duplicate placements → overlaps.
+    already_assigned: set[str] = set()
+    for cluster in clusters:
+        already_assigned.update(cluster)
+
     for ref in isolated:
+        if ref in already_assigned:
+            continue
         if clusters:
             smallest = min(clusters, key=len)
             smallest.append(ref)
         else:
             clusters.append([ref])
 
+    # Post-processing: ensure every cluster with an IC has at least one cap.
+    # This handles cases like U3 where the IC's decoupling caps ended up
+    # in other clusters due to weaker graph connectivity.
+    _ensure_ic_has_caps(clusters, model)
+
     return clusters
 
 
+def _ensure_ic_has_caps(
+    clusters: list[list[str]],
+    model: BoardModel,
+) -> None:
+    """Post-processing: move one cap to each IC cluster that has no caps.
+
+    For each cluster containing an IC but no capacitor, find the nearest
+    cap-rich cluster (one with multiple caps) and transfer one cap.
+    This ensures every IC has at least one decoupling cap nearby.
+    """
+    ic_types = {'ic', 'mcu', 'regulator'}
+    comp_type_map = {c.ref: getattr(c, 'component_type', 'generic') for c in model.components}
+
+    for i, cluster in enumerate(clusters):
+        has_ic = any(comp_type_map.get(r) in ic_types for r in cluster)
+        has_cap = any(comp_type_map.get(r) == 'capacitor' for r in cluster)
+
+        if has_ic and not has_cap:
+            # Find which IC this cluster has
+            ic_ref = next(r for r in cluster if comp_type_map.get(r) in ic_types)
+
+            # Find the best cap to steal from another cluster:
+            # prefer the cluster with the most caps (can afford to lose one)
+            best_donor = None
+            best_cap_ref = None
+            best_cap_count = 0
+
+            for j, other in enumerate(clusters):
+                if j == i:
+                    continue
+                other_caps = [r for r in other if comp_type_map.get(r) == 'capacitor']
+                if len(other_caps) > best_cap_count and len(other_caps) > 1:
+                    # Check if this cap shares any net with our IC
+                    ic_nets = set()
+                    for net in model.nets:
+                        if ic_ref in net.component_refs:
+                            ic_nets.add(net.name)
+
+                    for cap_ref in other_caps:
+                        cap_nets = set()
+                        for net in model.nets:
+                            if cap_ref in net.component_refs:
+                                cap_nets.add(net.name)
+                        # Prefer caps that share at least one net with the IC
+                        if ic_nets & cap_nets:
+                            best_donor = j
+                            best_cap_ref = cap_ref
+                            best_cap_count = len(other_caps)
+                            break
+
+                    # If no shared-net cap found, take any cap from the richest cluster
+                    if best_cap_ref is None and len(other_caps) > 1:
+                        best_donor = j
+                        best_cap_ref = other_caps[0]
+                        best_cap_count = len(other_caps)
+
+            if best_donor is not None and best_cap_ref is not None:
+                clusters[best_donor].remove(best_cap_ref)
+                cluster.append(best_cap_ref)
+
+
 def _greedy_clustering(G: nx.Graph, n_clusters: int) -> list[list[str]]:
-    """Greedy clustering: seed clusters from highest-degree nodes,
-    then assign each remaining node to the cluster it shares the most edges with."""
+    """Balanced greedy clustering with soft size constraint.
+
+    Seed clusters from highest-degree nodes, then assign each remaining
+    node to the cluster it shares the most edges with.  A soft size
+    penalty prevents any cluster from growing much larger than the
+    target size (total_nodes / n_clusters), which fixes the Cluster 0
+    bloat problem where the highest-degree seed accumulates everything.
+    """
     nodes = list(G.nodes())
     if not nodes:
         return []
 
     n_clusters = min(n_clusters, len(nodes))
+    target_size = len(nodes) / n_clusters
 
     # Seed: pick highest-degree nodes
     degree_sorted = sorted(nodes, key=lambda n: G.degree(n, weight="weight"), reverse=True)
@@ -123,21 +297,28 @@ def _greedy_clustering(G: nx.Graph, n_clusters: int) -> list[list[str]]:
 
     clusters: list[list[str]] = [[seed] for seed in seeds]
     assigned = set(seeds)
+    cluster_sizes = [1] * n_clusters
 
-    # Assign remaining nodes greedily by edge weight
+    # Assign remaining nodes greedily by edge weight + size balance
     remaining = [n for n in nodes if n not in assigned]
-    # Sort by degree descending so well-connected nodes get better placements
     remaining.sort(key=lambda n: G.degree(n, weight="weight"), reverse=True)
 
     for node in remaining:
         best_cluster = 0
-        best_weight = -1
+        best_score = -1
         for i, cluster in enumerate(clusters):
             weight = sum(G[node][c].get("weight", 1) for c in cluster if G.has_edge(node, c))
-            if weight > best_weight:
-                best_weight = weight
+            # Soft size penalty: reduce attractiveness of oversized clusters.
+            # At 2x target size, score is reduced by 50%.  This prevents
+            # Cluster 0 from absorbing everything just because it has the
+            # highest-degree seed (typically the MCU).
+            size_penalty = max(0, (cluster_sizes[i] - target_size) / max(target_size, 1))
+            score = weight * (1.0 - 0.5 * size_penalty)
+            if score > best_score:
+                best_score = score
                 best_cluster = i
         clusters[best_cluster].append(node)
+        cluster_sizes[best_cluster] += 1
 
     return clusters
 
@@ -147,13 +328,11 @@ def _louvain_clustering(G: nx.Graph, n_clusters: int) -> list[list[str]]:
     try:
         communities = nx.community.louvain_communities(G, weight="weight")
     except AttributeError:
-        # Fallback for older networkx
         communities = _greedy_clustering(G, n_clusters)
         return communities
 
     # If too many communities, merge smallest
     while len(communities) > n_clusters:
-        # Merge two smallest
         communities.sort(key=len)
         merged = communities[0] | communities[1]
         communities = [merged] + communities[2:]

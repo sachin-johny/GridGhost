@@ -12,13 +12,13 @@
     "annealer": {
         "max_iterations": 300,
         "reheat_count": 3,
-        "reheat_ratio": 0.30,
-        "reheat_decay": 0.5,
+        "reheat_ratio": 0.40,
+        "reheat_decay": 0.6,
         "calibration_samples": 200,
         "initial_accept_rate": 0.95,
-        "penalty_scale_min": 0.10,
+        "penalty_scale_min": 0.65,
         "min_temperature": 1e-6,
-        "freeze_threshold": 0.01,
+        "freeze_threshold": 0.005,
         "greedy_nudge_distances": [0.05, 0.1, 0.2, 0.5, 1.0],
         "greedy_rotations": [90.0, 180.0, 270.0],
         "greedy_improve_threshold": 1.0,
@@ -27,8 +27,8 @@
         "cooling_thorough": 0.95
     },
     "cost": {
-        "overlap_weight": 50.0,
-        "boundary_weight": 50.0
+        "overlap_weight": 10.0,
+        "boundary_weight": 2.0
     },
     "placement": {
         "margin": 5.0,

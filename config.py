@@ -28,11 +28,11 @@ class LegalizationConfig:
 class AnnealerConfig:
     max_iterations: int = 200
     reheat_count: int = 2
-    reheat_ratio: float = 0.30
-    reheat_decay: float = 0.5
+    reheat_ratio: float = 0.35
+    reheat_decay: float = 0.6
     calibration_samples: int = 200
-    initial_accept_rate: float = 0.95
-    penalty_scale_min: float = 0.80
+    initial_accept_rate: float = 0.90
+    penalty_scale_min: float = 0.65  # overlap=6.5 at hot — limits overlaps while exploring
     min_temperature: float = 1e-6
     freeze_threshold: float = 0.01
     greedy_nudge_distances: tuple[float, ...] = (0.05, 0.1, 0.2, 0.5, 1.0)
@@ -45,9 +45,9 @@ class AnnealerConfig:
 
 @dataclass
 class CostConfig:
-    overlap_weight: float = 50.0
-    boundary_weight: float = 50.0
-    constraint_weight: float = 4.0  # delta — overridden by profile.delta at runtime
+    overlap_weight: float = 10.0      # moderate — soft penalty; SA explores, legalizer resolves
+    boundary_weight: float = 2.0       # low — HPWL dominates; legalizer handles OOB
+    constraint_weight: float = 4.0     # delta — overridden by profile.delta at runtime
 
 
 @dataclass

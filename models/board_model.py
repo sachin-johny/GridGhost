@@ -132,6 +132,12 @@ class BoardOutline:
     def contains(self, x: float, y: float) -> bool:
         return self.x_min <= x <= self.x_max and self.y_min <= y <= self.y_max
 
+    def contains_bbox(self, bbox: tuple[float, float, float, float]) -> bool:
+        """Return True if the entire bounding box is inside the board outline."""
+        x_min, y_min, x_max, y_max = bbox
+        return (x_min >= self.x_min and x_max <= self.x_max and
+                y_min >= self.y_min and y_max <= self.y_max)
+
     def clamp(self, x: float, y: float) -> tuple[float, float]:
         """Clamp coordinates to be within the board outline."""
         return (
@@ -312,10 +318,12 @@ class BoardModel:
                     overlap_count += 1
                     overlap_area_total += area
 
-        # Out-of-bounds
+        # Out-of-bounds — check full bounding box, not just center point.
+        # This matches count_out_of_bounds() in cost_function.py which
+        # counts components whose bbox extends past the board edge.
         oob_count = sum(
             1 for c in self.components
-            if not self.board.contains(c.x, c.y)
+            if not self.board.contains_bbox(c.bbox)
         )
 
         return {

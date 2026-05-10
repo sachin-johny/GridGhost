@@ -15,8 +15,8 @@ from models.board_model import BoardModel
 from profiles.board_profiles import ConstraintRule
 from engine.constraint_evaluator import evaluate_constraint_penalties
 
-OVERLAP_WEIGHT = 50.0
-BOUNDARY_WEIGHT = 50.0
+OVERLAP_WEIGHT = 10.0   # moderate — soft penalty; SA explores, legalizer resolves
+BOUNDARY_WEIGHT = 2.0   # low — HPWL dominates; legalizer handles OOB
 CONSTRAINT_WEIGHT = 4.0  # delta — matches BoardProfile default
 
 _POWER_PREFIXES = (
