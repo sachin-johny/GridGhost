@@ -26,17 +26,18 @@ class LegalizationConfig:
 
 @dataclass
 class AnnealerConfig:
-    max_iterations: int = 300
-    reheat_count: int = 3
+    max_iterations: int = 300          # v11: density-adaptive SA adjusts at runtime
+    reheat_count: int = 3              # v11: overridden by density-adaptive logic (1-3)
     reheat_ratio: float = 0.40
-    calibration_samples: int = 500     # v9: more samples for robust T0
-    initial_accept_rate: float = 0.92  # v9: target high accept at start
-    penalty_scale_min: float = 0.50    # v9: balance exploration with constraint relevance
+    calibration_samples: int = 500     # v11: more samples for robust T0
+    initial_accept_rate: float = 0.90  # v11: target accept at start
+    penalty_scale_min: float = 0.50    # v11: overridden by density-adaptive logic (0.50-0.95)
     min_temperature: float = 1e-8
     freeze_threshold: float = 0.005
     greedy_nudge_distances: tuple[float, ...] = (0.05, 0.1, 0.2, 0.5, 1.0, 2.0)
     greedy_rotations: tuple[float, ...] = (90.0, 180.0, 270.0)
-    greedy_improve_threshold: float = 0.5  # v9: accept smaller improvements
+    greedy_improve_threshold: float = 0.5  # v11: accept smaller improvements
+    overlap_cap_factor: float = 2.0    # v11: reject moves exceeding this * initial overlaps
 
 
 @dataclass

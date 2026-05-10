@@ -1,9 +1,18 @@
 """Legalization pass for PCB placement.
 
+v11: Smarter overlap resolution that avoids creating new overlaps.
+Key improvements over v10:
+  - Push-apart checks if it creates new overlaps before accepting
+  - Sorts overlaps by area (smallest first — easier to resolve, less cascade)
+  - Greedy nearest-free-position fallback when push-apart fails
+  - Per-component boundary enforcement with overlap checking
+  - Smarter grid snapping that avoids creating overlaps
+
 Runs AFTER optimization to produce a legal, grid-snapped placement:
 1. Grid snapping — round coordinates to KiCad's placement grid
 2. Boundary enforcement — clamp out-of-bounds components
 3. Overlap resolution — iteratively shift overlapping components apart
+4. Greedy cleanup — move remaining overlapping components to free positions
 
 IMPORTANT: Run legalization as a single post-optimization pass,
 NOT iteratively inside the optimizer loop — it would corrupt
@@ -46,18 +55,28 @@ def legalize(
         oob_before = _count_oob(model)
         print(f"Legalization input: {overlaps_before} overlaps, {oob_before} out-of-bounds")
 
-    # Step 1: Snap to grid
+    # Step 1: Snap to grid (overlap-aware)
     _snap_to_grid(model, grid_mm)
 
     # Step 2: Enforce board boundary
     _enforce_boundary(model, interior_bbox)
 
-    # Step 3: Resolve overlaps
+    # Step 3: Resolve overlaps (smart push-apart + greedy fallback)
     _resolve_overlaps(model, max_iterations, push_strength, grid_mm, verbose, interior_bbox)
 
-    # Step 4: Final grid snap and boundary check
+    # Step 4: Greedy cleanup for any remaining overlaps
+    remaining = _count_overlaps(model)
+    if remaining > 0:
+        _greedy_resolve(model, grid_mm, verbose, interior_bbox)
+
+    # Step 5: Final grid snap and boundary check
     _snap_to_grid(model, grid_mm)
     _enforce_boundary(model, interior_bbox)
+
+    # Step 6: Final greedy cleanup (grid snap may have created overlaps)
+    remaining = _count_overlaps(model)
+    if remaining > 0:
+        _greedy_resolve(model, grid_mm, verbose, interior_bbox)
 
     if verbose:
         overlaps_after = _count_overlaps(model)
@@ -70,17 +89,66 @@ def legalize(
 def _snap_to_grid(model: BoardModel, grid_mm: float) -> None:
     """Round all component positions to the nearest grid point.
 
-    Edge connectors keep their exact perimeter positions.
-    Vertical connectors (treated as interior) ARE snapped.
+    v11: Overlap-aware grid snapping. After snapping each component,
+    check if it now overlaps with any previously-snapped component.
+    If so, try adjacent grid points to find a non-overlapping snap.
     """
-    for comp in model.components:
+    components = list(model.components)
+    snapped_positions = []  # list of (comp, old_x, old_y) for already-snapped
+
+    for comp in components:
         # Skip fixed components AND edge connectors
         if comp.is_fixed or comp.is_edge_connector:
             continue
-        comp.x = round(comp.x / grid_mm) * grid_mm
-        comp.y = round(comp.y / grid_mm) * grid_mm
-        # Snap rotation to nearest 90°
+
+        old_x, old_y = comp.x, comp.y
+        new_x = round(old_x / grid_mm) * grid_mm
+        new_y = round(old_y / grid_mm) * grid_mm
         comp.rotation = round(comp.rotation / 90.0) * 90.0
+
+        # Check if snapping created overlaps with already-snapped components
+        comp.x = new_x
+        comp.y = new_y
+
+        has_overlap = any(
+            comp.overlaps(other)
+            for other, _, _ in snapped_positions
+        )
+
+        if has_overlap:
+            # Try adjacent grid points
+            best_x, best_y = old_x, old_y  # fallback: keep original
+            best_overlaps = 999
+
+            for dx in [-grid_mm, 0, grid_mm]:
+                for dy in [-grid_mm, 0, grid_mm]:
+                    if dx == 0 and dy == 0:
+                        continue
+                    trial_x = new_x + dx
+                    trial_y = new_y + dy
+                    comp.x = trial_x
+                    comp.y = trial_y
+                    overlap_count = sum(
+                        1 for other, _, _ in snapped_positions
+                        if comp.overlaps(other)
+                    )
+                    if overlap_count < best_overlaps:
+                        best_overlaps = overlap_count
+                        best_x, best_y = trial_x, trial_y
+                        if overlap_count == 0:
+                            break
+                if best_overlaps == 0:
+                    break
+
+            if best_overlaps > 0:
+                # No adjacent grid point avoids overlap — keep original position
+                comp.x = old_x
+                comp.y = old_y
+            else:
+                comp.x = best_x
+                comp.y = best_y
+
+        snapped_positions.append((comp, old_x, old_y))
 
 
 def _enforce_boundary(
@@ -89,31 +157,127 @@ def _enforce_boundary(
 ) -> None:
     """Clamp component positions so their bounding boxes stay within bounds.
 
-    Edge connectors are treated as fixed — they stay where placed on perimeter.
-    Other components are clamped to the interior bbox if provided, otherwise
-    to board bounds.
+    v11: Overlap-aware boundary enforcement. When clamping would create
+    a new overlap, try sliding along the boundary to find a non-overlapping
+    position. If no such position exists, still clamp (out-of-bounds is
+    worse than overlapping).
     """
     board = model.board
+    components = list(model.components)
+
     for comp in model.components:
-        # Skip fixed components AND edge connectors
         if comp.is_fixed or comp.is_edge_connector:
             continue
-        half_w = comp.effective_width / 2.0
-        half_h = comp.effective_height / 2.0
 
-        if interior_bbox:
-            x_min = interior_bbox[0] + half_w
-            x_max = interior_bbox[2] - half_w
-            y_min = interior_bbox[1] + half_h
-            y_max = interior_bbox[3] - half_h
-        else:
-            x_min = board.x_min + half_w
-            x_max = board.x_max - half_w
-            y_min = board.y_min + half_h
-            y_max = board.y_max - half_h
+        old_x, old_y = comp.x, comp.y
+        _enforce_boundary_single(comp, interior_bbox, board)
 
-        comp.x = max(x_min, min(comp.x, x_max))
-        comp.y = max(y_min, min(comp.y, y_max))
+        # Check if clamping created new overlaps
+        if comp.x != old_x or comp.y != old_y:
+            overlap_count = sum(1 for other in components
+                                if other is not comp and comp.overlaps(other))
+            if overlap_count > 0:
+                # Try sliding along boundary to reduce overlaps
+                best_x, best_y = comp.x, comp.y
+                best_overlaps = overlap_count
+
+                # Try small adjustments along the boundary
+                for delta in [0.1, 0.2, 0.5, 1.0, 2.0, 3.0, 5.0]:
+                    for dx_dir, dy_dir in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+                        trial_x = comp.x + dx_dir * delta
+                        trial_y = comp.y + dy_dir * delta
+
+                        # Keep within bounds
+                        half_w = comp.effective_width / 2.0
+                        half_h = comp.effective_height / 2.0
+                        if interior_bbox:
+                            x_min = interior_bbox[0] + half_w
+                            x_max = interior_bbox[2] - half_w
+                            y_min = interior_bbox[1] + half_h
+                            y_max = interior_bbox[3] - half_h
+                        else:
+                            x_min = board.x_min + half_w
+                            x_max = board.x_max - half_w
+                            y_min = board.y_min + half_h
+                            y_max = board.y_max - half_h
+
+                        trial_x = max(x_min, min(trial_x, x_max))
+                        trial_y = max(y_min, min(trial_y, y_max))
+
+                        comp.x = trial_x
+                        comp.y = trial_y
+                        trial_overlaps = sum(1 for other in components
+                                             if other is not comp and comp.overlaps(other))
+                        if trial_overlaps < best_overlaps:
+                            best_overlaps = trial_overlaps
+                            best_x, best_y = trial_x, trial_y
+                            if trial_overlaps == 0:
+                                break
+                    if best_overlaps == 0:
+                        break
+
+                comp.x = best_x
+                comp.y = best_y
+
+
+def _enforce_boundary_single(
+    comp: Component,
+    interior_bbox: tuple[float, float, float, float] | None,
+    board: BoardOutline,
+) -> None:
+    """Clamp a single component to board/interior bounds."""
+    if comp.is_fixed or comp.is_edge_connector:
+        return
+    half_w = comp.effective_width / 2.0
+    half_h = comp.effective_height / 2.0
+
+    if interior_bbox:
+        x_min = interior_bbox[0] + half_w
+        x_max = interior_bbox[2] - half_w
+        y_min = interior_bbox[1] + half_h
+        y_max = interior_bbox[3] - half_h
+    else:
+        x_min = board.x_min + half_w
+        x_max = board.x_max - half_w
+        y_min = board.y_min + half_h
+        y_max = board.y_max - half_h
+
+    comp.x = max(x_min, min(comp.x, x_max))
+    comp.y = max(y_min, min(comp.y, y_max))
+
+
+def _count_overlaps_involving(
+    comp: Component,
+    components: list[Component],
+) -> int:
+    """Count overlaps involving comp with any other component."""
+    count = 0
+    for other in components:
+        if other is comp:
+            continue
+        if comp.overlaps(other):
+            count += 1
+    return count
+
+
+def _count_pair_overlaps_involving(
+    c1: Component,
+    c2: Component,
+    components: list[Component],
+) -> int:
+    """Count overlaps involving c1 or c2 with any other component."""
+    count = 0
+    for other in components:
+        if other is c1 or other is c2:
+            continue
+        if c1.overlaps(other):
+            count += 1
+        if c2.overlaps(other):
+            count += 1
+    # Also count c1-c2 overlap
+    if c1.overlaps(c2):
+        count += 1
+    return count
 
 
 def _resolve_overlaps(
@@ -126,23 +290,21 @@ def _resolve_overlaps(
 ) -> None:
     """Iteratively resolve component overlaps by pushing components apart.
 
-    Uses a force-directed push-apart strategy: for each overlapping pair,
-    compute the overlap direction and push both components away from each other.
-    Increases push_strength adaptively if progress stalls.
-
-    Edge connectors are treated as fixed — they stay on perimeter and only
-    interior components (including vertical connectors) get pushed away.
-    If interior_bbox is provided, interior components are clamped inside it.
+    v11: Smart push-apart that avoids creating new overlaps.
+    - Sorts overlaps by area (smallest first — easier to resolve)
+    - Only accepts pushes that reduce local overlap count
+    - Tries reduced strength if full push creates new overlaps
+    - Falls back to greedy resolution for stubborn overlaps
     """
+    board = model.board
     prev_overlap_count = float("inf")
     stall_iterations = 0
     adaptive_strength = push_strength
 
     for iteration in range(max_iterations):
-        overlap_count = 0
+        # Collect all overlapping pairs with their overlap areas
+        overlap_pairs = []
         components = list(model.components)
-
-        # Sort by position for deterministic resolution
         components.sort(key=lambda c: (c.x, c.y))
 
         for i, c1 in enumerate(components):
@@ -156,38 +318,237 @@ def _resolve_overlaps(
                 if c1_fixed and c2_fixed:
                     continue
 
-                overlap_count += 1
+                area = c1.overlap_area(c2)
+                overlap_pairs.append((area, c1, c2, c1_fixed, c2_fixed))
 
-                # If one is an edge connector, only move the other
-                if c1_fixed:
-                    _push_apart_one(c2, c1, adaptive_strength, grid_mm, board=model.board)
-                elif c2_fixed:
-                    _push_apart_one(c1, c2, adaptive_strength, grid_mm, board=model.board)
-                else:
-                    _push_apart(c1, c2, adaptive_strength, grid_mm)
-
-        # Keep everything inside bounds after each sweep
-        _enforce_boundary(model, interior_bbox)
-
-        # Detect stalling and increase push strength
-        if overlap_count >= prev_overlap_count:
-            stall_iterations += 1
-            if stall_iterations >= 10:
-                adaptive_strength = min(1.5, adaptive_strength * 1.2)
-                stall_iterations = 0
-        else:
-            stall_iterations = 0
-
-        prev_overlap_count = overlap_count
+        overlap_count = len(overlap_pairs)
 
         if overlap_count == 0:
             if verbose:
                 print(f"  Overlap resolution converged in {iteration + 1} iterations")
             break
+
+        # Sort by overlap area (smallest first — easier to resolve, less cascade)
+        overlap_pairs.sort(key=lambda x: x[0])
+
+        resolved_this_pass = 0
+        for area, c1, c2, c1_fixed, c2_fixed in overlap_pairs:
+            # Re-check if they still overlap (previous resolves may have fixed this)
+            if not c1.overlaps(c2):
+                continue
+
+            # Save positions before push
+            old_x1, old_y1 = c1.x, c1.y
+            old_x2, old_y2 = c2.x, c2.y
+
+            # Count overlaps involving c1 and c2 before push
+            local_before = _count_pair_overlaps_involving(c1, c2, components)
+
+            # Try push-apart with full strength
+            if c1_fixed:
+                _push_apart_one(c2, c1, adaptive_strength, grid_mm, board=board)
+            elif c2_fixed:
+                _push_apart_one(c1, c2, adaptive_strength, grid_mm, board=board)
+            else:
+                _push_apart(c1, c2, adaptive_strength, grid_mm)
+
+            # Apply boundary enforcement for pushed components only
+            _enforce_boundary_single(c1, interior_bbox, board)
+            _enforce_boundary_single(c2, interior_bbox, board)
+
+            # Count overlaps involving c1 and c2 after push
+            local_after = _count_pair_overlaps_involving(c1, c2, components)
+
+            if local_after <= local_before:
+                # Push improved or maintained the situation — accept
+                resolved_this_pass += 1
+            else:
+                # Push made things worse — try with reduced strength
+                c1.x, c1.y = old_x1, old_y1
+                c2.x, c2.y = old_x2, old_y2
+
+                reduced_strength = adaptive_strength * 0.5
+                if c1_fixed:
+                    _push_apart_one(c2, c1, reduced_strength, grid_mm, board=board)
+                elif c2_fixed:
+                    _push_apart_one(c1, c2, reduced_strength, grid_mm, board=board)
+                else:
+                    _push_apart(c1, c2, reduced_strength, grid_mm)
+
+                _enforce_boundary_single(c1, interior_bbox, board)
+                _enforce_boundary_single(c2, interior_bbox, board)
+
+                local_after_reduced = _count_pair_overlaps_involving(c1, c2, components)
+
+                if local_after_reduced <= local_before:
+                    # Reduced push worked
+                    resolved_this_pass += 1
+                else:
+                    # Still worse — undo completely and skip
+                    c1.x, c1.y = old_x1, old_y1
+                    c2.x, c2.y = old_x2, old_y2
+                    continue
+
+        # Global boundary enforcement
+        _enforce_boundary(model, interior_bbox)
+
+        # Count actual overlaps
+        actual_overlap_count = _count_overlaps(model)
+
+        # Detect stalling and increase push strength
+        if actual_overlap_count >= prev_overlap_count:
+            stall_iterations += 1
+            if stall_iterations >= 8:
+                adaptive_strength = min(2.0, adaptive_strength * 1.3)
+                stall_iterations = 0
+        else:
+            stall_iterations = 0
+
+        prev_overlap_count = actual_overlap_count
+
+        if actual_overlap_count == 0:
+            if verbose:
+                print(f"  Overlap resolution converged in {iteration + 1} iterations")
+            break
+
+        # If no progress after many iterations, break early — greedy will handle it
+        if stall_iterations >= 20:
+            if verbose:
+                print(f"  Push-apart stalled at iteration {iteration + 1} "
+                      f"({actual_overlap_count} overlaps remaining, switching to greedy)")
+            break
     else:
         if verbose:
             print(f"  Overlap resolution: max iterations ({max_iterations}) reached, "
                   f"{_count_overlaps(model)} overlaps remaining")
+
+
+def _greedy_resolve(
+    model: BoardModel,
+    grid_mm: float,
+    verbose: bool,
+    interior_bbox: tuple[float, float, float, float] | None = None,
+) -> None:
+    """Greedy overlap resolution: move overlapping components to nearest free positions.
+
+    This is the fallback when push-apart can't resolve all overlaps.
+    For each overlapping component, search nearby positions for a spot
+    that minimizes overlaps. Includes a grid-sweep search for finding
+    free positions on dense boards.
+
+    Strategy:
+    1. Find the component with the most overlaps
+    2. Try nudging it in all directions at various distances
+    3. If nudging fails, try sweeping a grid of positions across the board
+    4. Accept the position that minimizes its overlap count
+    5. Repeat until no overlaps remain or no improvement possible
+    """
+    board = model.board
+    components = list(model.components)
+    movable = [c for c in components if not c.is_fixed and not c.is_edge_connector]
+    directions = [(1, 0), (-1, 0), (0, 1), (0, -1),
+                  (1, 1), (-1, 1), (1, -1), (-1, -1)]
+    nudge_dists = [grid_mm, grid_mm * 2, grid_mm * 5, grid_mm * 10,
+                   0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0]
+
+    # Compute board bounds for grid sweep
+    if interior_bbox:
+        bx_min = interior_bbox[0]
+        bx_max = interior_bbox[2]
+        by_min = interior_bbox[1]
+        by_max = interior_bbox[3]
+    else:
+        bx_min = board.x_min
+        bx_max = board.x_max
+        by_min = board.y_min
+        by_max = board.y_max
+
+    prev_total = _count_overlaps(model)
+    for outer in range(30):  # max 30 outer passes
+        total_overlaps = _count_overlaps(model)
+        if total_overlaps == 0:
+            break
+
+        # Find overlapping components and their overlap counts
+        overlap_counts: dict[int, int] = {}
+        for idx, c in enumerate(movable):
+            count = _count_overlaps_involving(c, components)
+            if count > 0:
+                overlap_counts[id(c)] = count
+
+        if not overlap_counts:
+            break
+
+        # Sort by overlap count (most overlapping first)
+        movable_with_overlaps = [c for c in movable if id(c) in overlap_counts]
+        movable_with_overlaps.sort(key=lambda c: overlap_counts[id(c)], reverse=True)
+
+        improved = False
+        for comp in movable_with_overlaps:
+            old_x, old_y = comp.x, comp.y
+            old_overlaps = overlap_counts.get(id(comp), 0)
+            if old_overlaps == 0:
+                continue
+
+            best_x, best_y = old_x, old_y
+            best_overlaps = old_overlaps
+
+            # Strategy 1: Try nudging in all directions
+            for dx_dir, dy_dir in directions:
+                for dist in nudge_dists:
+                    comp.x = old_x + dx_dir * dist
+                    comp.y = old_y + dy_dir * dist
+                    _enforce_boundary_single(comp, interior_bbox, board)
+
+                    new_overlaps = _count_overlaps_involving(comp, components)
+                    if new_overlaps < best_overlaps:
+                        best_overlaps = new_overlaps
+                        best_x, best_y = comp.x, comp.y
+                        if new_overlaps == 0:
+                            break
+                if best_overlaps == 0:
+                    break
+
+            # Strategy 2: If nudging didn't resolve, try grid sweep
+            # Search a coarse grid across the board for a free position
+            if best_overlaps > 0:
+                comp.x, comp.y = old_x, old_y  # reset
+                half_w = comp.effective_width / 2.0
+                half_h = comp.effective_height / 2.0
+                grid_step = max(comp.effective_width, comp.effective_height, 2.0)
+
+                gx = bx_min + half_w
+                while gx <= bx_max - half_w:
+                    gy = by_min + half_h
+                    while gy <= by_max - half_h:
+                        comp.x = gx
+                        comp.y = gy
+                        new_overlaps = _count_overlaps_involving(comp, components)
+                        if new_overlaps < best_overlaps:
+                            # Also consider distance from original position (prefer closer)
+                            dist_penalty = abs(gx - old_x) + abs(gy - old_y)
+                            best_overlaps = new_overlaps
+                            best_x, best_y = comp.x, comp.y
+                            if new_overlaps == 0:
+                                break
+                        gy += grid_step
+                    if best_overlaps == 0:
+                        break
+                    gx += grid_step
+
+            comp.x, comp.y = best_x, best_y
+            if best_overlaps < old_overlaps:
+                improved = True
+
+        current_total = _count_overlaps(model)
+        if current_total >= prev_total and not improved:
+            break
+        prev_total = current_total
+
+    if verbose:
+        final = _count_overlaps(model)
+        if final > 0:
+            print(f"  Greedy resolution: {final} overlaps remaining (board may be too dense)")
 
 
 def _push_apart_one(

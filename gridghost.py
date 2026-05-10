@@ -127,17 +127,13 @@ def cmd_place(args) -> None:
         print("Step 5: Running SA optimization...")
         # Sync profile weights into CostState module-level constants.
         #
-        # SA strategy (v9): better T0 calibration, gentler cooling, improved greedy.
-        # - Hot SA (penalty_scale ≈ 0.50): overlap = 10*0.50 = 5.0, boundary = 2*0.50 = 1.0
-        #   HPWL dominates, SA explores with moderate overlap tolerance.
-        # - Cold SA (penalty_scale ≈ 1.0): overlap = 10, boundary = 2
-        #   Overlaps are expensive, SA naturally resolves them.
-        # - T0 calibration: samples ALL move types (translate, swap, rotate, median),
-        #   uses 90th percentile for robust T0 estimation.  Target accept ≈ 0.92.
-        # - Cooling: gentler adaptive schedule (0.95-0.99) maintains mobility longer.
-        # - 3 reheats at 40% of previous T0 with 0.7 decay.
-        # - Greedy: 8 sweeps (up from 5) with smaller improve threshold (0.5).
-        # - Overlap resolver: larger nudge distances (up to 32mm) for dense boards.
+        # SA strategy (v11): density-adaptive SA parameters.
+        # - Dense boards (density > 0.40): penalty_scale_min ≈ 0.87,
+        #   fewer reheats (1), hard overlap cap, focused refinement.
+        # - Sparse boards (density < 0.25): penalty_scale_min = 0.50,
+        #   3 reheats, full exploration.
+        # - Hard overlap cap: reject moves that exceed 2x initial overlaps.
+        # - Density-adaptive T0 calibration: lower percentile for dense boards.
         import engine.cost_state as cs
         cs.OVERLAP_WEIGHT = max(profile.beta, 10.0)    # moderate — SA explores, legalizer resolves
         cs.BOUNDARY_WEIGHT = max(profile.gamma, 2.0)   # low — HPWL dominates
@@ -192,17 +188,14 @@ def cmd_place(args) -> None:
     print_board_summary(model, "After Legalization")
 
     # Step 7.5: Post-legalization overlap resolution
-    # The legalizer can create new overlaps when it pushes components apart
-    # or clamps them to boundaries. Run the overlap resolver again to fix these.
+    # v11: Use the legalizer's greedy resolver instead of SA's overlap resolver.
+    # The SA resolver doesn't check if resolving one overlap creates new ones.
+    # The legalizer's greedy resolver checks all neighbors before accepting moves.
     post_legal_overlaps = count_overlaps(model)
     if post_legal_overlaps > 0:
         print(f"  Post-legalization overlap resolution ({post_legal_overlaps} overlaps)...")
-        from engine.annealer import _resolve_overlaps_greedy as _resolve_ovl
-        from engine.cost_state import CostState as PostLegalCostState
-        from engine.moves import get_moveable_indices as get_moveable
-        post_legal_cost_state = PostLegalCostState(model, rules=profile.rules)
-        post_legal_moveable = get_moveable(model)
-        _resolve_ovl(model, post_legal_cost_state, post_legal_moveable, SAConfig(verbose=True))
+        from legalization.legalizer import _greedy_resolve
+        _greedy_resolve(model, lcfg.grid_mm, True, interior_bbox)
         print_board_summary(model, "After Post-Legalization Overlap Resolution")
 
     # Step 8: Final cost evaluation
