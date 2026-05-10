@@ -38,19 +38,10 @@ ALGORITHMS = ("force-directed", "grid")
 
 def _apply_config_to_globals(cfg: Config) -> None:
     """Push config values into module-level constants used by cost_state."""
-    global _OVERLAP_WEIGHT_BACKUP, _BOUNDARY_WEIGHT_BACKUP, _CONSTRAINT_WEIGHT_BACKUP
     import engine.cost_state as cs
-    _OVERLAP_WEIGHT_BACKUP = cs.OVERLAP_WEIGHT
-    _BOUNDARY_WEIGHT_BACKUP = cs.BOUNDARY_WEIGHT
-    _CONSTRAINT_WEIGHT_BACKUP = cs.CONSTRAINT_WEIGHT
     cs.OVERLAP_WEIGHT = cfg.cost.overlap_weight
     cs.BOUNDARY_WEIGHT = cfg.cost.boundary_weight
     # CONSTRAINT_WEIGHT is set by the profile's delta weight — not from config
-
-
-_OVERLAP_WEIGHT_BACKUP = 10.0
-_BOUNDARY_WEIGHT_BACKUP = 2.0
-_CONSTRAINT_WEIGHT_BACKUP = 4.0
 
 
 def cmd_extract(args) -> None:

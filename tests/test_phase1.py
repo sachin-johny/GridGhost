@@ -34,7 +34,7 @@ from engine.net_clustering import (
     assign_cluster_positions,
     compute_seed_positions,
 )
-from engine.grid_placement import grid_place, edge_aware_grid_place
+from engine.grid_placement import grid_place
 from engine.cost_function import (
     CostFunction,
     total_hpwl,
@@ -404,7 +404,7 @@ def test_grid_placement():
 
 def test_edge_aware_placement():
     model = _make_test_model()
-    edge_aware_grid_place(model)
+    grid_place(model)
 
     # Connector should be near an edge
     j1 = model.get_component("J1")
@@ -528,7 +528,7 @@ def test_full_pipeline():
         initial_costs = cost_fn.evaluate(model)
 
         # Grid placement
-        edge_aware_grid_place(model, margin=5.0, spacing_factor=1.3)
+        grid_place(model, margin=5.0, spacing_factor=1.3)
 
         # Evaluate after placement
         placed_costs = cost_fn.evaluate(model)

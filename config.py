@@ -29,7 +29,6 @@ class AnnealerConfig:
     max_iterations: int = 200
     reheat_count: int = 2
     reheat_ratio: float = 0.35
-    reheat_decay: float = 0.6
     calibration_samples: int = 200
     initial_accept_rate: float = 0.90
     penalty_scale_min: float = 0.65  # overlap=6.5 at hot — limits overlaps while exploring
@@ -38,9 +37,6 @@ class AnnealerConfig:
     greedy_nudge_distances: tuple[float, ...] = (0.05, 0.1, 0.2, 0.5, 1.0)
     greedy_rotations: tuple[float, ...] = (90.0, 180.0, 270.0)
     greedy_improve_threshold: float = 1.0
-    cooling_fast: float = 0.80
-    cooling_balanced: float = 0.90
-    cooling_thorough: float = 0.95
 
 
 @dataclass

@@ -15,7 +15,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Set, Tuple, TYPE_CHECKING
 
-from engine.net_clustering import cluster_components, assign_cluster_positions
+from engine.net_clustering import cluster_components
 from engine.cost_state import _is_power_net
 
 if TYPE_CHECKING:
@@ -836,14 +836,6 @@ class ConnectorGroup:
     category: str  # "power", "input", "output", "data", "other"
     connectors: List["Component"] = field(default_factory=list)
     priority: int = 0
-
-    @property
-    def total_width(self) -> float:
-        if not self.connectors:
-            return 0.0
-        gap = 1.5
-        return sum(max(c.effective_width, c.effective_height)
-                   for c in self.connectors) + gap * (len(self.connectors) - 1)
 
 
 def _connector_name(c: "Component") -> str:

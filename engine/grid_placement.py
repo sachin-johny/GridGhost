@@ -15,7 +15,7 @@ import math
 from typing import Optional
 
 from models.board_model import BoardModel, Component
-from engine.net_clustering import compute_seed_positions, assign_cluster_positions, cluster_components
+from engine.net_clustering import compute_seed_positions, cluster_components
 from engine.cost_function import total_hpwl
 from legalization.legalizer import _push_apart, _enforce_boundary
 
@@ -164,70 +164,6 @@ def _place_in_region(
         comp.y = y_min + (row + 0.5) * cell_h
         comp.x = max(x_min + comp.effective_width / 2.0, min(comp.x, x_max - comp.effective_width / 2.0))
         comp.y = max(y_min + comp.effective_height / 2.0, min(comp.y, y_max - comp.effective_height / 2.0))
-
-
-def edge_aware_grid_place(
-    model: BoardModel,
-    margin: float = 5.0,
-    spacing_factor: float = 1.3,
-) -> BoardModel:
-    """Grid placement with edge-aware connector positioning.
-
-    Delegates to grid_place which now handles connectors first internally.
-    """
-    return grid_place(model, margin=margin, spacing_factor=spacing_factor)
-
-
-def _place_interior_components(
-    components: list[Component],
-    board,
-    margin: float,
-    spacing_factor: float,
-) -> None:
-    """Pack non-connector components into a single balanced interior grid."""
-    if not components:
-        return
-
-    inner_margin = margin + 2.0
-    x_min = board.x_min + inner_margin
-    y_min = board.y_min + inner_margin
-    x_max = board.x_max - inner_margin
-    y_max = board.y_max - inner_margin
-
-    if x_max <= x_min or y_max <= y_min:
-        return
-
-    # Spread parts according to board aspect ratio so the grid uses the full
-    # interior area instead of collapsing into a single dense cluster.
-    n = len(components)
-    region_w = x_max - x_min
-    region_h = y_max - y_min
-    cols = max(1, min(n, int(round(math.sqrt(n * (region_w / max(region_h, 1e-9)))))))
-    rows = max(1, int(math.ceil(n / cols)))
-
-    # Sort larger parts first so they claim more central cells.
-    components.sort(key=lambda c: (c.effective_width * c.effective_height, len(c.nets)), reverse=True)
-
-    cell_w = region_w / cols
-    cell_h = region_h / rows
-
-    # Keep a little slack around each part. If the cell is too small for the
-    # part, we still center it but do not shrink the whole layout into a line.
-    for index, comp in enumerate(components):
-        col = index % cols
-        row = index // cols
-        center_x = x_min + (col + 0.5) * cell_w
-        center_y = y_min + (row + 0.5) * cell_h
-
-        # Apply a small alternating offset to prevent long straight rows.
-        wiggle = min(cell_w, cell_h) * 0.12 * spacing_factor
-        if row % 2 == 1:
-            center_x += wiggle if col % 2 == 0 else -wiggle
-        else:
-            center_y += wiggle if col % 2 == 0 else -wiggle
-
-        comp.x = max(x_min + comp.effective_width / 2.0, min(center_x, x_max - comp.effective_width / 2.0))
-        comp.y = max(y_min + comp.effective_height / 2.0, min(center_y, y_max - comp.effective_height / 2.0))
 
 
 def _place_connectors_on_perimeter(
@@ -432,9 +368,6 @@ def _resolve_corner_collisions(
         if not resolved_any:
             break
 
-
-def _orient_connector_outward(comp: Component, board) -> None:
-    pass  # Removed (now handled in _place_connectors_on_perimeter)
 
 
 def _apply_strong_repulsion(model: BoardModel, exclude_types: set[str] | None = None) -> None:
@@ -651,7 +584,6 @@ def force_directed_place(
 
 __all__ = [
     "grid_place",
-    "edge_aware_grid_place",
     "shelf_packing_place",
     "force_directed_place",
 ]
