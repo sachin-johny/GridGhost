@@ -107,6 +107,26 @@ class Component:
         if ox2 <= ox1 or oy2 <= oy1:
             return 0.0
         return (ox2 - ox1) * (oy2 - oy1)
+    
+    @property
+    def is_edge_connector(self) -> bool:
+        """True for edge-mount connectors placed on the board perimeter.
+
+        These connectors intentionally overhang the board edge (pads are
+        inside, body extends outward) and should be excluded from OOB counts.
+        Vertical/THT connectors are interior components, not edge connectors.
+        """
+        import re
+        if getattr(self, 'component_type', '') != "connector":
+            return False
+        fp  = getattr(self, 'footprint', '') or ''
+        val = getattr(self, 'value', '') or ''
+        name = fp + ' ' + val
+        if re.search(r'Vertical|THT', name, re.IGNORECASE):
+            return False
+        if re.search(r'Horizontal|Angled|Side', name, re.IGNORECASE):
+            return True
+        return not re.search(r'Vertical|THT', name, re.IGNORECASE)
 
 
 @dataclass
@@ -319,11 +339,12 @@ class BoardModel:
                     overlap_area_total += area
 
         # Out-of-bounds — check full bounding box, not just center point.
-        # This matches count_out_of_bounds() in cost_function.py which
-        # counts components whose bbox extends past the board edge.
+        # Edge connectors are excluded: they intentionally overhang the board
+        # edge with pads inside and body outside.
         oob_count = sum(
             1 for c in self.components
-            if not self.board.contains_bbox(c.bbox)
+            if not c.is_edge_connector
+            and not self.board.contains_bbox(c.bbox)
         )
 
         return {

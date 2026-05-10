@@ -19,20 +19,6 @@ from typing import Optional
 from models.board_model import BoardModel, Component, BoardOutline
 
 
-def _is_edge_connector(comp: Component) -> bool:
-    """True for horizontal/edge-mount connectors placed on the board perimeter."""
-    if getattr(comp, 'component_type', '') != "connector":
-        return False
-    fp  = getattr(comp, 'footprint', '') or ''
-    val = getattr(comp, 'value', '') or ''
-    name = fp + ' ' + val
-    if re.search(r'Vertical|THT', name, re.IGNORECASE):
-        return False
-    if re.search(r'Horizontal|Angled|Side', name, re.IGNORECASE):
-        return True
-    return not re.search(r'Vertical|THT', name, re.IGNORECASE)
-
-
 def legalize(
     model: BoardModel,
     grid_mm: float = 0.1,
@@ -89,7 +75,7 @@ def _snap_to_grid(model: BoardModel, grid_mm: float) -> None:
     """
     for comp in model.components:
         # Skip fixed components AND edge connectors
-        if comp.is_fixed or _is_edge_connector(comp):
+        if comp.is_fixed or comp.is_edge_connector:
             continue
         comp.x = round(comp.x / grid_mm) * grid_mm
         comp.y = round(comp.y / grid_mm) * grid_mm
@@ -110,7 +96,7 @@ def _enforce_boundary(
     board = model.board
     for comp in model.components:
         # Skip fixed components AND edge connectors
-        if comp.is_fixed or _is_edge_connector(comp):
+        if comp.is_fixed or comp.is_edge_connector:
             continue
         half_w = comp.effective_width / 2.0
         half_h = comp.effective_height / 2.0
@@ -165,8 +151,8 @@ def _resolve_overlaps(
                     continue
 
                 # Cannot resolve if both are fixed or both are edge connectors
-                c1_fixed = c1.is_fixed or _is_edge_connector(c1)
-                c2_fixed = c2.is_fixed or _is_edge_connector(c2)
+                c1_fixed = c1.is_fixed or c1.is_edge_connector
+                c2_fixed = c2.is_fixed or c2.is_edge_connector
                 if c1_fixed and c2_fixed:
                     continue
 
@@ -235,7 +221,7 @@ def _push_apart_one(
     # Edge connectors live on the perimeter, so move interior parts toward the
     # board center instead of letting the generic minimum-overlap axis push them
     # sideways into another perimeter part.
-    if board is not None and _is_edge_connector(fixed):
+    if board is not None and fixed.is_edge_connector:
         board_cx = (board.x_min + board.x_max) / 2.0
         board_cy = (board.y_min + board.y_max) / 2.0
         center_dx = 1 if board_cx >= fixed.x else -1
@@ -340,10 +326,12 @@ def _count_overlaps(model: BoardModel) -> int:
 
 
 def _count_oob(model: BoardModel) -> int:
-    """Count out-of-bounds components."""
+    """Count out-of-bounds components, excluding edge connectors."""
     count = 0
     board = model.board
     for comp in model.components:
+        if comp.is_edge_connector:
+            continue
         x1, y1, x2, y2 = comp.bbox
         if x1 < board.x_min or x2 > board.x_max or y1 < board.y_min or y2 > board.y_max:
             count += 1
