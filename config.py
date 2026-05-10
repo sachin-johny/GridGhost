@@ -14,29 +14,29 @@ from typing import Any
 
 @dataclass
 class LegalizationConfig:
-    grid_mm: float = 1.0
-    max_iterations: int = 300
-    push_strength: float = 1.0
+    grid_mm: float = 0.50        # 0.5mm grid — fine enough for most components
+    max_iterations: int = 400
+    push_strength: float = 1.2   # v9: slightly stronger pushes for faster convergence
     stall_threshold: int = 10
-    adaptive_strength_max: float = 1.5
-    adaptive_strength_multiplier: float = 1.2
+    adaptive_strength_max: float = 1.8
+    adaptive_strength_multiplier: float = 1.3
     severity_threshold: float = 0.7
     severe_push_factor: float = 0.5
 
 
 @dataclass
 class AnnealerConfig:
-    max_iterations: int = 200
-    reheat_count: int = 2
-    reheat_ratio: float = 0.35
-    calibration_samples: int = 200
-    initial_accept_rate: float = 0.90
-    penalty_scale_min: float = 0.65  # overlap=6.5 at hot — limits overlaps while exploring
-    min_temperature: float = 1e-6
-    freeze_threshold: float = 0.01
-    greedy_nudge_distances: tuple[float, ...] = (0.05, 0.1, 0.2, 0.5, 1.0)
+    max_iterations: int = 300
+    reheat_count: int = 3
+    reheat_ratio: float = 0.40
+    calibration_samples: int = 500     # v9: more samples for robust T0
+    initial_accept_rate: float = 0.92  # v9: target high accept at start
+    penalty_scale_min: float = 0.50    # v9: balance exploration with constraint relevance
+    min_temperature: float = 1e-8
+    freeze_threshold: float = 0.005
+    greedy_nudge_distances: tuple[float, ...] = (0.05, 0.1, 0.2, 0.5, 1.0, 2.0)
     greedy_rotations: tuple[float, ...] = (90.0, 180.0, 270.0)
-    greedy_improve_threshold: float = 1.0
+    greedy_improve_threshold: float = 0.5  # v9: accept smaller improvements
 
 
 @dataclass

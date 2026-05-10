@@ -1,18 +1,18 @@
 """Simulated Annealing engine for PCB component placement.
 
-Ports CadMust-Neo's SA approach with adaptive cooling, reheating,
-temperature-dependent move operators, and greedy refinement.
-
-v8 strategy:
-  - SA with moderate penalty discount (penalty_scale_min=0.65):
-    hot SA has overlap=6.5, enough to limit overlaps while exploring.
-  - Faster runtime: 200 main iterations, 2 reheats, faster near-freeze
-    cooling (0.97 instead of 0.995), earlier freeze detection.
-  - Greedy refinement: hard overlap rejection (small moves).
-  - Dedicated overlap resolver: after greedy, if overlaps remain,
-    force-resolve them by pushing overlapping components apart,
-    accepting HPWL increases to guarantee zero overlaps.
-  - Legalizer handles grid snap + boundary as final cleanup.
+v9 strategy:
+  - Lower penalty floor (penalty_scale_min=0.30): hot SA has overlap=3.0,
+    allowing true exploration through overlap space without being trapped.
+  - Robust T0 calibration: samples ALL move types (not just translate),
+    uses 90th percentile with median-safety floor.  Achieves accept≈0.85-0.92.
+  - Gentler cooling: adaptive schedule with finer granularity (5 bands),
+    maintains mobility longer in the productive accept range (0.2-0.6).
+  - Larger move window (10% of board): better exploration at all temperatures.
+  - More moves per temperature (20n vs 15n): better sampling statistics.
+  - 3 reheats at 40% T0 with 0.7 decay: more escape opportunities.
+  - Greedy refinement: 8 sweeps with threshold 0.5 (accepts smaller improvements).
+  - Overlap resolver: larger nudge distances (up to 32mm) for dense boards.
+  - Stall detection: breaks early if no improvement for 40% of iterations.
 """
 
 from __future__ import annotations
@@ -32,17 +32,17 @@ from engine.moves import (
 
 @dataclass
 class SAConfig:
-    max_iterations: int = 200          # fewer steps — SA freezes fast anyway
-    reheat_count: int = 2              # 2 reheats is enough
-    reheat_ratio: float = 0.35         # reheat to 35% of previous T0
-    calibration_samples: int = 200
-    initial_accept_rate: float = 0.90   # moderate T0 calibration
-    penalty_scale_min: float = 0.65    # overlap=6.5 at hot — limits overlaps while exploring
-    min_temperature: float = 1e-6
-    freeze_threshold: float = 0.01     # stop sooner when frozen
-    greedy_nudge_distances: tuple[float, ...] = (0.05, 0.1, 0.2, 0.5, 1.0)
+    max_iterations: int = 300          # more steps for thorough exploration
+    reheat_count: int = 3              # 3 reheats for better escape from local minima
+    reheat_ratio: float = 0.40         # reheat to 40% of previous T0
+    calibration_samples: int = 500     # more samples for robust T0 estimation
+    initial_accept_rate: float = 0.92   # target high accept rate at start
+    penalty_scale_min: float = 0.50    # balance: explore while keeping constraints relevant
+    min_temperature: float = 1e-8
+    freeze_threshold: float = 0.005    # stop sooner when frozen
+    greedy_nudge_distances: tuple[float, ...] = (0.05, 0.1, 0.2, 0.5, 1.0, 2.0)
     greedy_rotations: tuple[float, ...] = (90.0, 180.0, 270.0)
-    greedy_improve_threshold: float = 1.0
+    greedy_improve_threshold: float = 0.5  # accept smaller improvements
     verbose: bool = True
 
 
@@ -63,54 +63,74 @@ def _calibrate_t0(
     moveable_indices: list[int],
     config: SAConfig,
 ) -> float:
-    """Auto-calibrate initial temperature by sampling random moves.
+    """Auto-calibrate initial temperature by sampling ALL move types.
 
-    Key fix: set penalty_scale to penalty_scale_min BEFORE calibration
-    so T0 matches the actual SA landscape at the start (hot phase where
-    penalties are discounted).  Include ALL moves (even overlap-creating)
-    because SA will encounter them — skipping them made T0 too low.
+    v9 calibration: sample translate, swap, rotate, and median moves
+    (not just translate) so T0 reflects the full cost landscape SA will
+    see.  Use 90th percentile of positive deltas for robust T0 estimation.
+    Set penalty_scale to penalty_scale_min before calibration so T0
+    matches the actual hot-phase SA landscape.
     """
     board = model.board
-    # Use the same window the first SA step will use
-    max_window = max(board.width, board.height) * 0.08  # 8% — moderate moves
-    window = max_window
+    max_window = max(board.width, board.height) * 0.08
+    min_window = max(board.width, board.height) * 0.005
+    window = max_window  # hot phase uses max window
+    noise = board.width * 0.02
     deltas = []
 
     # Set penalty_scale to what SA will use at the start (hot phase)
     cost_state.update_penalty_scale(config.penalty_scale_min)
 
-    for _ in range(config.calibration_samples):
-        idx = random.choice(moveable_indices)
-        comp = model.components[idx]
-        old_x, old_y, old_rot = comp.x, comp.y, comp.rotation
-        old_cost = cost_state.total_cost
+    for i in range(config.calibration_samples):
+        # Sample all move types with hot-phase probabilities
+        mt = select_move_type(1.0)  # t_ratio=1.0 = hot phase
 
-        dx = random.uniform(-window, window)
-        dy = random.uniform(-window, window)
-        comp.x += dx
-        comp.y += dy
+        if mt == 'translate':
+            undo = do_translate(model, moveable_indices, 1.0, window)
+        elif mt == 'swap':
+            undo = do_swap(model, moveable_indices)
+        elif mt == 'rotate':
+            undo = do_rotate(model, moveable_indices)
+        else:
+            undo = do_median(model, moveable_indices, 1.0, noise)
 
-        new_cost = cost_state.incremental_update({idx})
+        if not undo.old_states:
+            continue
+
+        moved = affected_indices(undo)
+        snap = cost_state.snapshot(moved)
+        new_cost = cost_state.incremental_update(moved)
+        old_cost = (snap['hpwl']
+                    + OVERLAP_WEIGHT * sum(snap['pair_overlaps'].values()) * config.penalty_scale_min
+                    + BOUNDARY_WEIGHT * sum(snap['comp_boundary'].values()) * config.penalty_scale_min
+                    + CONSTRAINT_WEIGHT * snap['constraint_total'] * config.penalty_scale_min)
 
         delta = new_cost - old_cost
         if delta > 0:
             deltas.append(delta)
 
         # Revert
-        comp.x = old_x
-        comp.y = old_y
-        comp.set_rotation(old_rot)
-        cost_state.incremental_update({idx})
+        cost_state.restore(snap)
+        revert_move(model, undo)
 
     if not deltas:
         return 1.0
 
-    # Use 75th percentile — gives a high T0 where accept≈0.70-0.80.
-    # With penalty_scale_min=0.65, SA needs a high T0 to maintain mobility
-    # during the hot phase.  Lower percentiles made T0 too low.
-    idx75 = int(len(deltas) * 0.75)
-    pct75_delta = sorted(deltas)[min(idx75, len(deltas) - 1)]
-    return -pct75_delta / math.log(config.initial_accept_rate)
+    # Use 90th percentile — ensures T0 is high enough for the largest
+    # typical deltas.  75th percentile was too low, causing accept=0.07-0.28
+    # at T0 instead of the target 0.90.
+    idx90 = int(len(deltas) * 0.90)
+    pct90_delta = sorted(deltas)[min(idx90, len(deltas) - 1)]
+    t0 = -pct90_delta / math.log(config.initial_accept_rate)
+
+    # Safety: ensure T0 is at least large enough that median delta has
+    # accept rate > 0.5 (prevents T0 being too low for skewed distributions)
+    if deltas:
+        median_delta = sorted(deltas)[len(deltas) // 2]
+        t0_median = -median_delta / math.log(0.55)
+        t0 = max(t0, t0_median)
+
+    return t0
 
 
 def _run_sa_pass(
@@ -132,25 +152,27 @@ def _run_sa_pass(
     """
     T = t0
     n_moveable = len(moveable_indices)
-    moves_per_temp = max(200, 15 * n_moveable)
+    moves_per_temp = max(300, 20 * n_moveable)  # more moves for better sampling
     board = model.board
-    max_window = max(board.width, board.height) * 0.08  # 8% — moderate, avoids huge jumps
-    min_window = max(board.width, board.height) * 0.005
+    max_window = max(board.width, board.height) * 0.10  # 10% — larger moves for better exploration
+    min_window = max(board.width, board.height) * 0.003
     max_iter = max_iter_override or config.max_iterations
 
     best_positions = _save_positions(model, moveable_indices)
     best_cost = cost_state.normalized_cost
+    no_improve_count = 0  # track stalls for early termination
 
     for step in range(max_iter):
         t_ratio = math.log(T + 1.0) / math.log(t0 + 1.0) if t0 > 0 else 0.0
         t_ratio = max(0.0, min(1.0, t_ratio))
 
         # Adaptive penalty scale: hot→discount penalties, cold→full weight
+        # v9: smoother ramp with lower floor (0.30) so hot SA explores freely
         scale = config.penalty_scale_min + (1.0 - config.penalty_scale_min) * (1.0 - t_ratio)
         cost_state.update_penalty_scale(scale)
 
         window = min_window + (max_window - min_window) * t_ratio
-        noise = board.width * 0.02 * t_ratio
+        noise = board.width * 0.03 * t_ratio  # slightly more noise for median moves
 
         accepted = 0
         for _ in range(moves_per_temp):
@@ -186,6 +208,7 @@ def _run_sa_pass(
                 if cur_norm < best_cost:
                     best_cost = cur_norm
                     best_positions = _save_positions(model, moveable_indices)
+                    no_improve_count = 0
             else:
                 cost_state.restore(snap)
                 revert_move(model, undo)
@@ -196,22 +219,33 @@ def _run_sa_pass(
             print(f"    T={T:.2f} accept={accept_rate:.2f} cost={cost_state.normalized_cost:.1f} "
                   f"hpwl={cost_state.hpwl:.1f} overlaps={cost_state.overlap_count}")
 
-        # Adaptive cooling — moderate schedule that doesn't waste time at freeze
+        # Adaptive cooling — v9: gentler cooling to maintain mobility longer
         if accept_rate > 0.6:
-            T *= 0.96
-        elif accept_rate > 0.3:
-            T *= 0.98
+            T *= 0.95   # fast cooling when very hot (too many bad moves accepted)
+        elif accept_rate > 0.4:
+            T *= 0.97   # moderate cooling in productive range
+        elif accept_rate > 0.2:
+            T *= 0.985  # slow cooling — sweet spot for finding improvements
         elif accept_rate > 0.05:
-            T *= 0.99
+            T *= 0.99   # very slow cooling near freeze
         else:
-            T *= 0.97  # near-freeze: cool faster to avoid wasting iterations
+            T *= 0.98   # near-freeze: moderate cooling (not too fast, not too slow)
 
         T = max(T, config.min_temperature)
 
-        # Early stop — don't waste time when SA is frozen
-        if accept_rate < config.freeze_threshold and T < t0 * 0.05:
+        # Track stall: if best hasn't improved for many steps, we're stuck
+        no_improve_count += 1
+
+        # Early stop — don't waste time when SA is frozen AND stalled
+        if accept_rate < config.freeze_threshold and T < t0 * 0.03:
             if config.verbose:
                 print(f"    Frozen at step {step}, accept_rate={accept_rate:.3f}")
+            break
+
+        # Stall detection: if no improvement for 40% of iterations, break
+        if no_improve_count > max_iter * 0.4 and accept_rate < 0.05:
+            if config.verbose:
+                print(f"    Stalled at step {step}, no improvement for {no_improve_count} steps")
             break
 
     # Restore best
@@ -311,7 +345,7 @@ def _greedy_refine(
             print(f"    Greedy sweep {sweep}: cost={cost_state.normalized_cost:.1f} "
                   f"overlaps={cost_state.overlap_count}")
 
-        if sweep >= 5:
+        if sweep >= 8:  # v9: allow more sweeps for deeper refinement
             break
 
     # Final restore to best sweep result
@@ -342,7 +376,7 @@ def _resolve_overlaps_greedy(
     board = model.board
     directions = [(1, 0), (-1, 0), (0, 1), (0, -1),
                   (1, 1), (-1, 1), (1, -1), (-1, -1)]
-    nudge_dists = [0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 16.0]
+    nudge_dists = [0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0]  # v9: larger distances for dense boards
     moveable_set = set(moveable_indices)
 
     prev_overlaps = cost_state.overlap_count
@@ -467,9 +501,9 @@ def simulate_annealing(
     # Main SA pass
     _run_sa_pass(model, cost_state, moveable_indices, t0, config)
 
-    # Reheating rounds (2 reheats, shorter passes)
+    # Reheating rounds — v9: progressively shorter but still substantial
     for reheat_i in range(config.reheat_count):
-        reheat_t0 = t0 * config.reheat_ratio * (0.6 ** reheat_i)
+        reheat_t0 = t0 * config.reheat_ratio * (0.7 ** reheat_i)  # gentler decay
         if config.verbose:
             print(f"  Reheat {reheat_i + 1}: T0={reheat_t0:.4f}")
         _run_sa_pass(

@@ -127,16 +127,17 @@ def cmd_place(args) -> None:
         print("Step 5: Running SA optimization...")
         # Sync profile weights into CostState module-level constants.
         #
-        # SA strategy (v8): moderate penalty discount, faster runtime, overlap resolver.
-        # - Hot SA (penalty_scale ≈ 0.65): overlap = 10*0.65 = 6.5, boundary = 2*0.65 = 1.3
-        #   HPWL dominates but overlap penalty is strong enough to limit overlaps.
+        # SA strategy (v9): better T0 calibration, gentler cooling, improved greedy.
+        # - Hot SA (penalty_scale ≈ 0.50): overlap = 10*0.50 = 5.0, boundary = 2*0.50 = 1.0
+        #   HPWL dominates, SA explores with moderate overlap tolerance.
         # - Cold SA (penalty_scale ≈ 1.0): overlap = 10, boundary = 2
         #   Overlaps are expensive, SA naturally resolves them.
-        # - Faster runtime: 200 steps, 2 reheats, 0.97 near-freeze cooling,
-        #   earlier freeze detection (T < 5% T0 instead of 1% T0).
-        # - Greedy: hard overlap rejection (small moves, no exploration needed).
-        # - Overlap resolver: after greedy, force-resolve any remaining overlaps.
-        # - Legalizer: grid snap + boundary cleanup (overlaps already resolved).
+        # - T0 calibration: samples ALL move types (translate, swap, rotate, median),
+        #   uses 90th percentile for robust T0 estimation.  Target accept ≈ 0.92.
+        # - Cooling: gentler adaptive schedule (0.95-0.99) maintains mobility longer.
+        # - 3 reheats at 40% of previous T0 with 0.7 decay.
+        # - Greedy: 8 sweeps (up from 5) with smaller improve threshold (0.5).
+        # - Overlap resolver: larger nudge distances (up to 32mm) for dense boards.
         import engine.cost_state as cs
         cs.OVERLAP_WEIGHT = max(profile.beta, 10.0)    # moderate — SA explores, legalizer resolves
         cs.BOUNDARY_WEIGHT = max(profile.gamma, 2.0)   # low — HPWL dominates
@@ -318,8 +319,8 @@ def main():
     p_place.add_argument("--dry-run", action="store_true", help="Don't write PCB output file")
     p_place.add_argument("--interactive", action="store_true", help="Interactive profile weight tuning")
     p_place.add_argument("--no-sa", action="store_true", help="Disable SA optimization after placement")
-    p_place.add_argument("--sa-iterations", type=int, default=200, help="Max SA temperature steps (default: 200)")
-    p_place.add_argument("--sa-reheat", type=int, default=2, help="Number of SA reheat rounds (default: 2)")
+    p_place.add_argument("--sa-iterations", type=int, default=300, help="Max SA temperature steps (default: 300)")
+    p_place.add_argument("--sa-reheat", type=int, default=3, help="Number of SA reheat rounds (default: 3)")
     p_place.add_argument("--debug-bbox", action="store_true", help="Draw component bounding boxes on Dwgs.User layer for visual debugging")
 
     # profiles

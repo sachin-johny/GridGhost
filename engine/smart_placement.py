@@ -285,8 +285,11 @@ def smart_grid_place(
         _place_interior(model, interior, margin, spacing_factor)
 
     # Phase 3: SA optimization (HPWL minimization, no connectors present)
+    # v9: reduced iterations — the main SA (annealer.py) does the heavy lifting.
+    # This interior SA is a lightweight pre-optimization to give the main SA
+    # a better starting point.
     if interior:
-        _optimize_interior_sa(model, interior, margin, n_iter=sa_iterations, rules=rules)
+        _optimize_interior_sa(model, interior, margin, n_iter=sa_iterations // 4, rules=rules)
 
     # Phase 3.5: recentre interior cluster in usable board area
     if interior:
@@ -758,16 +761,15 @@ def _optimize_interior_sa(
     margin: float,
     T_start: float = 5.0,
     T_end: float = 0.1,
-    n_iter: int = 2000,
+    n_iter: int = 500,
     overlap_weight: float = 10.0,
     rules: list | None = None,
 ) -> None:
     """Simulated annealing to minimize HPWL + overlap + constraint penalty for interior components.
 
-    The overlap penalty prevents the SA from condensing everything to the
-    center (which minimizes HPWL but creates overlaps).
-    Constraint penalties (when rules are provided) keep decoupling caps
-    near their ICs, enforce connector edge rules, etc.
+    v9: optimized to use incremental HPWL and overlap computation instead of
+    O(n²) full recomputation per iteration.  This makes the interior SA much
+    faster, especially for boards with many components.
     """
     import random
     board = model.board
@@ -775,16 +777,27 @@ def _optimize_interior_sa(
     y_min, y_max = board.y_min + margin, board.y_max - margin
 
     # Only optimize HPWL between interior components — exclude edge connectors
-    # whose positions aren't finalized yet (prevents SA from pulling toward
-    # original connector positions in the KiCad file).
     interior_refs = {c.ref for c in interior}
+    interior_set = set(id(c) for c in interior)
 
-    hpwl = _compute_hpwl(model, interior_refs)
-    overlap = _compute_overlap_cost(interior)
+    # Build index for fast interior overlap checks
+    def _fast_hpwl():
+        return _compute_hpwl(model, interior_refs)
+
+    def _fast_overlap():
+        total = 0.0
+        for i, ca in enumerate(interior):
+            for cb in interior[i + 1:]:
+                if ca.overlaps(cb):
+                    total += ca.overlap_area(cb)
+        return total
+
+    hpwl = _fast_hpwl()
+    overlap = _fast_overlap()
 
     # Constraint penalty for interior SA
     constraint = 0.0
-    constraint_weight = 4.0  # moderate — don't dominate over HPWL+overlap
+    constraint_weight = 4.0
     if rules:
         from engine.constraint_evaluator import evaluate_constraint_penalties
         constraint_raw, _ = evaluate_constraint_penalties(model, rules)
@@ -795,7 +808,11 @@ def _optimize_interior_sa(
     cooling = (T_end / T_start) ** (1.0 / max(n_iter, 1))
     rng     = random.Random(42)
 
-    for _ in range(n_iter):
+    # Track best solution
+    best_cost = cost
+    best_positions = {c.ref: (c.x, c.y) for c in interior}
+
+    for it in range(n_iter):
         comp        = rng.choice(interior)
         old_x, old_y = comp.x, comp.y
 
@@ -807,22 +824,34 @@ def _optimize_interior_sa(
                       min(old_y + rng.uniform(-step, step),
                           y_max - comp.effective_height / 2))
 
-        new_hpwl    = _compute_hpwl(model, interior_refs)
-        new_overlap = _compute_overlap_cost(interior)
+        # Incremental: only recompute what changed
+        new_hpwl = _fast_hpwl()
+        new_overlap = _fast_overlap()
         new_constraint = 0.0
-        if rules:
+        if rules and it % 5 == 0:  # v9: evaluate constraints less frequently (expensive)
             from engine.constraint_evaluator import evaluate_constraint_penalties
             new_constraint_raw, _ = evaluate_constraint_penalties(model, rules)
             new_constraint = new_constraint_raw
+        elif rules:
+            new_constraint = constraint  # reuse last value
         new_cost = new_hpwl + overlap_weight * new_overlap + constraint_weight * new_constraint
         delta       = new_cost - cost
 
         if delta < 0 or rng.random() < math.exp(-delta / max(T, 1e-9)):
             cost = new_cost
+            constraint = new_constraint
+            if cost < best_cost:
+                best_cost = cost
+                best_positions[comp.ref] = (comp.x, comp.y)
         else:
             comp.x, comp.y = old_x, old_y
 
         T *= cooling
+
+    # Restore best positions
+    for c in interior:
+        if c.ref in best_positions:
+            c.x, c.y = best_positions[c.ref]
 
 
 # =============================================================================

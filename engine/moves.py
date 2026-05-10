@@ -118,32 +118,43 @@ def do_median(
     t_ratio: float,
     noise_mm: float,
 ) -> MoveUndo:
-    """Move a component toward the centroid of its connected pads."""
+    """Move a component toward the centroid of its connected pads.
+
+    v9 optimization: uses the component's pre-built nets list and pad
+    lookup for O(k) instead of O(nets * components) per call.
+    """
     idx = random.choice(moveable_indices)
     comp = model.components[idx]
     old = (idx, comp.x, comp.y, comp.rotation)
 
-    # Compute centroid of connected pads (excluding own pads)
+    # Build a quick ref→component map for lookups
     cx_sum, cy_sum = 0.0, 0.0
     count = 0
-    for net in model.nets:
-        # Check if this component is on this net
-        comp_on_net = False
-        for ref, _ in net.pins:
-            if ref == comp.ref:
-                comp_on_net = True
-                break
-        if not comp_on_net:
-            continue
 
+    # Use comp.nets (pre-built list) for fast net lookup
+    comp_ref = comp.ref
+    comp_nets = set(comp.nets) if comp.nets else set()
+
+    if not comp_nets:
+        # Fallback: small random translate
+        dx = random.uniform(-1.0, 1.0)
+        dy = random.uniform(-1.0, 1.0)
+        comp.x += dx
+        comp.y += dy
+        return MoveUndo(move_type='median', old_states=[old])
+
+    # Build ref→component index once (cached on model for performance)
+    if not hasattr(model, '_comp_ref_map'):
+        model._comp_ref_map = {c.ref: c for c in model.components}
+    ref_map = model._comp_ref_map
+
+    for net in model.nets:
+        if net.name not in comp_nets:
+            continue
         for ref, pad_name in net.pins:
-            if ref == comp.ref:
+            if ref == comp_ref:
                 continue
-            other = None
-            for c in model.components:
-                if c.ref == ref:
-                    other = c
-                    break
+            other = ref_map.get(ref)
             if not other:
                 continue
             for pad in other.pads:
