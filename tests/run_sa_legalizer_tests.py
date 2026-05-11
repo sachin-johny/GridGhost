@@ -25,29 +25,30 @@ DEFAULT_PCBS = [
 
 def parse_summary(output: str) -> dict:
     summary = {
-        "sa_initial_cost": None,
-        "sa_final_cost": None,
-        "sa_initial_hpwl": None,
-        "sa_final_hpwl": None,
-        "sa_overlaps": None,
+        "opt_initial_cost": None,
+        "opt_final_cost": None,
+        "opt_initial_hpwl": None,
+        "opt_final_hpwl": None,
+        "opt_overlaps": None,
         "legal_overlaps": None,
         "legal_oob": None,
     }
 
-    # SA cost line: "SA: cost 1234.0 -> 1100.0"
-    m = re.search(r"SA: cost\s*([0-9.]+)\s*->\s*([0-9.]+)", output)
+    # Output uses "Greedy:" or "SA:" prefix depending on mode
+    # Match either prefix
+    m = re.search(r"(?:SA|Greedy): cost\s*([0-9.]+)\s*->\s*([0-9.]+)", output)
     if m:
-        summary["sa_initial_cost"] = float(m.group(1))
-        summary["sa_final_cost"] = float(m.group(2))
+        summary["opt_initial_cost"] = float(m.group(1))
+        summary["opt_final_cost"] = float(m.group(2))
 
-    m = re.search(r"SA: HPWL\s*([0-9.]+)\s*->\s*([0-9.]+)", output)
+    m = re.search(r"(?:SA|Greedy): HPWL\s*([0-9.]+)\s*->\s*([0-9.]+)", output)
     if m:
-        summary["sa_initial_hpwl"] = float(m.group(1))
-        summary["sa_final_hpwl"] = float(m.group(2))
+        summary["opt_initial_hpwl"] = float(m.group(1))
+        summary["opt_final_hpwl"] = float(m.group(2))
 
-    m = re.search(r"SA: overlaps=\s*([0-9]+)", output)
+    m = re.search(r"(?:SA|Greedy): overlaps=\s*([0-9]+)", output)
     if m:
-        summary["sa_overlaps"] = int(m.group(1))
+        summary["opt_overlaps"] = int(m.group(1))
 
     # Legalizer prints: "Legalization output: X overlaps, Y out-of-bounds"
     m = re.search(r"Legalization output:\s*([0-9]+) overlaps,\s*([0-9]+) out-of-bounds", output)
@@ -65,12 +66,14 @@ def parse_summary(output: str) -> dict:
     return summary
 
 
-def run_one(pcb_path: Path, sa_iterations: int, sa_reheat: int) -> dict:
+def run_one(pcb_path: Path, sa_iterations: int, sa_reheat: int, use_sa: bool = False) -> dict:
     gridghost = ROOT / "gridghost.py"
     if not gridghost.exists():
         raise FileNotFoundError(f"gridghost.py not found at {gridghost}")
 
     cmd = [sys.executable, str(gridghost), "place", str(pcb_path), "--profile", "generic", "--sa-iterations", str(sa_iterations), "--sa-reheat", str(sa_reheat), "--dry-run"]
+    if use_sa:
+        cmd.append("--sa")
 
     print(f"Running: {' '.join(cmd)}")
 
@@ -97,6 +100,7 @@ def main():
     parser.add_argument("pcbs", nargs="*", help="Paths to .kicad_pcb files", default=[str(p) for p in DEFAULT_PCBS])
     parser.add_argument("--sa-iterations", type=int, default=200)
     parser.add_argument("--sa-reheat", type=int, default=2)
+    parser.add_argument("--sa", action="store_true", help="Enable global SA (default: greedy+swap only)")
     args = parser.parse_args()
 
     results = []
@@ -106,7 +110,7 @@ def main():
         if not pcb.exists():
             print(f"Skipping missing PCB: {pcb}")
             continue
-        res = run_one(pcb, args.sa_iterations, args.sa_reheat)
+        res = run_one(pcb, args.sa_iterations, args.sa_reheat, use_sa=args.sa)
         results.append(res)
         legal_overlaps = res["summary"].get("legal_overlaps")
         legal_oob = res["summary"].get("legal_oob")

@@ -3,6 +3,8 @@
 This module includes the SA stability fixes, density-aware tuning,
 global-best tracking across reheats, and HPWL-based revert logic used
 by the placement pipeline.
+Enhanced greedy refinement + greedy swap refinement as default
+optimization path. Global SA is now opt-in via --sa flag.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ class SAConfig:
     greedy_improve_threshold: float = 0.5  # accept smaller improvements
     overlap_cap_factor: float = 2.0    # reject moves that exceed this * initial overlaps
     verbose: bool = True
+    skip_sa: bool = False              # v13: if True, skip global SA, run greedy+swap+greedy only
 
 
 def _compute_density(model: BoardModel) -> float:
@@ -214,7 +217,7 @@ def _run_sa_pass(
     best_positions = _save_positions(model, moveable_indices)
     best_cost = cost_state.normalized_cost
     best_overlap_count = cost_state.overlap_count
-    best_overlap_seen = initial_overlap_count
+
     no_improve_count = 0
 
     # Global best state across all passes (main + reheats)
@@ -223,9 +226,15 @@ def _run_sa_pass(
         global_best_positions = best_positions
         global_best_overlap_count = best_overlap_count
 
-    # Allow small overlap increases during exploration when starting from 0.
-    # Old strict mode rejected ALL overlap-creating moves → SA froze (accept=0.00)
-    strict_max_overlaps = max(3, int(len(moveable_indices) * 0.05))
+    # Unified adaptive overlap cap — replaces the old dual-path
+    # (strict mode for initial_overlap_count==0 vs relaxed mode for >0).
+    # The old strict mode (max 3-4 overlaps) caused SA to freeze when
+    # resync discovered more overlaps than the cap allowed.
+    # The new cap scales with density and component count, and always
+    # provides headroom above the current overlap count.
+    density = _compute_density(model)
+    density_factor = max(1.0, density / 0.25)  # 1.0 at sparse, ~1.6 at dense
+    base_overlap_cap = max(8, int(n_moveable * 0.15 * density_factor))
 
     # Current overlap count (incremental, updated each move)
     current_overlap_count = cost_state.overlap_count
@@ -262,28 +271,22 @@ def _run_sa_pass(
 
             new_cost = cost_state.incremental_update(moved)
 
-            # Dynamic overlap cap: reject moves that create too many overlaps
-            # Cap adapts based on best overlap count seen (tightens as SA improves)
-            # and temperature (relaxed at high T for exploration, tight at low T)
-            if initial_overlap_count == 0:
-                # Relaxed strict mode — allow small overlap increases during
-                # exploration. Old code rejected ALL overlap-creating moves when
-                # starting from 0 overlaps, which froze SA (accept=0.00).
-                # Allow up to strict_max_overlaps temporary overlaps for exploration.
-                if cost_state.overlap_count > strict_max_overlaps:
+            # Unified adaptive overlap cap — single path for all boards.
+            # Scales with density, component count, and temperature.
+            # At high T: generous cap for exploration (1.5x base).
+            # At low T: tighter cap (1.0x base) for exploitation.
+            # Always provides headroom above current overlap count to
+            # prevent freeze after resync discovers drift.
+            cap_relaxation = 1.0 + 0.5 * t_ratio  # 1.5x at hot, 1.0x at cold
+            overlap_cap = int(base_overlap_cap * cap_relaxation)
+            # Ensure cap provides headroom above current state (prevents freeze)
+            overlap_cap = max(overlap_cap, current_overlap_count + 3)
+            if cost_state.overlap_count > overlap_cap:
+                # Above cap: only reject if overlaps INCREASED from current
+                if cost_state.overlap_count > current_overlap_count:
                     cost_state.restore(snap)
                     revert_move(model, undo)
                     continue
-            else:
-                cap_base = max(best_overlap_seen + 10, initial_overlap_count + 10)
-                cap_relaxation = 1.0 + 0.25 * t_ratio  # 1.25x at hot, 1.0x at cold
-                overlap_cap = int(cap_base * cap_relaxation)
-                if cost_state.overlap_count > overlap_cap:
-                    # Above cap: only reject if overlaps INCREASED from current
-                    if cost_state.overlap_count > current_overlap_count:
-                        cost_state.restore(snap)
-                        revert_move(model, undo)
-                        continue
 
             # v10 BUG FIX: use snap['overlap_penalty'] (full sum) not
             # sum(snap['pair_overlaps'].values()) (partial).  See _calibrate_t0.
@@ -337,7 +340,6 @@ def _run_sa_pass(
                 global_best_overlap_count = cost_state.overlap_count
 
             best_overlap_count = cost_state.overlap_count
-            best_overlap_seen = min(best_overlap_seen, cost_state.overlap_count)
             no_improve_count = 0
 
         if config.verbose and step % 10 == 0:
@@ -390,18 +392,35 @@ def _greedy_refine(
     cost_state: CostState,
     moveable_indices: list[int],
     config: SAConfig,
+    enhanced: bool = False,
 ) -> None:
     """Greedy refinement: try nudges and rotations, accept only if improving.
 
     Hard overlap rejection: greedy does small moves, so rejecting
     overlap-creating moves doesn't limit exploration.  This ensures
     greedy never creates new overlaps.
+
+    Enhanced mode adds:
+    - Finer nudge distances for more precise placement
+    - Lower improve threshold for more aggressive acceptance
+    - Adaptive sweep count based on component count
+    - Position-aware ordering: process components by HPWL contribution
     """
     # Reset penalty scale for greedy — we want full-weight evaluation
     cost_state.update_penalty_scale(1.0)
 
     directions = [(1, 0), (-1, 0), (0, 1), (0, -1),
                   (1, 1), (-1, 1), (1, -1), (-1, -1)]
+
+    if enhanced:
+        # Enhanced: finer nudge distances + extended range
+        nudge_distances = (0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.8, 1.5, 2.5, 4.0, 6.0)
+        improve_threshold = 0.1  # accept smaller improvements
+        max_sweeps = min(15, 5 + len(moveable_indices) // 10)
+    else:
+        nudge_distances = config.greedy_nudge_distances
+        improve_threshold = config.greedy_improve_threshold
+        max_sweeps = 8
 
     improved = True
     sweep = 0
@@ -411,11 +430,19 @@ def _greedy_refine(
     while improved:
         improved = False
         sweep += 1
-        for idx in moveable_indices:
+
+        # In enhanced mode, order components by their HPWL contribution
+        # (components connected to high-HPWL nets first)
+        if enhanced:
+            indices_to_process = _order_by_hpwl_contribution(model, cost_state, moveable_indices)
+        else:
+            indices_to_process = moveable_indices
+
+        for idx in indices_to_process:
             comp = model.components[idx]
             # Try nudges
             for dx_dir, dy_dir in directions:
-                for dist in config.greedy_nudge_distances:
+                for dist in nudge_distances:
                     old_x, old_y = comp.x, comp.y
                     base_cost = cost_state.normalized_cost
                     prev_overlap_count = cost_state.overlap_count
@@ -432,7 +459,7 @@ def _greedy_refine(
                         cost_state.incremental_update({idx})
                         continue
 
-                    if new_cost < base_cost - config.greedy_improve_threshold:
+                    if new_cost < base_cost - improve_threshold:
                         improved = True
                     else:
                         comp.x = old_x
@@ -453,7 +480,7 @@ def _greedy_refine(
                     cost_state.incremental_update({idx})
                     continue
 
-                if new_cost < base_cost - config.greedy_improve_threshold:
+                if new_cost < base_cost - improve_threshold:
                     improved = True
                     base_rot = comp.rotation
                 else:
@@ -470,14 +497,190 @@ def _greedy_refine(
 
         if config.verbose:
             print(f"    Greedy sweep {sweep}: cost={cost_state.normalized_cost:.1f} "
-                  f"overlaps={cost_state.overlap_count}")
+                  f"hpwl={cost_state.hpwl:.1f} overlaps={cost_state.overlap_count}")
 
-        if sweep >= 8:
+        if sweep >= max_sweeps:
             break
 
     # Final restore to best sweep result
     if cost_state.normalized_cost > best_sweep_cost:
         _restore_positions(model, best_sweep_positions)
+        cost_state._compute_all()
+
+
+def _order_by_hpwl_contribution(
+    model: BoardModel,
+    cost_state: CostState,
+    moveable_indices: list[int],
+) -> list[int]:
+    """Order moveable indices by their HPWL contribution (highest first).
+
+    Components connected to high-HPWL nets are processed first,
+    so they get the most benefit from greedy nudges.
+    """
+    # Build per-component HPWL contribution
+    comp_hpwl = {}
+    for idx in moveable_indices:
+        comp_nets = cost_state._comp_nets[idx]
+        total = 0.0
+        for net_name in comp_nets:
+            if net_name in cost_state._net_hpwl:
+                total += cost_state._net_hpwl[net_name]
+        comp_hpwl[idx] = total
+
+    # Sort descending by HPWL contribution
+    return sorted(moveable_indices, key=lambda i: comp_hpwl.get(i, 0.0), reverse=True)
+
+
+def _greedy_swap_refine(
+    model: BoardModel,
+    cost_state: CostState,
+    moveable_indices: list[int],
+    config: SAConfig,
+) -> None:
+    """Greedy swap refinement: try swapping pairs of components, accept if improving.
+
+    Brute-force O(n^2) approach. For boards with <100 components this
+    completes in 1-3 seconds. For larger boards, the smart_swap patch
+    replaces this with net-aware/size-class candidate filtering.
+
+    Hard overlap rejection: swaps that increase overlap count are rejected.
+    Also tries rotation swaps (swap positions + exchange rotations) which
+    the SA's do_swap() never does.
+    """
+    cost_state.update_penalty_scale(1.0)
+    n = len(moveable_indices)
+
+    if n < 2:
+        return
+
+    best_swap_cost = cost_state.normalized_cost
+    best_positions = _save_positions(model, moveable_indices)
+    total_swaps = 0
+
+    for pass_num in range(3):  # max 3 swap passes
+        any_swap_accepted = False
+
+        for i_idx in range(n):
+            idx_a = moveable_indices[i_idx]
+            c_a = model.components[idx_a]
+
+            for j_idx in range(i_idx + 1, n):
+                idx_b = moveable_indices[j_idx]
+                c_b = model.components[idx_b]
+
+                prev_overlap_count = cost_state.overlap_count
+                base_cost = cost_state.normalized_cost
+
+                # Try position swap (keep each component's own rotation)
+                old_ax, old_ay, old_arot = c_a.x, c_a.y, c_a.rotation
+                old_bx, old_by, old_brot = c_b.x, c_b.y, c_b.rotation
+
+                # Swap positions only
+                c_a.x, c_b.x = c_b.x, c_a.x
+                c_a.y, c_b.y = c_b.y, c_a.y
+
+                new_cost = cost_state.incremental_update({idx_a, idx_b})
+
+                # Hard overlap rejection
+                if cost_state.overlap_count > prev_overlap_count:
+                    # Revert position swap
+                    c_a.x, c_a.y = old_ax, old_ay
+                    c_b.x, c_b.y = old_bx, old_by
+                    cost_state.incremental_update({idx_a, idx_b})
+
+                    # Also try swap with rotation exchange
+                    c_a.x, c_b.x = c_b.x, c_a.x
+                    c_a.y, c_b.y = c_b.y, c_a.y
+                    c_a.set_rotation(old_brot)
+                    c_b.set_rotation(old_arot)
+
+                    new_cost = cost_state.incremental_update({idx_a, idx_b})
+
+                    if cost_state.overlap_count > prev_overlap_count:
+                        # Revert everything
+                        c_a.x, c_a.y, c_a.rotation = old_ax, old_ay, old_arot
+                        c_a._update_trig()
+                        c_b.x, c_b.y, c_b.rotation = old_bx, old_by, old_brot
+                        c_b._update_trig()
+                        cost_state.incremental_update({idx_a, idx_b})
+                        continue
+
+                    # Swap+rotation accepted only if cost improves
+                    if new_cost < base_cost - 0.5:
+                        any_swap_accepted = True
+                        total_swaps += 1
+                    else:
+                        c_a.x, c_a.y, c_a.rotation = old_ax, old_ay, old_arot
+                        c_a._update_trig()
+                        c_b.x, c_b.y, c_b.rotation = old_bx, old_by, old_brot
+                        c_b._update_trig()
+                        cost_state.incremental_update({idx_a, idx_b})
+                    continue
+
+                # Position swap didn't increase overlaps — check cost
+                if new_cost < base_cost - 0.5:
+                    any_swap_accepted = True
+                    total_swaps += 1
+                    # Also try with rotation exchange to see if even better
+                    old_arot_now = c_a.rotation
+                    old_brot_now = c_b.rotation
+                    c_a.set_rotation(old_brot_now)
+                    c_b.set_rotation(old_arot_now)
+                    rot_cost = cost_state.incremental_update({idx_a, idx_b})
+                    if rot_cost < new_cost and cost_state.overlap_count <= prev_overlap_count:
+                        # Rotation exchange is even better
+                        pass
+                    else:
+                        # Revert rotation exchange, keep position swap
+                        c_a.set_rotation(old_arot_now)
+                        c_b.set_rotation(old_brot_now)
+                        cost_state.incremental_update({idx_a, idx_b})
+                else:
+                    # Revert position swap
+                    c_a.x, c_a.y = old_ax, old_ay
+                    c_b.x, c_b.y = old_bx, old_by
+                    cost_state.incremental_update({idx_a, idx_b})
+
+                    # Try swap with rotation exchange
+                    c_a.x, c_b.x = c_b.x, c_a.x
+                    c_a.y, c_b.y = c_b.y, c_a.y
+                    c_a.set_rotation(old_brot)
+                    c_b.set_rotation(old_arot)
+
+                    new_cost = cost_state.incremental_update({idx_a, idx_b})
+
+                    if cost_state.overlap_count <= prev_overlap_count and new_cost < base_cost - 0.5:
+                        any_swap_accepted = True
+                        total_swaps += 1
+                    else:
+                        c_a.x, c_a.y, c_a.rotation = old_ax, old_ay, old_arot
+                        c_a._update_trig()
+                        c_b.x, c_b.y, c_b.rotation = old_bx, old_by, old_brot
+                        c_b._update_trig()
+                        cost_state.incremental_update({idx_a, idx_b})
+
+        # After a full pass, check if we improved
+        cur_cost = cost_state.normalized_cost
+        if cur_cost < best_swap_cost:
+            best_swap_cost = cur_cost
+            best_positions = _save_positions(model, moveable_indices)
+        else:
+            _restore_positions(model, best_positions)
+            cost_state._compute_all()
+            break  # no improvement, stop swapping
+
+        if config.verbose:
+            print(f"    Swap pass {pass_num + 1}: cost={cost_state.normalized_cost:.1f} "
+                  f"hpwl={cost_state.hpwl:.1f} overlaps={cost_state.overlap_count} "
+                  f"(swaps accepted: {total_swaps})")
+
+        if not any_swap_accepted:
+            break
+
+    # Final restore to best result
+    if cost_state.normalized_cost > best_swap_cost:
+        _restore_positions(model, best_positions)
         cost_state._compute_all()
 
 
@@ -628,13 +831,47 @@ def simulate_annealing(
     moveable_indices: list[int],
     config: SAConfig | None = None,
 ) -> float:
-    """Run SA optimization. Returns final normalized cost. Mutates model in-place."""
+    """Run SA optimization. Returns final normalized cost. Mutates model in-place.
+
+    When config.skip_sa is True, runs enhanced greedy + swap + greedy
+    instead of the full SA pass. This is the new default — global SA is
+    opt-in via --sa flag.
+    """
     if config is None:
         config = SAConfig()
 
     if not moveable_indices:
         return cost_state.normalized_cost
 
+    # --- Greedy-only path (default) ---
+    if config.skip_sa:
+        if config.verbose:
+            print(f"  Enhanced greedy optimization ({len(moveable_indices)} moveable components)...")
+
+        # Phase 1: Enhanced greedy nudge+rotate
+        if config.verbose:
+            print("  Phase 1: Enhanced greedy nudge+rotate...")
+        _greedy_refine(model, cost_state, moveable_indices, config, enhanced=True)
+
+        # Phase 2: Greedy swap
+        if config.verbose:
+            print("  Phase 2: Greedy swap refinement...")
+        _greedy_swap_refine(model, cost_state, moveable_indices, config)
+
+        # Phase 3: Another pass of enhanced greedy (to settle after swaps)
+        if config.verbose:
+            print("  Phase 3: Final greedy nudge+rotate...")
+        _greedy_refine(model, cost_state, moveable_indices, config, enhanced=True)
+
+        if cost_state.overlap_count > 0 and config.verbose:
+            print(f"  Greedy leaving {cost_state.overlap_count} overlaps for legalizer to resolve")
+
+        final_cost = cost_state.normalized_cost
+        if config.verbose:
+            print(f"  Greedy complete: cost={final_cost:.1f} hpwl={cost_state.hpwl:.1f} overlaps={cost_state.overlap_count}")
+        return final_cost
+
+    # --- Full SA path (opt-in with --sa) ---
     # Record initial overlap count for hard cap
     initial_overlap_count = cost_state.overlap_count
 
@@ -682,10 +919,12 @@ def simulate_annealing(
                 global_best_overlap_count=global_best_overlap_count,
             )
 
-    # Greedy refinement
+    # After SA, run enhanced greedy + swap + greedy (not just basic greedy)
     if config.verbose:
-        print("  Greedy refinement...")
-    _greedy_refine(model, cost_state, moveable_indices, config)
+        print("  Post-SA enhanced greedy refinement...")
+    _greedy_refine(model, cost_state, moveable_indices, config, enhanced=True)
+    _greedy_swap_refine(model, cost_state, moveable_indices, config)
+    _greedy_refine(model, cost_state, moveable_indices, config, enhanced=True)
 
     # NO overlap resolution in SA. The legalizer handles overlaps.
     # SA overlap resolution destroys HPWL optimization for dense boards
@@ -710,10 +949,12 @@ def run_sa(
 ) -> dict:
     """High-level entry point: build CostState, get moveable indices, run SA.
 
+    When config.skip_sa is True, runs enhanced greedy + swap + greedy
+    instead of global SA. This is the new default behavior.
+
     HPWL-based revert policy.
     Consistent penalty_scale comparison prevents false reverts.
     Density-adaptive SA parameters.
-    Density-adaptive SA parameters for dense boards.
     """
     if config is None:
         config = SAConfig(verbose=verbose)
@@ -738,7 +979,8 @@ def run_sa(
             config.overlap_cap_factor = 1.75  # medium: allow 75% increase
 
     if config.verbose:
-        print(f"  Density: {density:.3f}, penalty_scale_min: {config.penalty_scale_min:.2f}, "
+        mode = "greedy+swap" if config.skip_sa else "SA+greedy+swap"
+        print(f"  Mode: {mode}, Density: {density:.3f}, penalty_scale_min: {config.penalty_scale_min:.2f}, "
               f"reheat_count: {config.reheat_count}, overlap_cap: {config.overlap_cap_factor:.1f}x")
 
     cost_state = CostState(model, rules=rules)
@@ -766,25 +1008,25 @@ def run_sa(
     if final_overlaps == 0:
         should_revert = False
         if config.verbose and final_cost > initial_cost:
-            print(f"  SA kept: 0 overlaps achieved "
-                  f"(cost {initial_cost:.1f} → {final_cost:.1f}, "
-                  f"HPWL {initial_hpwl:.1f} → {final_hpwl:.1f})")
+            print(f"  Optimization kept: 0 overlaps achieved "
+                  f"(cost {initial_cost:.1f} -> {final_cost:.1f}, "
+                  f"HPWL {initial_hpwl:.1f} -> {final_hpwl:.1f})")
     elif hpwl_ratio > 2.0:
         should_revert = True
-        revert_reason = f"HPWL doubled ({initial_hpwl:.1f} → {final_hpwl:.1f})"
+        revert_reason = f"HPWL doubled ({initial_hpwl:.1f} -> {final_hpwl:.1f})"
     elif hpwl_ratio > 1.5 and overlap_improvement <= 0:
         should_revert = True
         revert_reason = f"HPWL increased {hpwl_ratio:.0%} with no overlap improvement"
     elif overlap_improvement > 0:
         if config.verbose and final_cost > initial_cost:
-            print(f"  SA kept: overlaps improved ({initial_overlaps} → {final_overlaps}) "
-                  f"despite cost increase ({initial_cost:.1f} → {final_cost:.1f})")
+            print(f"  Optimization kept: overlaps improved ({initial_overlaps} -> {final_overlaps}) "
+                  f"despite cost increase ({initial_cost:.1f} -> {final_cost:.1f})")
     elif final_cost > initial_cost and config.verbose:
-        print(f"  SA kept: cost slightly worse ({initial_cost:.1f} → {final_cost:.1f})")
+        print(f"  Optimization kept: cost slightly worse ({initial_cost:.1f} -> {final_cost:.1f})")
 
     if should_revert:
         if config.verbose:
-            print(f"  SA reverted: {revert_reason}")
+            print(f"  Optimization reverted: {revert_reason}")
         _restore_positions(model, pre_sa_positions)
         cost_state._compute_all()
         final_cost = cost_state.normalized_cost

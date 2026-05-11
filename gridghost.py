@@ -159,35 +159,33 @@ def cmd_place(args) -> None:
 
     print_board_summary(model, "After Placement")
 
-    # Step 5.5: SA optimization (if enabled)
-    if not args.no_sa:
-        print("Step 5: Running SA optimization...")
-        # Sync profile weights into CostState module-level constants.
-        #
-        # SA strategy (v11): density-adaptive SA parameters.
-        # - Dense boards (density > 0.40): penalty_scale_min ≈ 0.87,
-        #   fewer reheats (1), hard overlap cap, focused refinement.
-        # - Sparse boards (density < 0.25): penalty_scale_min = 0.50,
-        #   3 reheats, full exploration.
-        # - Hard overlap cap: reject moves that exceed 2x initial overlaps.
-        # - Density-adaptive T0 calibration: lower percentile for dense boards.
-        import engine.cost_state as cs
-        cs.OVERLAP_WEIGHT = max(profile.beta, 25.0)   # strong — SA should avoid overlaps
-        cs.BOUNDARY_WEIGHT = max(profile.gamma, 8.0)   # strong — prevent OOB during SA
-        cs.CONSTRAINT_WEIGHT = profile.delta
-        sa_config = SAConfig(
-            max_iterations=args.sa_iterations,
-            reheat_count=args.sa_reheat,
-            verbose=True,
-        )
-        sa_result = run_sa(model, config=sa_config, verbose=True, rules=profile.rules)
-        print(f"  SA: cost {sa_result['initial_cost']:.1f} -> {sa_result['final_cost']:.1f} "
-              f"(delta={sa_result['improvement']:.1f})")
-        print(f"  SA: HPWL {sa_result['initial_hpwl']:.1f} -> {sa_result['final_hpwl']:.1f}")
-        print(f"  SA: overlaps={sa_result['overlap_count']}")
-        print_board_summary(model, "After SA Optimization")
+    # Step 5.5: Post-placement optimization
+    # Default is enhanced greedy+swap (no global SA).
+    # Use --sa to additionally run global SA before greedy.
+    import engine.cost_state as cs
+    cs.OVERLAP_WEIGHT = max(profile.beta, 25.0)   # strong — SA should avoid overlaps
+    cs.BOUNDARY_WEIGHT = max(profile.gamma, 8.0)   # strong — prevent OOB during SA
+    cs.CONSTRAINT_WEIGHT = profile.delta
+
+    sa_config = SAConfig(
+        max_iterations=args.sa_iterations,
+        reheat_count=args.sa_reheat,
+        verbose=True,
+        skip_sa=not args.sa,  # skip global SA by default
+    )
+
+    if args.sa:
+        print("Step 5: Running SA + enhanced greedy optimization...")
     else:
-        print("Step 5: SA optimization disabled (--no-sa)")
+        print("Step 5: Running enhanced greedy+swap optimization...")
+
+    sa_result = run_sa(model, config=sa_config, verbose=True, rules=profile.rules)
+    mode_label = "SA" if args.sa else "Greedy"
+    print(f"  {mode_label}: cost {sa_result['initial_cost']:.1f} -> {sa_result['final_cost']:.1f} "
+          f"(delta={sa_result['improvement']:.1f})")
+    print(f"  {mode_label}: HPWL {sa_result['initial_hpwl']:.1f} -> {sa_result['final_hpwl']:.1f}")
+    print(f"  {mode_label}: overlaps={sa_result['overlap_count']}")
+    print_board_summary(model, "After Optimization")
 
     # Step 6: Cost evaluation
     print("Step 6: Evaluating placement cost...")
@@ -225,7 +223,7 @@ def cmd_place(args) -> None:
     print_board_summary(model, "After Legalization")
 
     # Step 7.5: Post-legalization overlap resolution
-    # v11: Use the legalizer's greedy resolver instead of SA's overlap resolver.
+    # Use the legalizer's greedy resolver instead of SA's overlap resolver.
     # The SA resolver doesn't check if resolving one overlap creates new ones.
     # The legalizer's greedy resolver checks all neighbors before accepting moves.
     post_legal_overlaps = count_overlaps(model)
@@ -348,7 +346,7 @@ def main():
                          help="Board edge margin in mm (default: from config, else 5.0)")
     p_place.add_argument("--dry-run", action="store_true", help="Don't write PCB output file")
     p_place.add_argument("--interactive", action="store_true", help="Interactive profile weight tuning")
-    p_place.add_argument("--no-sa", action="store_true", help="Disable SA optimization after placement")
+    p_place.add_argument("--sa", action="store_true", help="Enable global SA optimization after placement (default: greedy+swap only)")
     p_place.add_argument("--sa-iterations", type=int, default=200, help="Max SA temperature steps (default: 200)")
     p_place.add_argument("--sa-reheat", type=int, default=2, help="Number of SA reheat rounds (default: 2)")
     p_place.add_argument("--debug-bbox", action="store_true", help="Draw component bounding boxes on Dwgs.User layer for visual debugging")
