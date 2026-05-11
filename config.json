@@ -10,8 +10,8 @@
         "severe_push_factor": 0.5
     },
     "annealer": {
-        "max_iterations": 300,
-        "reheat_count": 3,
+        "max_iterations": 200,
+        "reheat_count": 2,
         "reheat_ratio": 0.40,
         "reheat_decay": 0.7,
         "calibration_samples": 500,

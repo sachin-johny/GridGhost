@@ -338,9 +338,9 @@ def main():
     p_place.add_argument("input", help="Path to .kicad_pcb file")
     p_place.add_argument("-o", "--output", help="Output .kicad_pcb path")
     p_place.add_argument(
-        "-p", "--profile", default="mcu_peripheral",
+        "-p", "--profile", default="generic",
         choices=["mcu_peripheral", "power_supply", "rf_frontend", "mixed_signal", "generic", "small_board"],
-        help="Board profile (default: mcu_peripheral)",
+        help="Board profile (default: generic)",
     )
     p_place.add_argument("-a", "--algorithm", default="grid", choices=ALGORITHMS,
                          help="Placement algorithm (default: grid)")
@@ -349,8 +349,8 @@ def main():
     p_place.add_argument("--dry-run", action="store_true", help="Don't write PCB output file")
     p_place.add_argument("--interactive", action="store_true", help="Interactive profile weight tuning")
     p_place.add_argument("--no-sa", action="store_true", help="Disable SA optimization after placement")
-    p_place.add_argument("--sa-iterations", type=int, default=300, help="Max SA temperature steps (default: 300)")
-    p_place.add_argument("--sa-reheat", type=int, default=3, help="Number of SA reheat rounds (default: 3)")
+    p_place.add_argument("--sa-iterations", type=int, default=200, help="Max SA temperature steps (default: 200)")
+    p_place.add_argument("--sa-reheat", type=int, default=2, help="Number of SA reheat rounds (default: 2)")
     p_place.add_argument("--debug-bbox", action="store_true", help="Draw component bounding boxes on Dwgs.User layer for visual debugging")
 
     # profiles
