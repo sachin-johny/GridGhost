@@ -5,6 +5,7 @@ milestone.md
 auto_placer_plan.md
 .history/
 *.log
+*placed.kicad_pcb
 
 % donot ignore config.json 
 !config.json
