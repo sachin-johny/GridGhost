@@ -532,6 +532,222 @@ def _order_by_hpwl_contribution(
     return sorted(moveable_indices, key=lambda i: comp_hpwl.get(i, 0.0), reverse=True)
 
 
+def _build_swap_candidates(
+    model: BoardModel,
+    cost_state: CostState,
+    moveable_indices: list[int],
+) -> dict[int, list[int]]:
+    """Build candidate swap partners for each moveable component.
+
+    Smart swap: Instead of brute-force O(n^2) all-pairs, filter
+    candidates using three criteria:
+
+    1. **Net-connected**: Components sharing at least one signal net
+       are always candidates (swapping them directly reduces HPWL).
+    2. **Size-class**: Components with similar area (within 3x ratio)
+       are candidates (avoids placing a large IC in a resistor's spot).
+    3. **Proximity**: Components within 3x of each other's HPWL
+       contribution are candidates (prioritises high-impact swaps).
+
+    For small boards (<60 components), falls back to all-pairs since
+    the overhead of filtering exceeds the brute-force cost.
+    """
+    n = len(moveable_indices)
+
+    # For small boards, all-pairs is fine
+    if n < 60:
+        all_set = set(moveable_indices)
+        return {idx: [j for j in moveable_indices if j != idx] for idx in moveable_indices}
+
+    # Build per-component data
+    comp_area = {}
+    comp_nets = {}
+    comp_hpwl = {}
+
+    for idx in moveable_indices:
+        comp = model.components[idx]
+        comp_area[idx] = comp.effective_width * comp.effective_height
+        comp_nets[idx] = cost_state._comp_nets[idx]
+        # HPWL contribution
+        total = 0.0
+        for net_name in comp_nets[idx]:
+            if net_name in cost_state._net_hpwl:
+                total += cost_state._net_hpwl[net_name]
+        comp_hpwl[idx] = total
+
+    # Build net → component index map for fast lookup
+    net_to_comps: dict[str, list[int]] = {}
+    for idx in moveable_indices:
+        for net_name in comp_nets[idx]:
+            if net_name not in net_to_comps:
+                net_to_comps[net_name] = []
+            net_to_comps[net_name].append(idx)
+
+    # Build size-class buckets (log-scale area bins)
+    size_buckets: dict[int, list[int]] = {}
+    for idx in moveable_indices:
+        area = comp_area[idx]
+        if area <= 0:
+            bucket = 0
+        else:
+            bucket = int(math.log2(area + 1))
+        if bucket not in size_buckets:
+            size_buckets[bucket] = []
+        size_buckets[bucket].append(idx)
+
+    # Build candidates for each component
+    candidates: dict[int, list[int]] = {idx: [] for idx in moveable_indices}
+    seen_pairs: set[tuple[int, int]] = set()
+
+    # Strategy 1: Net-connected candidates (highest priority)
+    for net_name, comp_list in net_to_comps.items():
+        if net_name in cost_state._power_nets:
+            continue  # skip power nets — too many components, low value
+        for i_idx in range(len(comp_list)):
+            for j_idx in range(i_idx + 1, len(comp_list)):
+                a, b = comp_list[i_idx], comp_list[j_idx]
+                pair = (min(a, b), max(a, b))
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    candidates[a].append(b)
+                    candidates[b].append(a)
+
+    # Strategy 2: Size-class candidates (adjacent buckets)
+    for bucket, comps in size_buckets.items():
+        adjacent = list(comps)
+        for adj_bucket in [bucket - 1, bucket + 1]:
+            if adj_bucket in size_buckets:
+                adjacent.extend(size_buckets[adj_bucket])
+        for idx in comps:
+            for other in adjacent:
+                if other == idx:
+                    continue
+                # Check area ratio
+                area_a = comp_area[idx]
+                area_b = comp_area[other]
+                if area_a > 0 and area_b > 0:
+                    ratio = max(area_a, area_b) / min(area_a, area_b)
+                    if ratio <= 3.0:
+                        pair = (min(idx, other), max(idx, other))
+                        if pair not in seen_pairs:
+                            seen_pairs.add(pair)
+                            candidates[idx].append(other)
+
+    # Strategy 3: Top-20% HPWL contributors can swap with each other
+    # (even if not net-connected or size-similar)
+    sorted_by_hpwl = sorted(moveable_indices, key=lambda i: comp_hpwl[i], reverse=True)
+    top_k = max(5, n // 5)
+    top_comps = sorted_by_hpwl[:top_k]
+    for i_idx in range(len(top_comps)):
+        for j_idx in range(i_idx + 1, len(top_comps)):
+            a, b = top_comps[i_idx], top_comps[j_idx]
+            pair = (min(a, b), max(a, b))
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                candidates[a].append(b)
+                candidates[b].append(a)
+
+    return candidates
+
+
+def _try_single_swap(
+    model: BoardModel,
+    cost_state: CostState,
+    idx_a: int,
+    idx_b: int,
+    improve_threshold: float = 0.5,
+) -> bool:
+    """Try swapping components idx_a and idx_b. Returns True if swap accepted.
+
+    Tries: position swap, then position+rotation swap. Accepts the best
+    improving option. Reverts everything if no improvement.
+    """
+    c_a = model.components[idx_a]
+    c_b = model.components[idx_b]
+
+    prev_overlap_count = cost_state.overlap_count
+    base_cost = cost_state.normalized_cost
+
+    old_ax, old_ay, old_arot = c_a.x, c_a.y, c_a.rotation
+    old_bx, old_by, old_brot = c_b.x, c_b.y, c_b.rotation
+
+    # Try position swap (keep each component's own rotation)
+    c_a.x, c_b.x = c_b.x, c_a.x
+    c_a.y, c_b.y = c_b.y, c_a.y
+    new_cost = cost_state.incremental_update({idx_a, idx_b})
+
+    if cost_state.overlap_count > prev_overlap_count:
+        # Position swap creates overlaps — revert and try with rotation exchange
+        c_a.x, c_a.y = old_ax, old_ay
+        c_b.x, c_b.y = old_bx, old_by
+        cost_state.incremental_update({idx_a, idx_b})
+
+        # Try swap with rotation exchange
+        c_a.x, c_b.x = c_b.x, c_a.x
+        c_a.y, c_b.y = c_b.y, c_a.y
+        c_a.set_rotation(old_brot)
+        c_b.set_rotation(old_arot)
+        new_cost = cost_state.incremental_update({idx_a, idx_b})
+
+        if cost_state.overlap_count > prev_overlap_count:
+            # Both overlap — revert fully
+            c_a.x, c_a.y, c_a.rotation = old_ax, old_ay, old_arot
+            c_a._update_trig()
+            c_b.x, c_b.y, c_b.rotation = old_bx, old_by, old_brot
+            c_b._update_trig()
+            cost_state.incremental_update({idx_a, idx_b})
+            return False
+
+        if new_cost < base_cost - improve_threshold:
+            return True
+        else:
+            c_a.x, c_a.y, c_a.rotation = old_ax, old_ay, old_arot
+            c_a._update_trig()
+            c_b.x, c_b.y, c_b.rotation = old_bx, old_by, old_brot
+            c_b._update_trig()
+            cost_state.incremental_update({idx_a, idx_b})
+            return False
+
+    # Position swap didn't increase overlaps — check cost
+    if new_cost < base_cost - improve_threshold:
+        # Position swap is good — try rotation exchange to see if even better
+        old_arot_now = c_a.rotation
+        old_brot_now = c_b.rotation
+        c_a.set_rotation(old_brot_now)
+        c_b.set_rotation(old_arot_now)
+        rot_cost = cost_state.incremental_update({idx_a, idx_b})
+        if rot_cost < new_cost and cost_state.overlap_count <= prev_overlap_count:
+            # Rotation exchange is even better — keep it
+            return True
+        else:
+            # Revert rotation, keep position swap
+            c_a.set_rotation(old_arot_now)
+            c_b.set_rotation(old_brot_now)
+            cost_state.incremental_update({idx_a, idx_b})
+            return True
+    else:
+        # Position swap not good enough — try with rotation exchange
+        c_a.x, c_a.y = old_ax, old_ay
+        c_b.x, c_b.y = old_bx, old_by
+        cost_state.incremental_update({idx_a, idx_b})
+
+        c_a.x, c_b.x = c_b.x, c_a.x
+        c_a.y, c_b.y = c_b.y, c_a.y
+        c_a.set_rotation(old_brot)
+        c_b.set_rotation(old_arot)
+        new_cost = cost_state.incremental_update({idx_a, idx_b})
+
+        if cost_state.overlap_count <= prev_overlap_count and new_cost < base_cost - improve_threshold:
+            return True
+        else:
+            c_a.x, c_a.y, c_a.rotation = old_ax, old_ay, old_arot
+            c_a._update_trig()
+            c_b.x, c_b.y, c_b.rotation = old_bx, old_by, old_brot
+            c_b._update_trig()
+            cost_state.incremental_update({idx_a, idx_b})
+            return False
+
+
 def _greedy_swap_refine(
     model: BoardModel,
     cost_state: CostState,
@@ -540,9 +756,13 @@ def _greedy_swap_refine(
 ) -> None:
     """Greedy swap refinement: try swapping pairs of components, accept if improving.
 
-    Brute-force O(n^2) approach. For boards with <100 components this
-    completes in 1-3 seconds. For larger boards, the smart_swap patch
-    replaces this with net-aware/size-class candidate filtering.
+    Smart swap: Uses candidate filtering instead of brute-force O(n^2).
+    Candidates are built from:
+    - Net-connected components (sharing signal nets)
+    - Size-class similar components (area within 3x)
+    - Top HPWL contributors
+
+    For small boards (<60 components), falls back to all-pairs.
 
     Hard overlap rejection: swaps that increase overlap count are rejected.
     Also tries rotation swaps (swap positions + exchange rotations) which
@@ -554,6 +774,14 @@ def _greedy_swap_refine(
     if n < 2:
         return
 
+    # Build candidate swap partners (smart filtering for large boards)
+    candidates = _build_swap_candidates(model, cost_state, moveable_indices)
+
+    if config.verbose:
+        total_pairs = sum(len(v) for v in candidates.values()) // 2
+        max_brute = n * (n - 1) // 2
+        print(f"    Swap candidates: {total_pairs} pairs (vs {max_brute} brute-force)")
+
     best_swap_cost = cost_state.normalized_cost
     best_positions = _save_positions(model, moveable_indices)
     total_swaps = 0
@@ -561,104 +789,14 @@ def _greedy_swap_refine(
     for pass_num in range(3):  # max 3 swap passes
         any_swap_accepted = False
 
-        for i_idx in range(n):
-            idx_a = moveable_indices[i_idx]
-            c_a = model.components[idx_a]
+        for idx_a in moveable_indices:
+            for idx_b in candidates.get(idx_a, []):
+                if idx_b <= idx_a:
+                    continue  # avoid duplicate pairs (only process a < b)
 
-            for j_idx in range(i_idx + 1, n):
-                idx_b = moveable_indices[j_idx]
-                c_b = model.components[idx_b]
-
-                prev_overlap_count = cost_state.overlap_count
-                base_cost = cost_state.normalized_cost
-
-                # Try position swap (keep each component's own rotation)
-                old_ax, old_ay, old_arot = c_a.x, c_a.y, c_a.rotation
-                old_bx, old_by, old_brot = c_b.x, c_b.y, c_b.rotation
-
-                # Swap positions only
-                c_a.x, c_b.x = c_b.x, c_a.x
-                c_a.y, c_b.y = c_b.y, c_a.y
-
-                new_cost = cost_state.incremental_update({idx_a, idx_b})
-
-                # Hard overlap rejection
-                if cost_state.overlap_count > prev_overlap_count:
-                    # Revert position swap
-                    c_a.x, c_a.y = old_ax, old_ay
-                    c_b.x, c_b.y = old_bx, old_by
-                    cost_state.incremental_update({idx_a, idx_b})
-
-                    # Also try swap with rotation exchange
-                    c_a.x, c_b.x = c_b.x, c_a.x
-                    c_a.y, c_b.y = c_b.y, c_a.y
-                    c_a.set_rotation(old_brot)
-                    c_b.set_rotation(old_arot)
-
-                    new_cost = cost_state.incremental_update({idx_a, idx_b})
-
-                    if cost_state.overlap_count > prev_overlap_count:
-                        # Revert everything
-                        c_a.x, c_a.y, c_a.rotation = old_ax, old_ay, old_arot
-                        c_a._update_trig()
-                        c_b.x, c_b.y, c_b.rotation = old_bx, old_by, old_brot
-                        c_b._update_trig()
-                        cost_state.incremental_update({idx_a, idx_b})
-                        continue
-
-                    # Swap+rotation accepted only if cost improves
-                    if new_cost < base_cost - 0.5:
-                        any_swap_accepted = True
-                        total_swaps += 1
-                    else:
-                        c_a.x, c_a.y, c_a.rotation = old_ax, old_ay, old_arot
-                        c_a._update_trig()
-                        c_b.x, c_b.y, c_b.rotation = old_bx, old_by, old_brot
-                        c_b._update_trig()
-                        cost_state.incremental_update({idx_a, idx_b})
-                    continue
-
-                # Position swap didn't increase overlaps — check cost
-                if new_cost < base_cost - 0.5:
+                if _try_single_swap(model, cost_state, idx_a, idx_b, improve_threshold=0.5):
                     any_swap_accepted = True
                     total_swaps += 1
-                    # Also try with rotation exchange to see if even better
-                    old_arot_now = c_a.rotation
-                    old_brot_now = c_b.rotation
-                    c_a.set_rotation(old_brot_now)
-                    c_b.set_rotation(old_arot_now)
-                    rot_cost = cost_state.incremental_update({idx_a, idx_b})
-                    if rot_cost < new_cost and cost_state.overlap_count <= prev_overlap_count:
-                        # Rotation exchange is even better
-                        pass
-                    else:
-                        # Revert rotation exchange, keep position swap
-                        c_a.set_rotation(old_arot_now)
-                        c_b.set_rotation(old_brot_now)
-                        cost_state.incremental_update({idx_a, idx_b})
-                else:
-                    # Revert position swap
-                    c_a.x, c_a.y = old_ax, old_ay
-                    c_b.x, c_b.y = old_bx, old_by
-                    cost_state.incremental_update({idx_a, idx_b})
-
-                    # Try swap with rotation exchange
-                    c_a.x, c_b.x = c_b.x, c_a.x
-                    c_a.y, c_b.y = c_b.y, c_a.y
-                    c_a.set_rotation(old_brot)
-                    c_b.set_rotation(old_arot)
-
-                    new_cost = cost_state.incremental_update({idx_a, idx_b})
-
-                    if cost_state.overlap_count <= prev_overlap_count and new_cost < base_cost - 0.5:
-                        any_swap_accepted = True
-                        total_swaps += 1
-                    else:
-                        c_a.x, c_a.y, c_a.rotation = old_ax, old_ay, old_arot
-                        c_a._update_trig()
-                        c_b.x, c_b.y, c_b.rotation = old_bx, old_by, old_brot
-                        c_b._update_trig()
-                        cost_state.incremental_update({idx_a, idx_b})
 
         # After a full pass, check if we improved
         cur_cost = cost_state.normalized_cost
