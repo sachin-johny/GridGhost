@@ -4,6 +4,7 @@
 milestone.md
 auto_placer_plan.md
 .history/
+*.log
 
 % donot ignore config.json 
 !config.json
