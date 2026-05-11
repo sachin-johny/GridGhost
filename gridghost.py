@@ -36,6 +36,40 @@ from config import load_config, Config
 ALGORITHMS = ("force-directed", "grid")
 
 
+def _ensure_board_capacity(model: BoardModel, target_density: float = 0.35) -> None:
+    """Expand board if component density exceeds target."""
+    import math
+    board = model.board
+    board_area = board.width * board.height
+    if board_area <= 0:
+        return
+
+    comp_area = sum(c.effective_width * c.effective_height for c in model.components)
+    current_density = comp_area / board_area
+
+    if current_density <= target_density:
+        return
+
+    scale = math.sqrt(current_density / target_density)
+    new_w = board.width * scale
+    new_h = board.height * scale
+
+    cx = (board.x_min + board.x_max) / 2.0
+    cy = (board.y_min + board.y_max) / 2.0
+
+    from models.board_model import BoardOutline
+    model.board = BoardOutline(
+        x_min=cx - new_w / 2.0,
+        y_min=cy - new_h / 2.0,
+        x_max=cx + new_w / 2.0,
+        y_max=cy + new_h / 2.0,
+    )
+
+    print(f"  Board expanded for density: {board.width:.1f}x{board.height:.1f} -> "
+          f"{new_w:.1f}x{new_h:.1f}mm "
+          f"(density {current_density:.2f} -> {target_density:.2f})")
+
+
 def _apply_config_to_globals(cfg: Config) -> None:
     """Push config values into module-level constants used by cost_state."""
     import engine.cost_state as cs
@@ -74,6 +108,9 @@ def cmd_place(args) -> None:
     model = parser.parse()
     print_board_summary(model, "After Extraction")
     print_component_table(model)
+
+    # Step 1.5: Ensure board is large enough for component density
+    _ensure_board_capacity(model, target_density=0.35)
 
     # Step 2: Select board profile
     print("Step 2: Selecting board profile...")
@@ -135,8 +172,8 @@ def cmd_place(args) -> None:
         # - Hard overlap cap: reject moves that exceed 2x initial overlaps.
         # - Density-adaptive T0 calibration: lower percentile for dense boards.
         import engine.cost_state as cs
-        cs.OVERLAP_WEIGHT = max(profile.beta, 10.0)    # moderate — SA explores, legalizer resolves
-        cs.BOUNDARY_WEIGHT = max(profile.gamma, 2.0)   # low — HPWL dominates
+        cs.OVERLAP_WEIGHT = max(profile.beta, 25.0)   # strong — SA should avoid overlaps
+        cs.BOUNDARY_WEIGHT = max(profile.gamma, 8.0)   # strong — prevent OOB during SA
         cs.CONSTRAINT_WEIGHT = profile.delta
         sa_config = SAConfig(
             max_iterations=args.sa_iterations,

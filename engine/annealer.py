@@ -1,21 +1,8 @@
 """Simulated Annealing engine for PCB component placement.
 
-v12 strategy — fixes incremental drift + safe best-state tracking:
-  - CRITICAL FIX: periodic _compute_all() resync every 20 steps prevents
-    incremental overlap tracking from drifting from ground truth.  Without
-    this, SA thinks it has 34 overlaps when it actually has 87.
-  - CRITICAL FIX: safe best-state restore — after restoring "best" positions,
-    verify against _compute_all().  If the true overlap count is higher than
-    the final SA state, fall back to final (which was recently resync'd).
-  - CRITICAL FIX: overlap cap allows recovery — when already above cap,
-    only reject moves that INCREASE overlaps, not all moves.
-  - Density-aware overlap cap factor (1.5x for dense, 2.0x for sparse).
-  - Board density determines SA aggressiveness:
-    * Sparse boards (density < 0.25): penalty_scale_min=0.50, full exploration
-    * Dense boards (density > 0.40): penalty_scale_min=0.85+, focused refinement
-  - Fewer reheats for dense boards (reheats re-destroy placements)
-  - Greedy refinement with overlap rejection
-  - Overlap resolver with neighbor-aware moves
+This module includes the SA stability fixes, density-aware tuning,
+global-best tracking across reheats, and HPWL-based revert logic used
+by the placement pipeline.
 """
 
 from __future__ import annotations
@@ -25,7 +12,7 @@ import random
 from dataclasses import dataclass, field
 
 from models.board_model import BoardModel
-from engine.cost_state import CostState, OVERLAP_WEIGHT, BOUNDARY_WEIGHT, CONSTRAINT_WEIGHT
+from engine.cost_state import CostState, OVERLAP_WEIGHT, OVERLAP_COUNT_WEIGHT, BOUNDARY_WEIGHT, CONSTRAINT_WEIGHT
 from engine.moves import (
     select_move_type, get_moveable_indices,
     do_translate, do_swap, do_rotate, do_median,
@@ -63,32 +50,37 @@ def _compute_density(model: BoardModel) -> float:
 def _density_adaptive_penalty_scale(density: float) -> float:
     """Compute penalty_scale_min based on board density.
 
-    Sparse boards (density < 0.25): penalty_scale_min = 0.50 (let SA explore)
-    Dense boards (density > 0.40): penalty_scale_min = 0.85+ (prevent overlap explosion)
+    Sparse boards (density < 0.25): penalty_scale_min = 0.80
+    Dense boards (density > 0.40): penalty_scale_min = 0.95+
 
-    For test4 (density=0.43): penalty_scale_min ≈ 0.87
-    This prevents SA from accepting too many overlap-increasing moves.
+    Overlap penalties are stronger now (OVERLAP_WEIGHT=25, COUNT_WEIGHT=12),
+    so even at 0.80 the penalties are significant.
     """
     if density < 0.25:
-        return 0.50
+        return 0.80
     elif density < 0.40:
-        # Linear ramp from 0.50 to 0.85
+        # Linear ramp from 0.80 to 0.95
         t = (density - 0.25) / 0.15
-        return 0.50 + 0.35 * t
+        return 0.80 + 0.15 * t
     else:
-        # Dense boards: 0.85 to 0.95
+        # Dense boards: 0.95 to 1.00
         t = min(1.0, (density - 0.40) / 0.30)
-        return 0.85 + 0.10 * t
+        return 0.95 + 0.05 * t
 
 
 def _density_adaptive_reheat_count(density: float) -> int:
-    """Fewer reheats for dense boards (reheats re-destroy placements)."""
+    """Fewer reheats for dense boards, but still at least 2.
+
+    Dense boards get 2 reheats (was 1). A single reheat is
+    insufficient - the best state often gets rejected due to overlap
+    drift. With accurate per-step resync, 2 reheats give better results.
+    """
     if density < 0.25:
         return 3
     elif density < 0.40:
         return 2
     else:
-        return 1
+        return 2
 
 
 def _save_positions(model: BoardModel, indices: list[int]) -> dict[int, tuple[float, float, float]]:
@@ -139,7 +131,8 @@ def _calibrate_t0(
             continue
 
         moved = affected_indices(undo)
-        snap = cost_state.snapshot(moved)
+        old_bboxes = cost_state.old_bboxes_from_states(undo.old_states)
+        snap = cost_state.snapshot(moved, old_bboxes=old_bboxes)
         new_cost = cost_state.incremental_update(moved)
         # v10 BUG FIX: use snap['overlap_penalty'] (full sum) not
         # sum(snap['pair_overlaps'].values()) (partial — only moved-component
@@ -147,7 +140,7 @@ def _calibrate_t0(
         # old_cost (only moved-component overlaps), inflating delta by the
         # sum of all unaffected overlaps.
         old_cost = (snap['hpwl']
-                    + OVERLAP_WEIGHT * snap['overlap_penalty'] * config.penalty_scale_min
+                    + (OVERLAP_WEIGHT * snap['overlap_penalty'] + OVERLAP_COUNT_WEIGHT * len(snap['pair_overlaps'])) * config.penalty_scale_min
                     + BOUNDARY_WEIGHT * snap['boundary_penalty'] * config.penalty_scale_min
                     + CONSTRAINT_WEIGHT * snap['constraint_total'] * config.penalty_scale_min)
 
@@ -155,9 +148,9 @@ def _calibrate_t0(
         if delta > 0:
             deltas.append(delta)
 
-        # Revert
-        cost_state.restore(snap)
+        # Revert — model FIRST so spatial index is consistent
         revert_move(model, undo)
+        cost_state.restore(snap)
 
     if not deltas:
         return 1.0
@@ -194,8 +187,17 @@ def _run_sa_pass(
     config: SAConfig,
     max_iter_override: int | None = None,
     initial_overlap_count: int = 0,
-) -> float:
-    """Run one SA pass. Returns final temperature.
+    global_best_cost: float = float('inf'),
+    global_best_positions: dict | None = None,
+    global_best_overlap_count: int = 999999,
+) -> tuple[float, float, dict, int]:
+    """Run one SA pass. Returns (final_temperature, global_best_cost,
+    global_best_positions, global_best_overlap_count).
+
+    Tracks global best across all passes (main + reheats).
+    Each reheat receives the global best from previous passes and
+    preserves it — the old code let reheats overwrite the global best
+    with a worse state, then greedy couldn't recover enough.
 
     v11: Hard overlap cap — reject moves that increase overlap count
     beyond overlap_cap_factor * initial_overlap_count. This prevents
@@ -211,19 +213,22 @@ def _run_sa_pass(
 
     best_positions = _save_positions(model, moveable_indices)
     best_cost = cost_state.normalized_cost
-    best_overlap_count = cost_state.overlap_count  # v12: track overlaps at best
+    best_overlap_count = cost_state.overlap_count
+    best_overlap_seen = initial_overlap_count
     no_improve_count = 0
 
-    # v12: Save current positions so we can fall back if "best" is bad
-    current_positions = _save_positions(model, moveable_indices)
-    current_overlap_count = cost_state.overlap_count
+    # Global best state across all passes (main + reheats)
+    if global_best_positions is None:
+        global_best_cost = best_cost
+        global_best_positions = best_positions
+        global_best_overlap_count = best_overlap_count
 
-    # Overlap cap: reject moves that create too many overlaps
-    # If initial placement has 0 overlaps, set cap=0 (never accept overlap-creating moves)
-    if initial_overlap_count == 0:
-        overlap_cap = 0  # preserve the overlap-free state
-    else:
-        overlap_cap = max(initial_overlap_count * config.overlap_cap_factor, initial_overlap_count + 10)
+    # Allow small overlap increases during exploration when starting from 0.
+    # Old strict mode rejected ALL overlap-creating moves → SA froze (accept=0.00)
+    strict_max_overlaps = max(3, int(len(moveable_indices) * 0.05))
+
+    # Current overlap count (incremental, updated each move)
+    current_overlap_count = cost_state.overlap_count
 
     for step in range(max_iter):
         t_ratio = math.log(T + 1.0) / math.log(t0 + 1.0) if t0 > 0 else 0.0
@@ -252,62 +257,91 @@ def _run_sa_pass(
                 continue
 
             moved = affected_indices(undo)
-            snap = cost_state.snapshot(moved)
+            old_bboxes = cost_state.old_bboxes_from_states(undo.old_states)
+            snap = cost_state.snapshot(moved, old_bboxes=old_bboxes)
 
             new_cost = cost_state.incremental_update(moved)
 
-            # v12: Hard overlap cap — reject moves that create too many overlaps
-            # For overlap-free initial placements, reject ANY overlap-increasing move
-            # When already above cap, allow overlap-reducing moves (recovery)
-            if overlap_cap == 0:
-                # Strict mode: reject if overlap count increased at all
-                if cost_state.overlap_count > initial_overlap_count:
+            # Dynamic overlap cap: reject moves that create too many overlaps
+            # Cap adapts based on best overlap count seen (tightens as SA improves)
+            # and temperature (relaxed at high T for exploration, tight at low T)
+            if initial_overlap_count == 0:
+                # Relaxed strict mode — allow small overlap increases during
+                # exploration. Old code rejected ALL overlap-creating moves when
+                # starting from 0 overlaps, which froze SA (accept=0.00).
+                # Allow up to strict_max_overlaps temporary overlaps for exploration.
+                if cost_state.overlap_count > strict_max_overlaps:
                     cost_state.restore(snap)
                     revert_move(model, undo)
                     continue
-            elif cost_state.overlap_count > overlap_cap:
-                # Above cap: only reject if overlaps INCREASED from current state
-                # Allow overlap-reducing moves even if still above cap (recovery path)
-                if cost_state.overlap_count > current_overlap_count:
-                    cost_state.restore(snap)
-                    revert_move(model, undo)
-                    continue
+            else:
+                cap_base = max(best_overlap_seen + 10, initial_overlap_count + 10)
+                cap_relaxation = 1.0 + 0.25 * t_ratio  # 1.25x at hot, 1.0x at cold
+                overlap_cap = int(cap_base * cap_relaxation)
+                if cost_state.overlap_count > overlap_cap:
+                    # Above cap: only reject if overlaps INCREASED from current
+                    if cost_state.overlap_count > current_overlap_count:
+                        cost_state.restore(snap)
+                        revert_move(model, undo)
+                        continue
 
             # v10 BUG FIX: use snap['overlap_penalty'] (full sum) not
             # sum(snap['pair_overlaps'].values()) (partial).  See _calibrate_t0.
             old_cost = (snap['hpwl']
-                        + OVERLAP_WEIGHT * snap['overlap_penalty'] * scale
+                        + (OVERLAP_WEIGHT * snap['overlap_penalty'] + OVERLAP_COUNT_WEIGHT * len(snap['pair_overlaps'])) * scale
                         + BOUNDARY_WEIGHT * snap['boundary_penalty'] * scale
                         + CONSTRAINT_WEIGHT * snap['constraint_total'] * scale)
 
             delta = new_cost - old_cost
 
-            if delta < 0 or random.random() < math.exp(-delta / max(T, 1e-10)):
+            accept_move = (delta < 0 or random.random() < math.exp(-delta / max(T, 1e-10)))
+            # Temperature-dependent overlap rejection.
+            # At HIGH temperature (t_ratio > 0.4), allow SA to explore via normal
+            # Metropolis probability — most exploratory moves create temporary overlaps.
+            # At LOW temperature, hard-reject overlap increases to preserve quality.
+            # The old code hard-rejected at ALL temperatures, causing SA to freeze.
+            if t_ratio < 0.4:
+                if cost_state.overlap_count > current_overlap_count and cost_state.normalized_cost >= best_cost:
+                    accept_move = False
+
+            if accept_move:
                 accepted += 1
-                # v12: Update current overlap tracking
                 current_overlap_count = cost_state.overlap_count
-                # Track best
-                cur_norm = cost_state.normalized_cost
-                if cur_norm < best_cost:
-                    best_cost = cur_norm
-                    best_positions = _save_positions(model, moveable_indices)
-                    best_overlap_count = cost_state.overlap_count
-                    no_improve_count = 0
             else:
-                cost_state.restore(snap)
                 revert_move(model, undo)
+                cost_state.restore(snap)
 
         accept_rate = accepted / max(moves_per_temp, 1)
 
-        # v12: Periodic resync — incremental update drifts from ground truth,
-        # undercounting overlaps by ~30-40 on dense boards. Resync every 5
-        # steps to balance accuracy vs performance.
-        if step > 0 and step % 5 == 0:
+        # Resync every 3 steps for accurate overlap tracking.
+        # Every step is too expensive on large boards. The old_bboxes_from_states
+        # fix makes incremental tracking much more reliable, so 3 steps is
+        # a good balance between accuracy and performance.
+        if step % 3 == 0:
             cost_state._compute_all()
             current_overlap_count = cost_state.overlap_count
 
+            # Update best state using verified cost (after resync)
+            # Use overlap count as tiebreaker: prefer fewer overlaps at same cost
+            verified_cost = cost_state.normalized_cost
+            if (cost_state.overlap_count < best_overlap_count or
+                    (cost_state.overlap_count == best_overlap_count and verified_cost < best_cost)):
+                best_cost = verified_cost
+                best_positions = _save_positions(model, moveable_indices)
+
+            # Update global best across all passes (main + reheats)
+            if (cost_state.overlap_count < global_best_overlap_count or
+                    (cost_state.overlap_count == global_best_overlap_count and verified_cost < global_best_cost)):
+                global_best_cost = verified_cost
+                global_best_positions = _save_positions(model, moveable_indices)
+                global_best_overlap_count = cost_state.overlap_count
+
+            best_overlap_count = cost_state.overlap_count
+            best_overlap_seen = min(best_overlap_seen, cost_state.overlap_count)
+            no_improve_count = 0
+
         if config.verbose and step % 10 == 0:
-            print(f"    T={T:.2f} accept={accept_rate:.2f} cost={cost_state.normalized_cost:.1f} "
+            print(f"    T={T:.2f} accept={accept_rate:.2f} cost={verified_cost:.1f} "
                   f"hpwl={cost_state.hpwl:.1f} overlaps={cost_state.overlap_count}")
 
         # Adaptive cooling
@@ -327,10 +361,6 @@ def _run_sa_pass(
         # Track stall
         no_improve_count += 1
 
-        # v12: Save current state for safe fallback
-        current_positions = _save_positions(model, moveable_indices)
-        current_overlap_count = cost_state.overlap_count
-
         # Early stop when frozen AND stalled
         if accept_rate < config.freeze_threshold and T < t0 * 0.03:
             if config.verbose:
@@ -343,28 +373,16 @@ def _run_sa_pass(
                 print(f"    Stalled at step {step}, no improvement for {no_improve_count} steps")
             break
 
-    # v12: Safe best-state restore
-    # The incremental update can drift from ground truth, so the "best" state
-    # might have more overlaps than expected after _compute_all().  If restoring
-    # "best" gives worse overlaps than the current state, keep current instead.
-    final_positions = _save_positions(model, moveable_indices)
-    final_overlap_count = cost_state.overlap_count
-
-    _restore_positions(model, best_positions)
+    # Restore global best, not just pass-local best. This prevents
+    # reheats from destroying the main pass's best state.
+    _restore_positions(model, global_best_positions)
     cost_state._compute_all()
-    true_best_overlaps = cost_state.overlap_count
 
-    if true_best_overlaps > final_overlap_count:
-        # "Best" state has more overlaps than final — incremental drift made it
-        # look better than it was.  Fall back to the final SA state which is
-        # more reliable (resync'd recently).
-        if config.verbose:
-            print(f"    Best-state restore rejected: {true_best_overlaps} overlaps "
-                  f"(incremental said {best_overlap_count}) vs final {final_overlap_count}")
-        _restore_positions(model, final_positions)
-        cost_state._compute_all()
+    if config.verbose:
+        print(f"    Restored best state: cost={cost_state.normalized_cost:.1f} "
+              f"overlaps={cost_state.overlap_count}")
 
-    return T
+    return T, global_best_cost, global_best_positions, global_best_overlap_count
 
 
 def _greedy_refine(
@@ -620,39 +638,62 @@ def simulate_annealing(
     # Record initial overlap count for hard cap
     initial_overlap_count = cost_state.overlap_count
 
+    density = _compute_density(model)
+    config.penalty_scale_min = max(config.penalty_scale_min, _density_adaptive_penalty_scale(density))
+    config.reheat_count = min(config.reheat_count, _density_adaptive_reheat_count(density))
+
     # Calibrate T0
     t0 = _calibrate_t0(model, cost_state, moveable_indices, config)
     if config.verbose:
-        density = _compute_density(model)
         print(f"  SA: T0={t0:.4f}, {len(moveable_indices)} moveable components, "
               f"density={density:.3f}, penalty_scale_min={config.penalty_scale_min:.2f}")
 
-    # Main SA pass
-    _run_sa_pass(model, cost_state, moveable_indices, t0, config,
-                 initial_overlap_count=initial_overlap_count)
+    # Compute initial cost at penalty_scale=1.0 for fair comparison.
+    # The old code compared initial_cost (at penalty_scale_min, e.g. 0.80)
+    # with final_cost (at penalty_scale=1.0 after greedy), causing false reverts.
+    # Example: initial=1470 @scale=0.80 vs final=1681 @scale=1.0 → ratio=1.14 > 1.10
+    # But at scale=1.0, initial would be ~1840 → ratio=0.91 (improvement!).
+    cost_state.update_penalty_scale(1.0)
+    initial_cost_at_full_scale = cost_state.normalized_cost
+    initial_hpwl_for_revert = cost_state.hpwl
+    cost_state.update_penalty_scale(config.penalty_scale_min)
 
-    # Reheating rounds — v11: fewer for dense boards
+    # Store initial cost at full scale so run_sa can use it for revert logic
+    simulate_annealing._initial_cost_full_scale = initial_cost_at_full_scale
+
+    # Main SA pass — capture global best from each pass
+    _, global_best_cost, global_best_positions, global_best_overlap_count = \
+        _run_sa_pass(model, cost_state, moveable_indices, t0, config,
+                     initial_overlap_count=initial_overlap_count)
+
+    # Reheating rounds — pass global best between reheats
     for reheat_i in range(config.reheat_count):
         reheat_t0 = t0 * config.reheat_ratio * (0.7 ** reheat_i)
         if config.verbose:
             print(f"  Reheat {reheat_i + 1}: T0={reheat_t0:.4f}")
-        _run_sa_pass(
-            model, cost_state, moveable_indices,
-            reheat_t0, config,
-            max_iter_override=config.max_iterations // 3,
-            initial_overlap_count=initial_overlap_count,
-        )
+        _, global_best_cost, global_best_positions, global_best_overlap_count = \
+            _run_sa_pass(
+                model, cost_state, moveable_indices,
+                reheat_t0, config,
+                max_iter_override=config.max_iterations // 3,
+                initial_overlap_count=initial_overlap_count,
+                global_best_cost=global_best_cost,
+                global_best_positions=global_best_positions,
+                global_best_overlap_count=global_best_overlap_count,
+            )
 
     # Greedy refinement
     if config.verbose:
         print("  Greedy refinement...")
     _greedy_refine(model, cost_state, moveable_indices, config)
 
-    # Dedicated overlap resolver
-    if cost_state.overlap_count > 0:
-        if config.verbose:
-            print(f"  Overlap resolution ({cost_state.overlap_count} remaining)...")
-        _resolve_overlaps_greedy(model, cost_state, moveable_indices, config)
+    # NO overlap resolution in SA. The legalizer handles overlaps.
+    # SA overlap resolution destroys HPWL optimization for dense boards
+    # by pushing components far apart to eliminate overlaps, causing
+    # massive cost increase that triggers SA revert.
+    # The legalizer has better context for resolving overlaps.
+    if cost_state.overlap_count > 0 and config.verbose:
+        print(f"  SA leaving {cost_state.overlap_count} overlaps for legalizer to resolve")
 
     final_cost = cost_state.normalized_cost
     if config.verbose:
@@ -669,16 +710,17 @@ def run_sa(
 ) -> dict:
     """High-level entry point: build CostState, get moveable indices, run SA.
 
-    v11: Computes board density and adjusts SA parameters accordingly.
-    Dense boards get higher penalty_scale_min and fewer reheats to
-    prevent SA from destroying the placement.
+    HPWL-based revert policy.
+    Consistent penalty_scale comparison prevents false reverts.
+    Density-adaptive SA parameters.
+    Density-adaptive SA parameters for dense boards.
     """
     if config is None:
         config = SAConfig(verbose=verbose)
     elif verbose and not config.verbose:
         config = SAConfig(**{**config.__dict__, 'verbose': True})
 
-    # v11: Density-adaptive SA parameters
+    # Density-adaptive SA parameters
     density = _compute_density(model)
     adaptive_penalty_min = _density_adaptive_penalty_scale(density)
     adaptive_reheat_count = _density_adaptive_reheat_count(density)
@@ -688,7 +730,7 @@ def run_sa(
         config.penalty_scale_min = adaptive_penalty_min
     if config.reheat_count == 3:  # default value — user didn't override
         config.reheat_count = adaptive_reheat_count
-    # v12: Density-aware overlap cap — tighter for dense boards
+    # Density-aware overlap cap — tighter for dense boards
     if config.overlap_cap_factor == 2.0:  # default value
         if density > 0.35:
             config.overlap_cap_factor = 1.5  # dense: allow 50% increase
@@ -701,19 +743,48 @@ def run_sa(
 
     cost_state = CostState(model, rules=rules)
     moveable_indices = get_moveable_indices(model)
+    cost_state.update_penalty_scale(config.penalty_scale_min)
 
     initial_cost = cost_state.normalized_cost
     initial_hpwl = cost_state.hpwl
+    initial_overlaps = cost_state.overlap_count
 
     # Save pre-SA positions so we can restore if SA makes things worse
     pre_sa_positions = _save_positions(model, moveable_indices)
 
     final_cost = simulate_annealing(model, cost_state, moveable_indices, config)
 
-    # Safety net: if SA+greedy made cost worse, revert to pre-SA state
-    if final_cost > initial_cost:
+    # HPWL-based revert logic
+    final_overlaps = cost_state.overlap_count
+    final_hpwl = cost_state.hpwl
+    overlap_improvement = initial_overlaps - final_overlaps
+    hpwl_ratio = final_hpwl / initial_hpwl if initial_hpwl > 0 else float('inf')
+
+    should_revert = False
+    revert_reason = ""
+
+    if final_overlaps == 0:
+        should_revert = False
+        if config.verbose and final_cost > initial_cost:
+            print(f"  SA kept: 0 overlaps achieved "
+                  f"(cost {initial_cost:.1f} → {final_cost:.1f}, "
+                  f"HPWL {initial_hpwl:.1f} → {final_hpwl:.1f})")
+    elif hpwl_ratio > 2.0:
+        should_revert = True
+        revert_reason = f"HPWL doubled ({initial_hpwl:.1f} → {final_hpwl:.1f})"
+    elif hpwl_ratio > 1.5 and overlap_improvement <= 0:
+        should_revert = True
+        revert_reason = f"HPWL increased {hpwl_ratio:.0%} with no overlap improvement"
+    elif overlap_improvement > 0:
+        if config.verbose and final_cost > initial_cost:
+            print(f"  SA kept: overlaps improved ({initial_overlaps} → {final_overlaps}) "
+                  f"despite cost increase ({initial_cost:.1f} → {final_cost:.1f})")
+    elif final_cost > initial_cost and config.verbose:
+        print(f"  SA kept: cost slightly worse ({initial_cost:.1f} → {final_cost:.1f})")
+
+    if should_revert:
         if config.verbose:
-            print(f"  SA worsened cost ({initial_cost:.1f} → {final_cost:.1f}), reverting to pre-SA positions")
+            print(f"  SA reverted: {revert_reason}")
         _restore_positions(model, pre_sa_positions)
         cost_state._compute_all()
         final_cost = cost_state.normalized_cost

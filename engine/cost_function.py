@@ -186,8 +186,8 @@ class CostFunction:
     def __init__(
         self,
         alpha: float = 1.0,    # HPWL weight
-        beta: float = 5.0,     # Overlap penalty weight
-        gamma: float = 3.0,    # Boundary penalty weight
+        beta: float = 25.0,    # Overlap penalty weight (aligned more closely with SA)
+        gamma: float = 4.0,    # Boundary penalty weight (aligned more closely with SA)
         delta: float = 4.0,    # Constraint penalty weight
         rules: list[ConstraintRule] | None = None,  # Board profile constraint rules
     ):

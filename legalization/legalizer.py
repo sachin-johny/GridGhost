@@ -1,18 +1,7 @@
 """Legalization pass for PCB placement.
 
-v11: Smarter overlap resolution that avoids creating new overlaps.
-Key improvements over v10:
-  - Push-apart checks if it creates new overlaps before accepting
-  - Sorts overlaps by area (smallest first — easier to resolve, less cascade)
-  - Greedy nearest-free-position fallback when push-apart fails
-  - Per-component boundary enforcement with overlap checking
-  - Smarter grid snapping that avoids creating overlaps
-
-Runs AFTER optimization to produce a legal, grid-snapped placement:
-1. Grid snapping — round coordinates to KiCad's placement grid
-2. Boundary enforcement — clamp out-of-bounds components
-3. Overlap resolution — iteratively shift overlapping components apart
-4. Greedy cleanup — move remaining overlapping components to free positions
+This pass runs after optimization to produce a legal, grid-snapped
+placement with boundary enforcement, overlap resolution, and cleanup.
 
 IMPORTANT: Run legalization as a single post-optimization pass,
 NOT iteratively inside the optimizer loop — it would corrupt
@@ -26,6 +15,8 @@ import math
 from typing import Optional
 
 from models.board_model import BoardModel, Component, BoardOutline
+from engine.cost_function import total_hpwl
+from engine.constraint_evaluator import evaluate_constraint_penalties
 
 
 def legalize(
@@ -77,6 +68,14 @@ def legalize(
     remaining = _count_overlaps(model)
     if remaining > 0:
         _greedy_resolve(model, grid_mm, verbose, interior_bbox)
+
+    # Step 7: Final legality pass. The last greedy cleanup can move parts
+    # back out of bounds, so enforce boundaries again before returning.
+    _enforce_boundary(model, interior_bbox)
+    remaining = _count_overlaps(model)
+    if remaining > 0:
+        _greedy_resolve(model, grid_mm, verbose, interior_bbox)
+        _enforce_boundary(model, interior_bbox)
 
     if verbose:
         overlaps_after = _count_overlaps(model)
@@ -260,6 +259,33 @@ def _count_overlaps_involving(
     return count
 
 
+def _legalizer_score(
+    model: BoardModel,
+    moved: list[Component],
+    original_positions: dict[int, tuple[float, float]],
+) -> tuple[float, int, int]:
+    """Score legalization candidates — lower is better.
+
+    Keep overlap count dominant, use overlap area as a tiebreaker.
+    """
+    overlaps = _count_overlaps(model)
+    oob = _count_oob(model)
+    hpwl = total_hpwl(model)
+    overlap_area = _compute_total_overlap_area(model)
+    rules = getattr(model, 'active_rules', None) or []
+    if rules:
+        constraint_total, _ = evaluate_constraint_penalties(model, rules)
+    else:
+        constraint_total = 0.0
+    displacement = 0.0
+    for comp in moved:
+        ox, oy = original_positions.get(id(comp), (comp.x, comp.y))
+        displacement += abs(comp.x - ox) + abs(comp.y - oy)
+    score = (100000.0 * overlaps + 25000.0 * oob + 50.0 * overlap_area
+             + 5.0 * hpwl + 10.0 * constraint_total + displacement)
+    return score, overlaps, oob
+
+
 def _count_pair_overlaps_involving(
     c1: Component,
     c2: Component,
@@ -343,6 +369,9 @@ def _resolve_overlaps(
 
             # Count overlaps involving c1 and c2 before push
             local_before = _count_pair_overlaps_involving(c1, c2, components)
+            moved = [c for c in (c1, c2) if not c.is_fixed and not c.is_edge_connector]
+            original_positions = {id(c1): (old_x1, old_y1), id(c2): (old_x2, old_y2)}
+            base_score, _, _ = _legalizer_score(model, moved, original_positions)
 
             # Try push-apart with full strength
             if c1_fixed:
@@ -358,8 +387,9 @@ def _resolve_overlaps(
 
             # Count overlaps involving c1 and c2 after push
             local_after = _count_pair_overlaps_involving(c1, c2, components)
+            trial_score, _, _ = _legalizer_score(model, moved, original_positions)
 
-            if local_after <= local_before:
+            if local_after <= local_before and trial_score <= base_score:
                 # Push improved or maintained the situation — accept
                 resolved_this_pass += 1
             else:
@@ -379,8 +409,9 @@ def _resolve_overlaps(
                 _enforce_boundary_single(c2, interior_bbox, board)
 
                 local_after_reduced = _count_pair_overlaps_involving(c1, c2, components)
+                trial_score_reduced, _, _ = _legalizer_score(model, moved, original_positions)
 
-                if local_after_reduced <= local_before:
+                if local_after_reduced <= local_before and trial_score_reduced <= base_score:
                     # Reduced push worked
                     resolved_this_pass += 1
                 else:
@@ -464,7 +495,7 @@ def _greedy_resolve(
         by_max = board.y_max
 
     prev_total = _count_overlaps(model)
-    for outer in range(30):  # max 30 outer passes
+    for outer in range(50):  # More passes for dense boards
         total_overlaps = _count_overlaps(model)
         if total_overlaps == 0:
             break
@@ -492,6 +523,8 @@ def _greedy_resolve(
 
             best_x, best_y = old_x, old_y
             best_overlaps = old_overlaps
+            base_score, _, _ = _legalizer_score(model, [comp], {id(comp): (old_x, old_y)})
+            best_score = base_score
 
             # Strategy 1: Try nudging in all directions
             for dx_dir, dy_dir in directions:
@@ -501,8 +534,10 @@ def _greedy_resolve(
                     _enforce_boundary_single(comp, interior_bbox, board)
 
                     new_overlaps = _count_overlaps_involving(comp, components)
-                    if new_overlaps < best_overlaps:
+                    trial_score, _, _ = _legalizer_score(model, [comp], {id(comp): (old_x, old_y)})
+                    if new_overlaps < best_overlaps or (new_overlaps == best_overlaps and trial_score < best_score):
                         best_overlaps = new_overlaps
+                        best_score = trial_score
                         best_x, best_y = comp.x, comp.y
                         if new_overlaps == 0:
                             break
@@ -515,7 +550,7 @@ def _greedy_resolve(
                 comp.x, comp.y = old_x, old_y  # reset
                 half_w = comp.effective_width / 2.0
                 half_h = comp.effective_height / 2.0
-                grid_step = max(comp.effective_width, comp.effective_height, 2.0)
+                grid_step = max(comp.effective_width * 0.5, comp.effective_height * 0.5, 0.5)
 
                 gx = bx_min + half_w
                 while gx <= bx_max - half_w:
@@ -524,10 +559,10 @@ def _greedy_resolve(
                         comp.x = gx
                         comp.y = gy
                         new_overlaps = _count_overlaps_involving(comp, components)
-                        if new_overlaps < best_overlaps:
-                            # Also consider distance from original position (prefer closer)
-                            dist_penalty = abs(gx - old_x) + abs(gy - old_y)
+                        trial_score, _, _ = _legalizer_score(model, [comp], {id(comp): (old_x, old_y)})
+                        if new_overlaps < best_overlaps or (new_overlaps == best_overlaps and trial_score < best_score):
                             best_overlaps = new_overlaps
+                            best_score = trial_score
                             best_x, best_y = comp.x, comp.y
                             if new_overlaps == 0:
                                 break
@@ -537,8 +572,10 @@ def _greedy_resolve(
                     gx += grid_step
 
             comp.x, comp.y = best_x, best_y
-            if best_overlaps < old_overlaps:
+            if best_overlaps < old_overlaps or best_score < base_score:
                 improved = True
+            else:
+                comp.x, comp.y = old_x, old_y
 
         current_total = _count_overlaps(model)
         if current_total >= prev_total and not improved:
@@ -697,3 +734,19 @@ def _count_oob(model: BoardModel) -> int:
         if x1 < board.x_min or x2 > board.x_max or y1 < board.y_min or y2 > board.y_max:
             count += 1
     return count
+
+
+def _compute_total_overlap_area(model: BoardModel) -> float:
+    """Compute total overlap area across all overlapping component pairs.
+
+    Used by _legalizer_score to prevent creating fewer but deeper overlaps.
+    The old score (100000 * overlaps) optimized for count only, causing the
+    legalizer to create 7 overlaps at 309mm² vs 30 at 130mm².
+    """
+    total = 0.0
+    components = list(model.components)
+    for i, c1 in enumerate(components):
+        for c2 in components[i + 1:]:
+            if c1.overlaps(c2):
+                total += c1.overlap_area(c2)
+    return total

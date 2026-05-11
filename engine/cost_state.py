@@ -15,9 +15,10 @@ from models.board_model import BoardModel
 from profiles.board_profiles import ConstraintRule
 from engine.constraint_evaluator import evaluate_constraint_penalties
 
-OVERLAP_WEIGHT = 10.0   # moderate — soft penalty; SA explores, legalizer resolves
-BOUNDARY_WEIGHT = 2.0   # low — HPWL dominates; legalizer handles OOB
+OVERLAP_WEIGHT = 25.0   # stronger — SA should avoid creating overlaps
+BOUNDARY_WEIGHT = 4.0   # stronger — discourage OOB during SA, not just legalization
 CONSTRAINT_WEIGHT = 4.0  # delta — matches BoardProfile default
+OVERLAP_COUNT_WEIGHT = 12.0  # extra penalty per overlapping pair
 
 _POWER_PREFIXES = (
     'GND', 'AGND', 'DGND', 'PGND', 'SGND',
@@ -262,8 +263,16 @@ class CostState:
     # Snapshot / Restore
     # ------------------------------------------------------------------
 
-    def snapshot(self, moved_indices: set[int]) -> dict:
-        """Save state for the given indices so we can restore on rejection."""
+    def snapshot(
+        self,
+        moved_indices: set[int],
+        old_bboxes: dict[int, tuple[float, float, float, float]] | None = None,
+    ) -> dict:
+        """Save state for the given indices so we can restore on rejection.
+
+        Callers may pass pre-move bounding boxes via ``old_bboxes`` when the
+        model has already been mutated by a proposed move. This preserves the
+        spatial index for rejected SA moves."""
         saved_net_hpwl = {
             net_name: self._net_hpwl[net_name]
             for net_name in self._comp_nets_moved(moved_indices)
@@ -274,7 +283,7 @@ class CostState:
             if k[0] in moved_indices or k[1] in moved_indices
         }
         saved_boundary = {i: self._comp_boundary[i] for i in moved_indices}
-        saved_bbox = {i: self._comps[i].bbox for i in moved_indices}
+        saved_bbox = dict(old_bboxes) if old_bboxes is not None else {i: self._comps[i].bbox for i in moved_indices}
 
         return {
             'hpwl': self._hpwl_sum(),
@@ -315,6 +324,24 @@ class CostState:
             self._xmin_items = [(x, idx) for x, idx in self._xmin_items if idx != i]
             insort(self._xmin_items, (bbox[0], i))
 
+    def old_bboxes_from_states(
+        self,
+        old_states: list[tuple[int, float, float, float]],
+    ) -> dict[int, tuple[float, float, float, float]]:
+        """Reconstruct pre-move bounding boxes from MoveUndo state."""
+        result: dict[int, tuple[float, float, float, float]] = {}
+        for idx, old_x, old_y, old_rot in old_states:
+            comp = self._comps[idx]
+            old_width = comp.width if old_rot in (0.0, 180.0) else comp.height
+            old_height = comp.height if old_rot in (0.0, 180.0) else comp.width
+            result[idx] = (
+                old_x - old_width / 2.0,
+                old_y - old_height / 2.0,
+                old_x + old_width / 2.0,
+                old_y + old_height / 2.0,
+            )
+        return result
+
     def _comp_nets_moved(self, moved_indices: set[int]) -> set[str]:
         nets: set[str] = set()
         for i in moved_indices:
@@ -337,7 +364,7 @@ class CostState:
     @property
     def total_cost(self) -> float:
         hpwl = self._hpwl_sum()
-        overlap = OVERLAP_WEIGHT * self._overlap_sum() * self._penalty_scale
+        overlap = (OVERLAP_WEIGHT * self._overlap_sum() + OVERLAP_COUNT_WEIGHT * self.overlap_count) * self._penalty_scale
         boundary = BOUNDARY_WEIGHT * self._boundary_sum() * self._penalty_scale
         constraint = CONSTRAINT_WEIGHT * self._constraint_total * self._penalty_scale
         return hpwl + overlap + boundary + constraint
@@ -347,6 +374,7 @@ class CostState:
         """Unscaled cost for best-solution tracking."""
         return (self._hpwl_sum()
                 + OVERLAP_WEIGHT * self._overlap_sum()
+                + OVERLAP_COUNT_WEIGHT * self.overlap_count
                 + BOUNDARY_WEIGHT * self._boundary_sum()
                 + CONSTRAINT_WEIGHT * self._constraint_total)
 

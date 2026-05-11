@@ -276,7 +276,7 @@ def _extract_board_outline(sexp: list) -> BoardOutline:
         # Default board if no outline found
         return BoardOutline(x_min=0.0, y_min=0.0, x_max=100.0, y_max=100.0)
 
-    margin = 0.5  # Small margin
+    margin = 2.0  # Board outline margin — must leave room for component courtyards
     return BoardOutline(
         x_min=min(points_x) - margin,
         y_min=min(points_y) - margin,
@@ -288,8 +288,10 @@ def _extract_board_outline(sexp: list) -> BoardOutline:
 def _infer_board_from_components(components: list[Component]) -> BoardOutline:
     """Infer a board outline from placed components when Edge.Cuts is absent.
 
-    This keeps the component cluster centered instead of forcing it into the
-    top-left corner of the default 100x100 mm fallback board.
+    Density-aware: when components are tightly packed (density > 0.35),
+    the board is expanded so that the legalizer has room to push components
+    apart without cascading overlaps. For sparse boards, the original 25%
+    padding is retained.
     """
     if not components:
         return BoardOutline(x_min=0.0, y_min=0.0, x_max=100.0, y_max=100.0)
@@ -298,6 +300,7 @@ def _infer_board_from_components(components: list[Component]) -> BoardOutline:
     min_y = float('inf')
     max_x = float('-inf')
     max_y = float('-inf')
+    total_comp_area = 0.0
 
     for comp in components:
         half_w = comp.effective_width / 2.0
@@ -306,8 +309,29 @@ def _infer_board_from_components(components: list[Component]) -> BoardOutline:
         min_y = min(min_y, comp.y - half_h)
         max_x = max(max_x, comp.x + half_w)
         max_y = max(max_y, comp.y + half_h)
+        total_comp_area += comp.effective_width * comp.effective_height
 
-    padding = max(8.0, max(max_x - min_x, max_y - min_y) * 0.25)
+    cluster_w = max(max_x - min_x, 1.0)
+    cluster_h = max(max_y - min_y, 1.0)
+    cluster_area = cluster_w * cluster_h
+
+    default_padding = max(8.0, max(cluster_w, cluster_h) * 0.25)
+
+    TARGET_DENSITY = 0.35
+    needed_area = total_comp_area / TARGET_DENSITY
+
+    if needed_area > cluster_area:
+        a = 4.0
+        b = 2.0 * (cluster_w + cluster_h)
+        c = cluster_area - needed_area
+        disc = b * b - 4.0 * a * c
+        if disc >= 0:
+            density_padding = (-b + math.sqrt(disc)) / (2.0 * a)
+        else:
+            density_padding = 0.0
+        padding = max(default_padding, density_padding)
+    else:
+        padding = default_padding
     return BoardOutline(
         x_min=min_x - padding,
         y_min=min_y - padding,
