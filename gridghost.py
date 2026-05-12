@@ -201,6 +201,11 @@ def cmd_place(args) -> None:
 
     # Step 7: Legalization
     print("Step 7: Running legalization...")
+
+    # Attach active rules to the model so the legalizer's cap-nudge pass
+    # can use the decoupling_proximity constraint parameters.
+    model.active_rules = profile.active_rules()
+
     lcfg = cfg.legalization
     n_total = len(model.components)
     adaptive_max_iter = max(100, min(800, n_total * 5))

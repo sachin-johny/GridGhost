@@ -62,10 +62,19 @@ def _build_decoupling_map(
 ) -> dict[str, list[str]]:
     """Map each IC ref → list of decoupling cap refs that share a power net.
 
-    A decoupling cap is a capacitor that shares at least one non-GND power
-    net with an IC.  If a cap shares power nets with multiple ICs, it is
-    assigned to the IC with the most shared power nets (tie-break: closest
-    initial position).
+    Distributes caps evenly across ICs sharing a power rail.
+
+    When multiple ICs share the same power net (e.g., four op-amps on
+    +3V3), the old code assigned ALL caps on that net to a single IC
+    (whichever came first alphabetically).  This left 3 out of 4 ICs
+    with zero decoupling caps and zero proximity penalty, so the SA
+    had no incentive to keep caps near those ICs.
+
+    The new algorithm:
+    1. For each cap, collect the set of ICs sharing its power net(s).
+    2. Distribute caps round-robin among those ICs, prioritising ICs
+       that currently have the fewest caps assigned.  This ensures
+       every IC gets at least one nearby decoupling cap.
     """
     ic_types = {'ic', 'mcu', 'regulator'}
     ics = [c for c in model.components if getattr(c, 'component_type', '') in ic_types]
@@ -88,7 +97,8 @@ def _build_decoupling_map(
 
     # For each cap, find which ICs share power nets
     ic_refs = {ic.ref for ic in ics}
-    cap_to_ics: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    # cap → set of IC refs that share at least one power net
+    cap_to_ics: dict[str, set[str]] = defaultdict(set)
 
     for net_name, refs in power_nets.items():
         net_ics = refs & ic_refs
@@ -98,13 +108,17 @@ def _build_decoupling_map(
                     if any(c.ref == r and getattr(c, 'component_type', '') == 'capacitor'
                            for c in model.components)}
         for cap_ref in net_caps:
-            for ic_ref in net_ics:
-                cap_to_ics[cap_ref][ic_ref] += 1
+            cap_to_ics[cap_ref].update(net_ics)
 
-    # Assign each cap to its best IC
+    # Distribute caps round-robin: each cap goes to the IC with the
+    # fewest caps currently assigned (among ICs that share its power net).
+    # This ensures every IC gets decoupling caps, not just one.
     ic_caps: dict[str, list[str]] = defaultdict(list)
-    for cap_ref, ic_scores in cap_to_ics.items():
-        best_ic = max(ic_scores, key=lambda r: ic_scores[r])
+    for cap_ref, candidate_ics in cap_to_ics.items():
+        if not candidate_ics:
+            continue
+        # Pick the IC with fewest caps assigned so far
+        best_ic = min(candidate_ics, key=lambda r: len(ic_caps[r]))
         ic_caps[best_ic].append(cap_ref)
 
     return dict(ic_caps)
@@ -140,7 +154,11 @@ def penalty_decoupling_proximity(
                 continue
             dist = _center_distance(ic, cap)
             excess = max(0.0, dist - max_dist)
-            total += excess  # linear ramp (quadratic too aggressive for SA)
+            # Quadratic ramp: gives SA a much stronger gradient to push
+            # caps toward ICs.  Linear excess makes distant caps (70mm)
+            # produce only a weak signal vs HPWL.  With quadratic,
+            # a cap at 70mm (excess=65) contributes 65^2=4225 vs linear 65.
+            total += excess * excess
 
     return total
 

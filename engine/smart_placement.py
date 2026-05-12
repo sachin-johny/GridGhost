@@ -828,12 +828,10 @@ def _optimize_interior_sa(
         new_hpwl = _fast_hpwl()
         new_overlap = _fast_overlap()
         new_constraint = 0.0
-        if rules and it % 5 == 0:  # v9: evaluate constraints less frequently (expensive)
+        if rules:  # evaluate every iteration (was every 5th — stale constraints caused caps to drift)
             from engine.constraint_evaluator import evaluate_constraint_penalties
             new_constraint_raw, _ = evaluate_constraint_penalties(model, rules)
             new_constraint = new_constraint_raw
-        elif rules:
-            new_constraint = constraint  # reuse last value
         new_cost = new_hpwl + overlap_weight * new_overlap + constraint_weight * new_constraint
         delta       = new_cost - cost
 

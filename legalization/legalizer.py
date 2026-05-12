@@ -15,8 +15,7 @@ import math
 from typing import Optional
 
 from models.board_model import BoardModel, Component, BoardOutline
-from engine.cost_function import total_hpwl
-from engine.constraint_evaluator import evaluate_constraint_penalties
+from engine.constraint_evaluator import evaluate_constraint_penalties, _build_decoupling_map
 
 
 def legalize(
@@ -76,6 +75,15 @@ def legalize(
     if remaining > 0:
         _greedy_resolve(model, grid_mm, verbose, interior_bbox)
         _enforce_boundary(model, interior_bbox)
+
+    # Step 8: Constraint-preserving nudge — push decoupling caps back
+    # toward their ICs without creating new overlaps.  The overlap
+    # resolution steps above can push caps far from their ICs, which
+    # defeats the decoupling_proximity constraint that the optimizer
+    # worked hard to satisfy.
+    rules = getattr(model, 'active_rules', None) or []
+    if rules:
+        _nudge_caps_to_ics(model, rules, interior_bbox, verbose)
 
     if verbose:
         overlaps_after = _count_overlaps(model)
@@ -267,10 +275,21 @@ def _legalizer_score(
     """Score legalization candidates — lower is better.
 
     Keep overlap count dominant, use overlap area as a tiebreaker.
+
+    NOTE: HPWL is intentionally excluded from this scoring function.
+    The legalizer's primary job is resolving overlaps and enforcing
+    boundaries — HPWL optimization is handled by the annealer/greedy
+    before legalization. Including total_hpwl() here made the legalizer
+    extremely slow because it's called inside tight inner loops
+    (nudge search: 8 dirs x 13 distances = 104 calls per component;
+     grid sweep: potentially hundreds of calls per component), and
+    each total_hpwl() call does a full O(NxP) recomputation of all
+    nets. With HPWL weight 5.0 vs overlap weight 100000.0 (a 20000:1
+    ratio), HPWL had virtually zero influence on legalizer decisions
+    but dominated runtime.
     """
     overlaps = _count_overlaps(model)
     oob = _count_oob(model)
-    hpwl = total_hpwl(model)
     overlap_area = _compute_total_overlap_area(model)
     rules = getattr(model, 'active_rules', None) or []
     if rules:
@@ -282,7 +301,7 @@ def _legalizer_score(
         ox, oy = original_positions.get(id(comp), (comp.x, comp.y))
         displacement += abs(comp.x - ox) + abs(comp.y - oy)
     score = (100000.0 * overlaps + 25000.0 * oob + 50.0 * overlap_area
-             + 5.0 * hpwl + 10.0 * constraint_total + displacement)
+             + 10.0 * constraint_total + displacement)
     return score, overlaps, oob
 
 
@@ -711,6 +730,139 @@ def _push_apart(c1: Component, c2: Component, strength: float, grid_mm: float) -
         c1.y -= dy * push_y / 2.0
         c2.x += dx * push_x / 2.0
         c2.y += dy * push_y / 2.0
+
+
+def _nudge_caps_to_ics(
+    model: BoardModel,
+    rules: list,
+    interior_bbox: tuple[float, float, float, float] | None = None,
+    verbose: bool = False,
+) -> None:
+    """Nudge decoupling caps toward their associated ICs after legalization.
+
+    Legalization resolves overlaps by pushing components apart, which often
+    moves decoupling caps far from their ICs.  This pass moves caps back
+    toward their ICs in small steps, stopping before creating overlaps
+    or boundary violations.
+
+    The algorithm:
+    1. Build the decoupling map (IC → caps).
+    2. For each cap that's farther than max_distance_mm from its IC,
+       move it toward the IC in small increments.
+    3. Stop if an overlap or boundary violation would occur.
+    4. Repeat for up to 5 passes (caps may need to "wait their turn"
+       as other caps move).
+    """
+    board = model.board
+    components = list(model.components)
+
+    # Find the decoupling_proximity rule params
+    max_dist = 5.0  # default
+    for rule in rules:
+        if rule.name == 'decoupling_proximity':
+            max_dist = rule.params.get('max_distance_mm', 5.0)
+            break
+    else:
+        return  # no decoupling rule — nothing to do
+
+    decap_map = _build_decoupling_map(model)
+    if not decap_map:
+        return
+
+    # Build movable set for overlap checks
+    step_sizes = [2.0, 1.0, 0.5, 0.25, 0.1]
+
+    for pass_num in range(5):
+        any_moved = False
+
+        for ic_ref, cap_refs in decap_map.items():
+            ic = model.get_component(ic_ref)
+            if not ic:
+                continue
+
+            for cap_ref in cap_refs:
+                cap = model.get_component(cap_ref)
+                if not cap:
+                    continue
+                if cap.is_fixed or cap.is_edge_connector:
+                    continue
+
+                dist = math.hypot(ic.x - cap.x, ic.y - cap.y)
+                if dist <= max_dist:
+                    continue  # already close enough
+
+                # Direction from cap toward IC
+                dx = ic.x - cap.x
+                dy = ic.y - cap.y
+                if dx == 0 and dy == 0:
+                    continue
+                length = math.hypot(dx, dy)
+                dx /= length
+                dy /= length
+
+                # Try moving in decreasing step sizes
+                for step in step_sizes:
+                    new_x = cap.x + dx * step
+                    new_y = cap.y + dy * step
+
+                    # Clamp to bounds
+                    half_w = cap.effective_width / 2.0
+                    half_h = cap.effective_height / 2.0
+                    if interior_bbox:
+                        x_min = interior_bbox[0] + half_w
+                        x_max = interior_bbox[2] - half_w
+                        y_min = interior_bbox[1] + half_h
+                        y_max = interior_bbox[3] - half_h
+                    else:
+                        x_min = board.x_min + half_w
+                        x_max = board.x_max - half_w
+                        y_min = board.y_min + half_h
+                        y_max = board.y_max - half_h
+
+                    new_x = max(x_min, min(new_x, x_max))
+                    new_y = max(y_min, min(new_y, y_max))
+
+                    # Check if this move creates overlaps
+                    old_x, old_y = cap.x, cap.y
+                    cap.x = new_x
+                    cap.y = new_y
+
+                    has_overlap = any(
+                        cap.overlaps(other)
+                        for other in components
+                        if other is not cap and not other.is_fixed
+                    )
+
+                    if not has_overlap:
+                        new_dist = math.hypot(ic.x - new_x, ic.y - new_y)
+                        if new_dist < dist:
+                            any_moved = True
+                            break  # accept this step
+                    else:
+                        cap.x = old_x
+                        cap.y = old_y
+
+        if not any_moved:
+            break
+
+    if verbose:
+        # Report remaining violations
+        violations = 0
+        for ic_ref, cap_refs in decap_map.items():
+            ic = model.get_component(ic_ref)
+            if not ic:
+                continue
+            for cap_ref in cap_refs:
+                cap = model.get_component(cap_ref)
+                if not cap:
+                    continue
+                dist = math.hypot(ic.x - cap.x, ic.y - cap.y)
+                if dist > max_dist:
+                    violations += 1
+        if violations > 0:
+            print(f"  Cap-IC nudge: {violations} caps still beyond {max_dist:.0f}mm threshold")
+        else:
+            print(f"  Cap-IC nudge: all caps within {max_dist:.0f}mm of their ICs")
 
 
 def _count_overlaps(model: BoardModel) -> int:
