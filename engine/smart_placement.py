@@ -17,6 +17,8 @@ from typing import Optional, List, Dict, Set, Tuple, TYPE_CHECKING
 
 from engine.net_clustering import cluster_components
 from engine.cost_state import _is_power_net
+from engine.quadratic_placement import quadratic_place
+from engine.congestion import rudy_congestion_penalty
 
 if TYPE_CHECKING:
     from models.board_model import BoardModel, Component, BoardOutline
@@ -284,12 +286,31 @@ def smart_grid_place(
     if interior:
         _place_interior(model, interior, margin, spacing_factor)
 
+    # Phase 2.5: Quadratic analytical placement
+    if interior:
+        quadratic_place(model, margin=margin, n_iterations=3, verbose=False)
+
     # Phase 3: SA optimization (HPWL minimization, no connectors present)
     # v9: reduced iterations — the main SA (annealer.py) does the heavy lifting.
     # This interior SA is a lightweight pre-optimization to give the main SA
     # a better starting point.
     if interior:
-        _optimize_interior_sa(model, interior, margin, n_iter=sa_iterations // 4, rules=rules)
+        board = model.board
+        board_area = board.width * board.height
+        if board_area > 0:
+            comp_area = sum(c.effective_width * c.effective_height for c in interior)
+            density = min(1.0, comp_area / board_area)
+        else:
+            density = 0.0
+        if density > 0.30:
+            sa_n_iter = sa_iterations // 4
+        elif density < 0.20:
+            sa_n_iter = sa_iterations // 8
+        else:
+            t = (density - 0.20) / 0.10
+            sa_n_iter = int(sa_iterations // 8 + t * (sa_iterations // 4 - sa_iterations // 8))
+            sa_n_iter = max(sa_n_iter, sa_iterations // 8)
+        _optimize_interior_sa(model, interior, margin, n_iter=sa_n_iter, rules=rules)
 
     # Phase 3.5: recentre interior cluster in usable board area
     if interior:
@@ -388,7 +409,8 @@ def _place_interior(
         grouped = _group_by_ic_affinity(model, unplaced)
         _place_cluster_grid(grouped, x_min, y_min, x_max, y_max)
 
-    _apply_repulsion(interior, x_min, x_max, y_min, y_max, spacing_factor)
+    _apply_repulsion(interior, x_min, x_max, y_min, y_max, spacing_factor,
+                     max_iterations=30)
 
 
 def _merge_orphan_caps(
@@ -678,9 +700,10 @@ def _apply_repulsion(
     x_min: float, x_max: float,
     y_min: float, y_max: float,
     spacing_factor: float,
+    max_iterations: int = 150,
 ) -> None:
     """Push components apart to reduce overlaps."""
-    for iteration in range(150):
+    for iteration in range(max_iterations):
         moved = False
 
         for i, ca in enumerate(components):
@@ -804,6 +827,17 @@ def _optimize_interior_sa(
         constraint = constraint_raw
 
     cost = hpwl + overlap_weight * overlap + constraint_weight * constraint
+    rudy_active = len(interior) >= 100
+    rudy_weight = 0.2
+    rudy_penalty = 0.0
+    if rudy_active:
+        try:
+            rudy_penalty, _rpeak, _ravg, _roverflow = rudy_congestion_penalty(model)
+        except Exception:
+            rudy_active = False
+            rudy_penalty = 0.0
+    rudy_cost = rudy_weight * rudy_penalty if rudy_active else 0.0
+    cost += rudy_cost
     T       = T_start
     cooling = (T_end / T_start) ** (1.0 / max(n_iter, 1))
     rng     = random.Random(42)
@@ -833,10 +867,19 @@ def _optimize_interior_sa(
             new_constraint_raw, _ = evaluate_constraint_penalties(model, rules)
             new_constraint = new_constraint_raw
         new_cost = new_hpwl + overlap_weight * new_overlap + constraint_weight * new_constraint
+        new_rudy_cost = rudy_cost
+        if rudy_active and it % 50 == 0:
+            try:
+                new_rudy_penalty, _, _, _ = rudy_congestion_penalty(model)
+                new_rudy_cost = rudy_weight * new_rudy_penalty
+            except Exception:
+                new_rudy_cost = rudy_cost
+        new_cost += new_rudy_cost
         delta       = new_cost - cost
 
         if delta < 0 or rng.random() < math.exp(-delta / max(T, 1e-9)):
             cost = new_cost
+            rudy_cost = new_rudy_cost
             constraint = new_constraint
             if cost < best_cost:
                 best_cost = cost

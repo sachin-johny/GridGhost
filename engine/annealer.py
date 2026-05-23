@@ -20,6 +20,7 @@ from engine.moves import (
     do_translate, do_swap, do_rotate, do_median,
     revert_move, affected_indices, MoveUndo,
 )
+from engine.congestion import rudy_congestion_penalty, rudy_gradient_for_comp
 
 
 @dataclass
@@ -38,6 +39,8 @@ class SAConfig:
     overlap_cap_factor: float = 2.0    # reject moves that exceed this * initial overlaps
     verbose: bool = True
     skip_sa: bool = False              # v13: if True, skip global SA, run greedy+swap+greedy only
+    rudy_weight: float = 0.3           # RUDY congestion penalty weight (0 = disabled)
+    rudy_grid_resolution: float = 2.0  # RUDY grid cell size in mm
 
 
 def _compute_density(model: BoardModel) -> float:
@@ -239,6 +242,18 @@ def _run_sa_pass(
     # Current overlap count (incremental, updated each move)
     current_overlap_count = cost_state.overlap_count
 
+    # RUDY congestion state - only for dense boards
+    rudy_active = (config.rudy_weight > 0 and len(model.components) >= 100)
+    rudy_penalty = 0.0
+    rudy_step_counter = 0
+    if rudy_active:
+        try:
+            rudy_penalty, _rudy_peak, _rudy_avg, _rudy_overflow = \
+                rudy_congestion_penalty(model, config.rudy_grid_resolution)
+        except Exception:
+            rudy_active = False
+            rudy_penalty = 0.0
+
     for step in range(max_iter):
         t_ratio = math.log(T + 1.0) / math.log(t0 + 1.0) if t0 > 0 else 0.0
         t_ratio = max(0.0, min(1.0, t_ratio))
@@ -253,8 +268,23 @@ def _run_sa_pass(
         accepted = 0
         for _ in range(moves_per_temp):
             mt = select_move_type(t_ratio)
+            rudy_bias_dx = 0.0
+            rudy_bias_dy = 0.0
+            if rudy_active and mt == 'translate':
+                _bias_idx = random.choice(moveable_indices)
+                _bias_comp = model.components[_bias_idx]
+                try:
+                    rudy_bias_dx, rudy_bias_dy = rudy_gradient_for_comp(
+                        _bias_comp, model, config.rudy_grid_resolution)
+                    bias_scale = window * 0.05
+                    rudy_bias_dx *= bias_scale
+                    rudy_bias_dy *= bias_scale
+                except Exception:
+                    rudy_bias_dx = 0.0
+                    rudy_bias_dy = 0.0
             if mt == 'translate':
-                undo = do_translate(model, moveable_indices, t_ratio, window)
+                undo = do_translate(model, moveable_indices, t_ratio, window,
+                                    bias_dx=rudy_bias_dx, bias_dy=rudy_bias_dy)
             elif mt == 'swap':
                 undo = do_swap(model, moveable_indices)
             elif mt == 'rotate':
@@ -316,6 +346,18 @@ def _run_sa_pass(
 
         accept_rate = accepted / max(moves_per_temp, 1)
 
+        if rudy_active:
+            rudy_step_counter += 1
+            if rudy_step_counter >= 50:
+                rudy_step_counter = 0
+                try:
+                    rudy_penalty, _rudy_peak, _rudy_avg, _rudy_overflow = \
+                        rudy_congestion_penalty(model, config.rudy_grid_resolution)
+                except Exception:
+                    rudy_penalty = 0.0
+
+        rudy_cost = rudy_penalty * config.rudy_weight if rudy_active else 0.0
+
         # Resync every 3 steps for accurate overlap tracking.
         # Every step is too expensive on large boards. The old_bboxes_from_states
         # fix makes incremental tracking much more reliable, so 3 steps is
@@ -328,13 +370,13 @@ def _run_sa_pass(
             # Use overlap count as tiebreaker: prefer fewer overlaps at same cost
             verified_cost = cost_state.normalized_cost
             if (cost_state.overlap_count < best_overlap_count or
-                    (cost_state.overlap_count == best_overlap_count and verified_cost < best_cost)):
+                    (cost_state.overlap_count == best_overlap_count and verified_cost + rudy_cost < best_cost)):
                 best_cost = verified_cost
                 best_positions = _save_positions(model, moveable_indices)
 
             # Update global best across all passes (main + reheats)
             if (cost_state.overlap_count < global_best_overlap_count or
-                    (cost_state.overlap_count == global_best_overlap_count and verified_cost < global_best_cost)):
+                    (cost_state.overlap_count == global_best_overlap_count and verified_cost + rudy_cost < global_best_cost)):
                 global_best_cost = verified_cost
                 global_best_positions = _save_positions(model, moveable_indices)
                 global_best_overlap_count = cost_state.overlap_count
@@ -692,9 +734,7 @@ def _try_single_swap(
         if cost_state.overlap_count > prev_overlap_count:
             # Both overlap — revert fully
             c_a.x, c_a.y, c_a.rotation = old_ax, old_ay, old_arot
-            c_a._update_trig()
             c_b.x, c_b.y, c_b.rotation = old_bx, old_by, old_brot
-            c_b._update_trig()
             cost_state.incremental_update({idx_a, idx_b})
             return False
 
@@ -702,9 +742,7 @@ def _try_single_swap(
             return True
         else:
             c_a.x, c_a.y, c_a.rotation = old_ax, old_ay, old_arot
-            c_a._update_trig()
             c_b.x, c_b.y, c_b.rotation = old_bx, old_by, old_brot
-            c_b._update_trig()
             cost_state.incremental_update({idx_a, idx_b})
             return False
 
@@ -741,9 +779,7 @@ def _try_single_swap(
             return True
         else:
             c_a.x, c_a.y, c_a.rotation = old_ax, old_ay, old_arot
-            c_a._update_trig()
             c_b.x, c_b.y, c_b.rotation = old_bx, old_by, old_brot
-            c_b._update_trig()
             cost_state.incremental_update({idx_a, idx_b})
             return False
 

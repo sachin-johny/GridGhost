@@ -32,74 +32,122 @@ class Pad:
 
 @dataclass
 class Component:
-    """A placed or unplaced component on the board."""
-    ref: str                    # Reference designator (e.g. "U1", "R3")
-    footprint: str = ""        # Footprint library ID (e.g. "Package_QFP:LQFP-48")
-    value: str = ""            # Component value (e.g. "STM32F103C8T6")
-    x: float = 0.0            # Position X in mm
-    y: float = 0.0            # Position Y in mm
-    rotation: float = 0.0     # Rotation in degrees (discrete: 0, 90, 180, 270)
-    layer: str = "top"        # "top" or "bottom"
-    width: float = 0.0        # Bounding box width in mm
-    height: float = 0.0       # Bounding box height in mm
-    courtyard_margin: float = 0.25  # Courtyard margin in mm (default 0.25mm per KiCad convention)
-    bbox_offset_x: float = 0.0  # Offset from footprint origin to bbox center (mm)
-    bbox_offset_y: float = 0.0  # Offset from footprint origin to bbox center (mm)
-    pads: list[Pad] = field(default_factory=list)
-    nets: list[str] = field(default_factory=list)  # Net names connected to this component
-    is_fixed: bool = False    # If True, position should not be changed by optimizer
-    component_type: str = "generic"  # "ic", "capacitor", "resistor", "connector", "crystal", "generic"
+    """A placed or unplaced component on the board.
 
-    # Cached trig values (set by _update_trig)
+    Cached bbox / effective_width / effective_height. Position and rotation
+    changes mark the cache dirty so the next read recomputes.
+    """
+    ref: str
+    footprint: str = ""
+    value: str = ""
+    x: float = 0.0
+    y: float = 0.0
+    rotation: float = 0.0
+    layer: str = "top"
+    width: float = 0.0
+    height: float = 0.0
+    courtyard_margin: float = 0.25
+    bbox_offset_x: float = 0.0
+    bbox_offset_y: float = 0.0
+    pads: list[Pad] = field(default_factory=list)
+    nets: list[str] = field(default_factory=list)
+    is_fixed: bool = False
+    component_type: str = "generic"
+
     _cos_a: float = field(default=1.0, repr=False, compare=False)
     _sin_a: float = field(default=0.0, repr=False, compare=False)
 
-    def __post_init__(self):
-        self._update_trig()
+    # Cached computed values (invalidated when x/y/rotation change)
+    _dirty: bool = field(default=True, repr=False, compare=False)
+    _cached_bbox: tuple = field(default=None, repr=False, compare=False)
+    _cached_eff_w: float = field(default=0.0, repr=False, compare=False)
+    _cached_eff_h: float = field(default=0.0, repr=False, compare=False)
+    _cached_rot90: bool = field(default=False, repr=False, compare=False)
+    _courtyard_w: float = field(default=0.0, repr=False, compare=False)
+    _courtyard_h: float = field(default=0.0, repr=False, compare=False)
+    _courtyard_rot_w: float = field(default=0.0, repr=False, compare=False)
+    _courtyard_rot_h: float = field(default=0.0, repr=False, compare=False)
 
-    def _update_trig(self):
-        rad = math.radians(self.rotation)
-        self._cos_a = math.cos(rad)
-        self._sin_a = -math.sin(rad)  # KiCad uses clockwise-positive rotation
+    _POSITION_FIELDS = frozenset({'x', 'y', 'rotation', 'bbox_offset_x', 'bbox_offset_y'})
+
+    def __post_init__(self):
+        self._update_courtyard_sizes()
+        self._dirty = True
+
+    def __setattr__(self, name: str, value) -> None:
+        super().__setattr__(name, value)
+        if name in Component._POSITION_FIELDS:
+            super().__setattr__('_dirty', True)
+            if name == 'rotation':
+                rad = math.radians(value)
+                super().__setattr__('_cos_a', math.cos(rad))
+                super().__setattr__('_sin_a', -math.sin(rad))
+
+    def _update_courtyard_sizes(self):
+        self._courtyard_w = self.width + 2 * self.courtyard_margin
+        self._courtyard_h = self.height + 2 * self.courtyard_margin
+        self._courtyard_rot_w = self.height + 2 * self.courtyard_margin
+        self._courtyard_rot_h = self.width + 2 * self.courtyard_margin
+
+    def _recompute_cache(self):
+        rot90 = int(self.rotation) % 180 == 90
+        self._cached_rot90 = rot90
+        if rot90:
+            self._cached_eff_w = self._courtyard_rot_w
+            self._cached_eff_h = self._courtyard_rot_h
+        else:
+            self._cached_eff_w = self._courtyard_w
+            self._cached_eff_h = self._courtyard_h
+        half_w = self._cached_eff_w / 2.0
+        half_h = self._cached_eff_h / 2.0
+        cx = self.x + self.bbox_offset_x * self._cos_a - self.bbox_offset_y * self._sin_a
+        cy = self.y + self.bbox_offset_x * self._sin_a + self.bbox_offset_y * self._cos_a
+        self._cached_bbox = (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+        self._dirty = False
 
     def set_rotation(self, angle: float):
         self.rotation = angle % 360.0
-        self._update_trig()
 
     @property
     def _is_rotated_90(self) -> bool:
-        return int(self.rotation) % 180 == 90
+        if self._dirty:
+            self._recompute_cache()
+        return self._cached_rot90
 
     @property
     def bbox(self) -> tuple[float, float, float, float]:
-        half_w = self.effective_width / 2.0
-        half_h = self.effective_height / 2.0
-        cx = self.x + self.bbox_offset_x * self._cos_a - self.bbox_offset_y * self._sin_a
-        cy = self.y + self.bbox_offset_x * self._sin_a + self.bbox_offset_y * self._cos_a
-        return (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+        if self._dirty:
+            self._recompute_cache()
+        return self._cached_bbox
 
     @property
     def effective_width(self) -> float:
-        if self._is_rotated_90:
-            return self.height + 2 * self.courtyard_margin
-        return self.width + 2 * self.courtyard_margin
+        if self._dirty:
+            self._recompute_cache()
+        return self._cached_eff_w
 
     @property
     def effective_height(self) -> float:
-        if self._is_rotated_90:
-            return self.width + 2 * self.courtyard_margin
-        return self.height + 2 * self.courtyard_margin
+        if self._dirty:
+            self._recompute_cache()
+        return self._cached_eff_h
 
     def overlaps(self, other: Component) -> bool:
-        """Check if this component's courtyard overlaps with another."""
-        ax1, ay1, ax2, ay2 = self.bbox
-        bx1, by1, bx2, by2 = other.bbox
+        if self._dirty:
+            self._recompute_cache()
+        if other._dirty:
+            other._recompute_cache()
+        ax1, ay1, ax2, ay2 = self._cached_bbox
+        bx1, by1, bx2, by2 = other._cached_bbox
         return not (ax2 <= bx1 or bx2 <= ax1 or ay2 <= by1 or by2 <= ay1)
 
     def overlap_area(self, other: Component) -> float:
-        """Compute the overlap area between this component and another."""
-        ax1, ay1, ax2, ay2 = self.bbox
-        bx1, by1, bx2, by2 = other.bbox
+        if self._dirty:
+            self._recompute_cache()
+        if other._dirty:
+            other._recompute_cache()
+        ax1, ay1, ax2, ay2 = self._cached_bbox
+        bx1, by1, bx2, by2 = other._cached_bbox
         ox1 = max(ax1, bx1)
         oy1 = max(ay1, by1)
         ox2 = min(ax2, bx2)

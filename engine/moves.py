@@ -55,14 +55,16 @@ def do_translate(
     moveable_indices: list[int],
     t_ratio: float,
     window_mm: float,
+    bias_dx: float = 0.0,
+    bias_dy: float = 0.0,
 ) -> MoveUndo:
     """Pick a random component and apply a random displacement."""
     idx = random.choice(moveable_indices)
     comp = model.components[idx]
     old = (idx, comp.x, comp.y, comp.rotation)
 
-    dx = random.uniform(-window_mm, window_mm)
-    dy = random.uniform(-window_mm, window_mm)
+    dx = random.uniform(-window_mm, window_mm) + bias_dx
+    dy = random.uniform(-window_mm, window_mm) + bias_dy
     comp.x += dx
     comp.y += dy
 

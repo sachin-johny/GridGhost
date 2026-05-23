@@ -1,11 +1,8 @@
 """Legalization pass for PCB placement.
 
-This pass runs after optimization to produce a legal, grid-snapped
-placement with boundary enforcement, overlap resolution, and cleanup.
-
-IMPORTANT: Run legalization as a single post-optimization pass,
-NOT iteratively inside the optimizer loop — it would corrupt
-gradient/energy signals.
+Produces a legal, grid-snapped placement with boundary enforcement,
+overlap resolution, and cleanup. Uses spatial grid acceleration,
+HPWL-aware tiebreaking, rotation awareness, and Abacus row-based DP.
 """
 
 from __future__ import annotations
@@ -14,8 +11,9 @@ import re
 import math
 from typing import Optional
 
-from models.board_model import BoardModel, Component, BoardOutline
+from models.board_model import BoardModel, Component, BoardOutline, Net, Pad
 from engine.constraint_evaluator import evaluate_constraint_penalties, _build_decoupling_map
+from legalization.spatial_grid import SpatialGrid, compute_overlap_stats_fast, count_overlaps_involving_fast, count_pair_overlaps_involving_fast
 
 
 def legalize(
@@ -25,86 +23,94 @@ def legalize(
     push_strength: float = 1,
     verbose: bool = False,
     interior_bbox: tuple[float, float, float, float] | None = None,
+    use_abacus: bool = False,
 ) -> BoardModel:
-    """Full legalization pipeline.
+    rules = getattr(model, 'active_rules', None) or []
+    cached_decap_map = _build_decoupling_map(model) if rules else {}
 
-    Args:
-        model: Board model with optimized but potentially illegal positions
-        grid_mm: Grid size in mm (0.1mm or 0.05mm typical for KiCad)
-        max_iterations: Max iterations for overlap resolution (300 for dense designs)
-        push_strength: How far to push overlapping components (fraction of overlap, 0.8 is aggressive)
-        verbose: Print progress information
-        interior_bbox: Optional (x_min, y_min, x_max, y_max) to clamp interior
-            components inside, keeping them away from edge connectors.
+    grid = SpatialGrid.from_components(list(model.components), model.board)
 
-    Returns:
-        BoardModel with legalized component positions
-    """
     if verbose:
-        overlaps_before = _count_overlaps(model)
+        overlaps_before, _ = _compute_overlap_stats(model, grid)
         oob_before = _count_oob(model)
         print(f"Legalization input: {overlaps_before} overlaps, {oob_before} out-of-bounds")
 
-    # Step 1: Snap to grid (overlap-aware)
+    # Step 1: Snap to grid (overlap-aware + rotation-aware)
     _snap_to_grid(model, grid_mm)
+    grid.build(list(model.components))
 
     # Step 2: Enforce board boundary
     _enforce_boundary(model, interior_bbox)
+    grid.build(list(model.components))
 
-    # Step 3: Resolve overlaps (smart push-apart + greedy fallback)
-    _resolve_overlaps(model, max_iterations, push_strength, grid_mm, verbose, interior_bbox)
+    # Step 2.5: Try Abacus row-based DP legalization first
+    abacus_success = False
+    if use_abacus:
+        from legalization.abacus_legalizer import abacus_legalize
+        abacus_success = abacus_legalize(
+            model, grid_mm=grid_mm, verbose=verbose,
+            interior_bbox=interior_bbox,
+            cached_decap_map=cached_decap_map,
+        )
+        if verbose:
+            if abacus_success:
+                print("  Abacus resolved all overlaps - skipping push-apart")
+            else:
+                print("  Abacus left overlaps - falling through to push-apart + greedy")
 
-    # Step 4: Greedy cleanup for any remaining overlaps
-    remaining = _count_overlaps(model)
+    # Step 3: Resolve overlaps (only if Abacus didn't fully resolve)
+    if not abacus_success:
+        _resolve_overlaps(model, max_iterations, push_strength, grid_mm, verbose, interior_bbox, cached_decap_map, grid)
+
+    # Step 4: Greedy cleanup
+    remaining, _ = _compute_overlap_stats(model, grid)
     if remaining > 0:
-        _greedy_resolve(model, grid_mm, verbose, interior_bbox)
+        _greedy_resolve(model, grid_mm, verbose, interior_bbox, cached_decap_map, grid)
 
     # Step 5: Final grid snap and boundary check
     _snap_to_grid(model, grid_mm)
     _enforce_boundary(model, interior_bbox)
+    grid.build(list(model.components))
 
-    # Step 6: Final greedy cleanup (grid snap may have created overlaps)
-    remaining = _count_overlaps(model)
+    # Step 6: Final greedy cleanup
+    remaining, _ = _compute_overlap_stats(model, grid)
     if remaining > 0:
-        _greedy_resolve(model, grid_mm, verbose, interior_bbox)
+        _greedy_resolve(model, grid_mm, verbose, interior_bbox, cached_decap_map, grid)
 
-    # Step 7: Final legality pass. The last greedy cleanup can move parts
-    # back out of bounds, so enforce boundaries again before returning.
+    # Step 7: Final legality pass
     _enforce_boundary(model, interior_bbox)
-    remaining = _count_overlaps(model)
+    grid.build(list(model.components))
+    remaining, _ = _compute_overlap_stats(model, grid)
     if remaining > 0:
-        _greedy_resolve(model, grid_mm, verbose, interior_bbox)
+        _greedy_resolve(model, grid_mm, verbose, interior_bbox, cached_decap_map, grid)
         _enforce_boundary(model, interior_bbox)
+        grid.build(list(model.components))
 
-    # Step 8: Constraint-preserving nudge — push decoupling caps back
-    # toward their ICs without creating new overlaps.  The overlap
-    # resolution steps above can push caps far from their ICs, which
-    # defeats the decoupling_proximity constraint that the optimizer
-    # worked hard to satisfy.
-    rules = getattr(model, 'active_rules', None) or []
+    # Step 8: Cap nudge
     if rules:
-        _nudge_caps_to_ics(model, rules, interior_bbox, verbose)
+        _nudge_caps_to_ics(model, rules, interior_bbox, verbose, cached_decap_map, grid)
+
+    # Step 9: Post-legalization HPWL recovery (cell sliding + pair swap)
+    from legalization.post_legalize import post_legalization_refine
+    post_legalization_refine(model, grid_mm, interior_bbox, verbose, cached_decap_map)
 
     if verbose:
-        overlaps_after = _count_overlaps(model)
+        overlaps_after, _ = _compute_overlap_stats(model, grid)
         oob_after = _count_oob(model)
         print(f"Legalization output: {overlaps_after} overlaps, {oob_after} out-of-bounds")
 
     return model
 
 
-def _snap_to_grid(model: BoardModel, grid_mm: float) -> None:
-    """Round all component positions to the nearest grid point.
+def _is_non_square(comp: Component) -> bool:
+    return abs(comp.width - comp.height) > 0.01
 
-    v11: Overlap-aware grid snapping. After snapping each component,
-    check if it now overlaps with any previously-snapped component.
-    If so, try adjacent grid points to find a non-overlapping snap.
-    """
+
+def _snap_to_grid(model: BoardModel, grid_mm: float) -> None:
     components = list(model.components)
-    snapped_positions = []  # list of (comp, old_x, old_y) for already-snapped
+    snapped_positions = []
 
     for comp in components:
-        # Skip fixed components AND edge connectors
         if comp.is_fixed or comp.is_edge_connector:
             continue
 
@@ -112,8 +118,8 @@ def _snap_to_grid(model: BoardModel, grid_mm: float) -> None:
         new_x = round(old_x / grid_mm) * grid_mm
         new_y = round(old_y / grid_mm) * grid_mm
         comp.rotation = round(comp.rotation / 90.0) * 90.0
+        snapped_rot = comp.rotation
 
-        # Check if snapping created overlaps with already-snapped components
         comp.x = new_x
         comp.y = new_y
 
@@ -123,8 +129,8 @@ def _snap_to_grid(model: BoardModel, grid_mm: float) -> None:
         )
 
         if has_overlap:
-            # Try adjacent grid points
-            best_x, best_y = old_x, old_y  # fallback: keep original
+            best_x, best_y = old_x, old_y
+            best_rot = snapped_rot
             best_overlaps = 999
 
             for dx in [-grid_mm, 0, grid_mm]:
@@ -147,13 +153,51 @@ def _snap_to_grid(model: BoardModel, grid_mm: float) -> None:
                 if best_overlaps == 0:
                     break
 
+            # Try 90° rotation for non-square components
+            if best_overlaps > 0 and _is_non_square(comp):
+                rot_alt = (snapped_rot + 90) % 360
+                comp.set_rotation(rot_alt)
+
+                comp.x = new_x
+                comp.y = new_y
+                rot_overlaps = sum(
+                    1 for other, _, _ in snapped_positions
+                    if comp.overlaps(other)
+                )
+                if rot_overlaps < best_overlaps:
+                    best_overlaps = rot_overlaps
+                    best_x, best_y = new_x, new_y
+                    best_rot = rot_alt
+
+                for dx in [-grid_mm, 0, grid_mm]:
+                    for dy in [-grid_mm, 0, grid_mm]:
+                        if dx == 0 and dy == 0:
+                            continue
+                        comp.x = new_x + dx
+                        comp.y = new_y + dy
+                        overlap_count = sum(
+                            1 for other, _, _ in snapped_positions
+                            if comp.overlaps(other)
+                        )
+                        if overlap_count < best_overlaps:
+                            best_overlaps = overlap_count
+                            best_x, best_y = comp.x, comp.y
+                            best_rot = rot_alt
+                            if overlap_count == 0:
+                                break
+                    if best_overlaps == 0:
+                        break
+
+                if best_rot != rot_alt:
+                    comp.set_rotation(snapped_rot)
+
             if best_overlaps > 0:
-                # No adjacent grid point avoids overlap — keep original position
                 comp.x = old_x
                 comp.y = old_y
             else:
                 comp.x = best_x
                 comp.y = best_y
+            comp.rotation = best_rot
 
         snapped_positions.append((comp, old_x, old_y))
 
@@ -162,13 +206,6 @@ def _enforce_boundary(
     model: BoardModel,
     interior_bbox: tuple[float, float, float, float] | None = None,
 ) -> None:
-    """Clamp component positions so their bounding boxes stay within bounds.
-
-    v11: Overlap-aware boundary enforcement. When clamping would create
-    a new overlap, try sliding along the boundary to find a non-overlapping
-    position. If no such position exists, still clamp (out-of-bounds is
-    worse than overlapping).
-    """
     board = model.board
     components = list(model.components)
 
@@ -177,24 +214,71 @@ def _enforce_boundary(
             continue
 
         old_x, old_y = comp.x, comp.y
+        old_rot = comp.rotation
         _enforce_boundary_single(comp, interior_bbox, board)
 
-        # Check if clamping created new overlaps
-        if comp.x != old_x or comp.y != old_y:
+        # Rotation-aware: if still OOB and non-square, try 90°
+        if _is_non_square(comp):
+            bbox = comp.bbox
+            still_oob = (bbox[0] < board.x_min or bbox[2] > board.x_max
+                         or bbox[1] < board.y_min or bbox[3] > board.y_max)
+            if interior_bbox and not still_oob:
+                still_oob = (bbox[0] < interior_bbox[0] or bbox[2] > interior_bbox[2]
+                             or bbox[1] < interior_bbox[1] or bbox[3] > interior_bbox[3])
+            if still_oob:
+                rot_alt = (comp.rotation + 90) % 360
+                comp.set_rotation(rot_alt)
+                alt_half_w = comp.effective_width / 2.0
+                alt_half_h = comp.effective_height / 2.0
+                if interior_bbox:
+                    alt_x_min = interior_bbox[0] + alt_half_w
+                    alt_x_max = interior_bbox[2] - alt_half_w
+                    alt_y_min = interior_bbox[1] + alt_half_h
+                    alt_y_max = interior_bbox[3] - alt_half_h
+                else:
+                    alt_x_min = board.x_min + alt_half_w
+                    alt_x_max = board.x_max - alt_half_w
+                    alt_y_min = board.y_min + alt_half_h
+                    alt_y_max = board.y_max - alt_half_h
+                if alt_x_min <= alt_x_max and alt_y_min <= alt_y_max:
+                    comp.x = max(alt_x_min, min(comp.x, alt_x_max))
+                    comp.y = max(alt_y_min, min(comp.y, alt_y_max))
+                    rot_overlaps = sum(1 for other in components
+                                       if other is not comp and comp.overlaps(other))
+                    if rot_overlaps <= 2:
+                        continue
+                    else:
+                        comp.set_rotation(old_rot)
+                        # Recompute bounds for original rotation
+                        half_w = comp.effective_width / 2.0
+                        half_h = comp.effective_height / 2.0
+                        if interior_bbox:
+                            x_min_b = interior_bbox[0] + half_w
+                            x_max_b = interior_bbox[2] - half_w
+                            y_min_b = interior_bbox[1] + half_h
+                            y_max_b = interior_bbox[3] - half_h
+                        else:
+                            x_min_b = board.x_min + half_w
+                            x_max_b = board.x_max - half_w
+                            y_min_b = board.y_min + half_h
+                            y_max_b = board.y_max - half_h
+                        comp.x = max(x_min_b, min(comp.x, x_max_b))
+                        comp.y = max(y_min_b, min(comp.y, y_max_b))
+                else:
+                    comp.set_rotation(old_rot)
+
+        if comp.x != old_x or comp.y != old_y or comp.rotation != old_rot:
             overlap_count = sum(1 for other in components
                                 if other is not comp and comp.overlaps(other))
             if overlap_count > 0:
-                # Try sliding along boundary to reduce overlaps
                 best_x, best_y = comp.x, comp.y
+                best_rot = comp.rotation
                 best_overlaps = overlap_count
 
-                # Try small adjustments along the boundary
                 for delta in [0.1, 0.2, 0.5, 1.0, 2.0, 3.0, 5.0]:
                     for dx_dir, dy_dir in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
                         trial_x = comp.x + dx_dir * delta
                         trial_y = comp.y + dy_dir * delta
-
-                        # Keep within bounds
                         half_w = comp.effective_width / 2.0
                         half_h = comp.effective_height / 2.0
                         if interior_bbox:
@@ -207,10 +291,8 @@ def _enforce_boundary(
                             x_max = board.x_max - half_w
                             y_min = board.y_min + half_h
                             y_max = board.y_max - half_h
-
                         trial_x = max(x_min, min(trial_x, x_max))
                         trial_y = max(y_min, min(trial_y, y_max))
-
                         comp.x = trial_x
                         comp.y = trial_y
                         trial_overlaps = sum(1 for other in components
@@ -232,12 +314,10 @@ def _enforce_boundary_single(
     interior_bbox: tuple[float, float, float, float] | None,
     board: BoardOutline,
 ) -> None:
-    """Clamp a single component to board/interior bounds."""
     if comp.is_fixed or comp.is_edge_connector:
         return
     half_w = comp.effective_width / 2.0
     half_h = comp.effective_height / 2.0
-
     if interior_bbox:
         x_min = interior_bbox[0] + half_w
         x_max = interior_bbox[2] - half_w
@@ -248,16 +328,16 @@ def _enforce_boundary_single(
         x_max = board.x_max - half_w
         y_min = board.y_min + half_h
         y_max = board.y_max - half_h
-
     comp.x = max(x_min, min(comp.x, x_max))
     comp.y = max(y_min, min(comp.y, y_max))
 
 
 def _count_overlaps_involving(
-    comp: Component,
-    components: list[Component],
+    comp: Component, components: list[Component],
+    grid: SpatialGrid | None = None,
 ) -> int:
-    """Count overlaps involving comp with any other component."""
+    if grid is not None:
+        return count_overlaps_involving_fast(comp, components, grid)
     count = 0
     for other in components:
         if other is comp:
@@ -267,30 +347,68 @@ def _count_overlaps_involving(
     return count
 
 
+def _compute_overlap_stats(model: BoardModel, grid: SpatialGrid | None = None) -> tuple[int, float]:
+    if grid is not None:
+        return compute_overlap_stats_fast(model, grid)
+    count = 0
+    total_area = 0.0
+    components = model.components
+    for i, c1 in enumerate(components):
+        for c2 in components[i + 1:]:
+            if c1.overlaps(c2):
+                count += 1
+                total_area += c1.overlap_area(c2)
+    return count, total_area
+
+
+def _build_comp_net_lookup(model: BoardModel) -> dict[str, list[Net]]:
+    comp_nets: dict[str, list[Net]] = {}
+    for net in model.nets:
+        for ref, _pad_name in net.pins:
+            if ref not in comp_nets:
+                comp_nets[ref] = []
+            comp_nets[ref].append(net)
+    return comp_nets
+
+
+def _compute_local_hpwl(
+    comp: Component, comp_nets: dict[str, list[Net]], model: BoardModel,
+) -> float:
+    total = 0.0
+    nets = comp_nets.get(comp.ref, [])
+    comp_map = {c.ref: c for c in model.components}
+    for net in nets:
+        from engine.cost_state import _is_power_net
+        if _is_power_net(net.name):
+            continue
+        pins = []
+        for ref, pad_name in net.pins:
+            other = comp_map.get(ref)
+            if not other:
+                continue
+            for pad in other.pads:
+                if pad.pad_name == pad_name:
+                    abs_x, abs_y = pad.absolute_pos(other.x, other.y, other.rotation)
+                    pins.append((abs_x, abs_y))
+                    break
+            else:
+                pins.append((other.x, other.y))
+        if len(pins) < 2:
+            continue
+        xs = [p[0] for p in pins]
+        ys = [p[1] for p in pins]
+        total += (max(xs) - min(xs)) + (max(ys) - min(ys))
+    return total
+
+
 def _legalizer_score(
-    model: BoardModel,
-    moved: list[Component],
+    model: BoardModel, moved: list[Component],
     original_positions: dict[int, tuple[float, float]],
+    cached_decap_map: dict | None = None,
+    grid: SpatialGrid | None = None,
 ) -> tuple[float, int, int]:
-    """Score legalization candidates — lower is better.
-
-    Keep overlap count dominant, use overlap area as a tiebreaker.
-
-    NOTE: HPWL is intentionally excluded from this scoring function.
-    The legalizer's primary job is resolving overlaps and enforcing
-    boundaries — HPWL optimization is handled by the annealer/greedy
-    before legalization. Including total_hpwl() here made the legalizer
-    extremely slow because it's called inside tight inner loops
-    (nudge search: 8 dirs x 13 distances = 104 calls per component;
-     grid sweep: potentially hundreds of calls per component), and
-    each total_hpwl() call does a full O(NxP) recomputation of all
-    nets. With HPWL weight 5.0 vs overlap weight 100000.0 (a 20000:1
-    ratio), HPWL had virtually zero influence on legalizer decisions
-    but dominated runtime.
-    """
-    overlaps = _count_overlaps(model)
+    overlaps, overlap_area = _compute_overlap_stats(model, grid)
     oob = _count_oob(model)
-    overlap_area = _compute_total_overlap_area(model)
     rules = getattr(model, 'active_rules', None) or []
     if rules:
         constraint_total, _ = evaluate_constraint_penalties(model, rules)
@@ -306,11 +424,11 @@ def _legalizer_score(
 
 
 def _count_pair_overlaps_involving(
-    c1: Component,
-    c2: Component,
-    components: list[Component],
+    c1: Component, c2: Component, components: list[Component],
+    grid: SpatialGrid | None = None,
 ) -> int:
-    """Count overlaps involving c1 or c2 with any other component."""
+    if grid is not None:
+        return count_pair_overlaps_involving_fast(c1, c2, components, grid)
     count = 0
     for other in components:
         if other is c1 or other is c2:
@@ -319,52 +437,61 @@ def _count_pair_overlaps_involving(
             count += 1
         if c2.overlaps(other):
             count += 1
-    # Also count c1-c2 overlap
     if c1.overlaps(c2):
         count += 1
     return count
 
 
 def _resolve_overlaps(
-    model: BoardModel,
-    max_iterations: int,
-    push_strength: float,
-    grid_mm: float,
-    verbose: bool,
+    model: BoardModel, max_iterations: int, push_strength: float,
+    grid_mm: float, verbose: bool,
     interior_bbox: tuple[float, float, float, float] | None = None,
+    cached_decap_map: dict | None = None,
+    grid: SpatialGrid | None = None,
 ) -> None:
-    """Iteratively resolve component overlaps by pushing components apart.
-
-    v11: Smart push-apart that avoids creating new overlaps.
-    - Sorts overlaps by area (smallest first — easier to resolve)
-    - Only accepts pushes that reduce local overlap count
-    - Tries reduced strength if full push creates new overlaps
-    - Falls back to greedy resolution for stubborn overlaps
-    """
     board = model.board
     prev_overlap_count = float("inf")
     stall_iterations = 0
     adaptive_strength = push_strength
 
     for iteration in range(max_iterations):
-        # Collect all overlapping pairs with their overlap areas
         overlap_pairs = []
         components = list(model.components)
         components.sort(key=lambda c: (c.x, c.y))
 
-        for i, c1 in enumerate(components):
-            for c2 in components[i + 1:]:
-                if not c1.overlaps(c2):
-                    continue
-
-                # Cannot resolve if both are fixed or both are edge connectors
-                c1_fixed = c1.is_fixed or c1.is_edge_connector
-                c2_fixed = c2.is_fixed or c2.is_edge_connector
-                if c1_fixed and c2_fixed:
-                    continue
-
-                area = c1.overlap_area(c2)
-                overlap_pairs.append((area, c1, c2, c1_fixed, c2_fixed))
+        if grid is not None:
+            grid.build(components)
+            seen: set[tuple[int, int]] = set()
+            for i in range(len(components)):
+                c1 = components[i]
+                candidates = grid.query_overlaps(i, components)
+                for j in candidates:
+                    if j <= i:
+                        continue
+                    pair = (i, j)
+                    if pair in seen:
+                        continue
+                    seen.add(pair)
+                    c2 = components[j]
+                    if not c1.overlaps(c2):
+                        continue
+                    c1_fixed = c1.is_fixed or c1.is_edge_connector
+                    c2_fixed = c2.is_fixed or c2.is_edge_connector
+                    if c1_fixed and c2_fixed:
+                        continue
+                    area = c1.overlap_area(c2)
+                    overlap_pairs.append((area, c1, c2, c1_fixed, c2_fixed))
+        else:
+            for i, c1 in enumerate(components):
+                for c2 in components[i + 1:]:
+                    if not c1.overlaps(c2):
+                        continue
+                    c1_fixed = c1.is_fixed or c1.is_edge_connector
+                    c2_fixed = c2.is_fixed or c2.is_edge_connector
+                    if c1_fixed and c2_fixed:
+                        continue
+                    area = c1.overlap_area(c2)
+                    overlap_pairs.append((area, c1, c2, c1_fixed, c2_fixed))
 
         overlap_count = len(overlap_pairs)
 
@@ -373,26 +500,18 @@ def _resolve_overlaps(
                 print(f"  Overlap resolution converged in {iteration + 1} iterations")
             break
 
-        # Sort by overlap area (smallest first — easier to resolve, less cascade)
         overlap_pairs.sort(key=lambda x: x[0])
 
         resolved_this_pass = 0
         for area, c1, c2, c1_fixed, c2_fixed in overlap_pairs:
-            # Re-check if they still overlap (previous resolves may have fixed this)
             if not c1.overlaps(c2):
                 continue
 
-            # Save positions before push
             old_x1, old_y1 = c1.x, c1.y
             old_x2, old_y2 = c2.x, c2.y
 
-            # Count overlaps involving c1 and c2 before push
-            local_before = _count_pair_overlaps_involving(c1, c2, components)
-            moved = [c for c in (c1, c2) if not c.is_fixed and not c.is_edge_connector]
-            original_positions = {id(c1): (old_x1, old_y1), id(c2): (old_x2, old_y2)}
-            base_score, _, _ = _legalizer_score(model, moved, original_positions)
+            local_before = _count_pair_overlaps_involving(c1, c2, components, grid)
 
-            # Try push-apart with full strength
             if c1_fixed:
                 _push_apart_one(c2, c1, adaptive_strength, grid_mm, board=board)
             elif c2_fixed:
@@ -400,19 +519,37 @@ def _resolve_overlaps(
             else:
                 _push_apart(c1, c2, adaptive_strength, grid_mm)
 
-            # Apply boundary enforcement for pushed components only
             _enforce_boundary_single(c1, interior_bbox, board)
             _enforce_boundary_single(c2, interior_bbox, board)
 
-            # Count overlaps involving c1 and c2 after push
-            local_after = _count_pair_overlaps_involving(c1, c2, components)
-            trial_score, _, _ = _legalizer_score(model, moved, original_positions)
+            local_after = _count_pair_overlaps_involving(c1, c2, components, grid)
 
-            if local_after <= local_before and trial_score <= base_score:
-                # Push improved or maintained the situation — accept
+            if local_after < local_before:
                 resolved_this_pass += 1
+            elif local_after == local_before:
+                moved = [c for c in (c1, c2) if not c.is_fixed and not c.is_edge_connector]
+                original_positions = {id(c1): (old_x1, old_y1), id(c2): (old_x2, old_y2)}
+                base_score, _, _ = _legalizer_score(model, moved, original_positions, cached_decap_map, grid)
+
+                c1.x, c1.y = old_x1, old_y1
+                c2.x, c2.y = old_x2, old_y2
+                pre_score, _, _ = _legalizer_score(model, moved, original_positions, cached_decap_map, grid)
+
+                if c1_fixed:
+                    _push_apart_one(c2, c1, adaptive_strength, grid_mm, board=board)
+                elif c2_fixed:
+                    _push_apart_one(c1, c2, adaptive_strength, grid_mm, board=board)
+                else:
+                    _push_apart(c1, c2, adaptive_strength, grid_mm)
+                _enforce_boundary_single(c1, interior_bbox, board)
+                _enforce_boundary_single(c2, interior_bbox, board)
+
+                if base_score <= pre_score:
+                    resolved_this_pass += 1
+                else:
+                    c1.x, c1.y = old_x1, old_y1
+                    c2.x, c2.y = old_x2, old_y2
             else:
-                # Push made things worse — try with reduced strength
                 c1.x, c1.y = old_x1, old_y1
                 c2.x, c2.y = old_x2, old_y2
 
@@ -427,25 +564,17 @@ def _resolve_overlaps(
                 _enforce_boundary_single(c1, interior_bbox, board)
                 _enforce_boundary_single(c2, interior_bbox, board)
 
-                local_after_reduced = _count_pair_overlaps_involving(c1, c2, components)
-                trial_score_reduced, _, _ = _legalizer_score(model, moved, original_positions)
-
-                if local_after_reduced <= local_before and trial_score_reduced <= base_score:
-                    # Reduced push worked
+                local_after_reduced = _count_pair_overlaps_involving(c1, c2, components, grid)
+                if local_after_reduced <= local_before:
                     resolved_this_pass += 1
                 else:
-                    # Still worse — undo completely and skip
                     c1.x, c1.y = old_x1, old_y1
                     c2.x, c2.y = old_x2, old_y2
                     continue
 
-        # Global boundary enforcement
         _enforce_boundary(model, interior_bbox)
+        actual_overlap_count, _ = _compute_overlap_stats(model, grid)
 
-        # Count actual overlaps
-        actual_overlap_count = _count_overlaps(model)
-
-        # Detect stalling and increase push strength
         if actual_overlap_count >= prev_overlap_count:
             stall_iterations += 1
             if stall_iterations >= 8:
@@ -461,7 +590,6 @@ def _resolve_overlaps(
                 print(f"  Overlap resolution converged in {iteration + 1} iterations")
             break
 
-        # If no progress after many iterations, break early — greedy will handle it
         if stall_iterations >= 20:
             if verbose:
                 print(f"  Push-apart stalled at iteration {iteration + 1} "
@@ -469,39 +597,30 @@ def _resolve_overlaps(
             break
     else:
         if verbose:
+            remaining, _ = _compute_overlap_stats(model, grid)
             print(f"  Overlap resolution: max iterations ({max_iterations}) reached, "
-                  f"{_count_overlaps(model)} overlaps remaining")
+                  f"{remaining} overlaps remaining")
 
 
 def _greedy_resolve(
-    model: BoardModel,
-    grid_mm: float,
-    verbose: bool,
+    model: BoardModel, grid_mm: float, verbose: bool,
     interior_bbox: tuple[float, float, float, float] | None = None,
+    cached_decap_map: dict | None = None,
+    grid: SpatialGrid | None = None,
 ) -> None:
-    """Greedy overlap resolution: move overlapping components to nearest free positions.
-
-    This is the fallback when push-apart can't resolve all overlaps.
-    For each overlapping component, search nearby positions for a spot
-    that minimizes overlaps. Includes a grid-sweep search for finding
-    free positions on dense boards.
-
-    Strategy:
-    1. Find the component with the most overlaps
-    2. Try nudging it in all directions at various distances
-    3. If nudging fails, try sweeping a grid of positions across the board
-    4. Accept the position that minimizes its overlap count
-    5. Repeat until no overlaps remain or no improvement possible
-    """
     board = model.board
     components = list(model.components)
     movable = [c for c in components if not c.is_fixed and not c.is_edge_connector]
     directions = [(1, 0), (-1, 0), (0, 1), (0, -1),
                   (1, 1), (-1, 1), (1, -1), (-1, -1)]
-    nudge_dists = [grid_mm, grid_mm * 2, grid_mm * 5, grid_mm * 10,
-                   0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0]
 
-    # Compute board bounds for grid sweep
+    max_nudge = max(board.width, board.height) * 0.15
+    nudge_dists = [grid_mm, grid_mm * 2, grid_mm * 5, grid_mm * 10,
+                   0.5, 1.0, 2.0, 4.0, 8.0, 12.0]
+    nudge_dists.extend([d for d in [16.0, 24.0, 32.0] if d <= max_nudge])
+
+    comp_net_lookup = _build_comp_net_lookup(model)
+
     if interior_bbox:
         bx_min = interior_bbox[0]
         bx_max = interior_bbox[2]
@@ -513,60 +632,85 @@ def _greedy_resolve(
         by_min = board.y_min
         by_max = board.y_max
 
-    prev_total = _count_overlaps(model)
-    for outer in range(50):  # More passes for dense boards
-        total_overlaps = _count_overlaps(model)
+    prev_total, _ = _compute_overlap_stats(model, grid)
+    for outer in range(50):
+        total_overlaps, _ = _compute_overlap_stats(model, grid)
         if total_overlaps == 0:
             break
 
-        # Find overlapping components and their overlap counts
         overlap_counts: dict[int, int] = {}
         for idx, c in enumerate(movable):
-            count = _count_overlaps_involving(c, components)
+            count = _count_overlaps_involving(c, components, grid)
             if count > 0:
                 overlap_counts[id(c)] = count
 
         if not overlap_counts:
             break
 
-        # Sort by overlap count (most overlapping first)
         movable_with_overlaps = [c for c in movable if id(c) in overlap_counts]
         movable_with_overlaps.sort(key=lambda c: overlap_counts[id(c)], reverse=True)
 
         improved = False
         for comp in movable_with_overlaps:
             old_x, old_y = comp.x, comp.y
+            old_rot = comp.rotation
             old_overlaps = overlap_counts.get(id(comp), 0)
             if old_overlaps == 0:
                 continue
 
-            best_x, best_y = old_x, old_y
+            orig_local_hpwl = _compute_local_hpwl(comp, comp_net_lookup, model)
+
+            best_x, best_y, best_rot = old_x, old_y, old_rot
             best_overlaps = old_overlaps
-            base_score, _, _ = _legalizer_score(model, [comp], {id(comp): (old_x, old_y)})
-            best_score = base_score
+            best_local_hpwl = orig_local_hpwl
+            best_displacement = 0.0
 
-            # Strategy 1: Try nudging in all directions
-            for dx_dir, dy_dir in directions:
-                for dist in nudge_dists:
-                    comp.x = old_x + dx_dir * dist
-                    comp.y = old_y + dy_dir * dist
-                    _enforce_boundary_single(comp, interior_bbox, board)
+            is_nonsquare = _is_non_square(comp)
+            rotations_to_try = [old_rot]
+            if is_nonsquare:
+                rotations_to_try.append((old_rot + 90) % 360)
 
-                    new_overlaps = _count_overlaps_involving(comp, components)
-                    trial_score, _, _ = _legalizer_score(model, [comp], {id(comp): (old_x, old_y)})
-                    if new_overlaps < best_overlaps or (new_overlaps == best_overlaps and trial_score < best_score):
-                        best_overlaps = new_overlaps
-                        best_score = trial_score
-                        best_x, best_y = comp.x, comp.y
-                        if new_overlaps == 0:
-                            break
+            for try_rot in rotations_to_try:
+                if try_rot != old_rot:
+                    comp.set_rotation(try_rot)
+                comp.x, comp.y = old_x, old_y
+
+                rot_penalty = 0.0 if comp.rotation == old_rot else 0.1
+
+                for dx_dir, dy_dir in directions:
+                    for dist in nudge_dists:
+                        comp.x = old_x + dx_dir * dist
+                        comp.y = old_y + dy_dir * dist
+                        _enforce_boundary_single(comp, interior_bbox, board)
+
+                        new_overlaps = _count_overlaps_involving(comp, components, grid)
+                        if new_overlaps < best_overlaps:
+                            best_overlaps = new_overlaps
+                            best_x, best_y = comp.x, comp.y
+                            best_rot = comp.rotation
+                            best_local_hpwl = _compute_local_hpwl(comp, comp_net_lookup, model)
+                            best_displacement = abs(comp.x - old_x) + abs(comp.y - old_y)
+                            if new_overlaps == 0:
+                                break
+                        elif new_overlaps == best_overlaps:
+                            trial_hpwl = _compute_local_hpwl(comp, comp_net_lookup, model)
+                            trial_disp = abs(comp.x - old_x) + abs(comp.y - old_y)
+                            best_rot_penalty = 0.0 if best_rot == old_rot else 0.1
+                            if (trial_hpwl + rot_penalty < best_local_hpwl + best_rot_penalty or
+                                    (trial_hpwl + rot_penalty == best_local_hpwl + best_rot_penalty
+                                     and trial_disp < best_displacement)):
+                                best_local_hpwl = trial_hpwl
+                                best_displacement = trial_disp
+                                best_x, best_y = comp.x, comp.y
+                                best_rot = comp.rotation
+                    if best_overlaps == 0:
+                        break
+
                 if best_overlaps == 0:
                     break
 
-            # Strategy 2: If nudging didn't resolve, try grid sweep
-            # Search a coarse grid across the board for a free position
-            if best_overlaps > 0:
-                comp.x, comp.y = old_x, old_y  # reset
+                # Grid sweep
+                comp.x, comp.y = old_x, old_y
                 half_w = comp.effective_width / 2.0
                 half_h = comp.effective_height / 2.0
                 grid_step = max(comp.effective_width * 0.5, comp.effective_height * 0.5, 0.5)
@@ -577,52 +721,66 @@ def _greedy_resolve(
                     while gy <= by_max - half_h:
                         comp.x = gx
                         comp.y = gy
-                        new_overlaps = _count_overlaps_involving(comp, components)
-                        trial_score, _, _ = _legalizer_score(model, [comp], {id(comp): (old_x, old_y)})
-                        if new_overlaps < best_overlaps or (new_overlaps == best_overlaps and trial_score < best_score):
+                        new_overlaps = _count_overlaps_involving(comp, components, grid)
+                        if new_overlaps < best_overlaps:
                             best_overlaps = new_overlaps
-                            best_score = trial_score
                             best_x, best_y = comp.x, comp.y
+                            best_rot = comp.rotation
+                            best_local_hpwl = _compute_local_hpwl(comp, comp_net_lookup, model)
+                            best_displacement = abs(comp.x - old_x) + abs(comp.y - old_y)
                             if new_overlaps == 0:
                                 break
+                        elif new_overlaps == best_overlaps:
+                            trial_hpwl = _compute_local_hpwl(comp, comp_net_lookup, model)
+                            trial_disp = abs(comp.x - old_x) + abs(comp.y - old_y)
+                            best_rot_penalty = 0.0 if best_rot == old_rot else 0.1
+                            if (trial_hpwl + rot_penalty < best_local_hpwl + best_rot_penalty or
+                                    (trial_hpwl + rot_penalty == best_local_hpwl + best_rot_penalty
+                                     and trial_disp < best_displacement)):
+                                best_local_hpwl = trial_hpwl
+                                best_displacement = trial_disp
+                                best_x, best_y = comp.x, comp.y
+                                best_rot = comp.rotation
                         gy += grid_step
                     if best_overlaps == 0:
                         break
                     gx += grid_step
 
+                if best_overlaps == 0:
+                    break
+
+                comp.x, comp.y = old_x, old_y
+                if try_rot != old_rot:
+                    comp.set_rotation(old_rot)
+
             comp.x, comp.y = best_x, best_y
-            if best_overlaps < old_overlaps or best_score < base_score:
+            if comp.rotation != best_rot:
+                comp.set_rotation(best_rot)
+
+            if best_overlaps < old_overlaps:
+                improved = True
+            elif best_overlaps == old_overlaps and best_local_hpwl < orig_local_hpwl:
                 improved = True
             else:
                 comp.x, comp.y = old_x, old_y
+                if comp.rotation != old_rot:
+                    comp.set_rotation(old_rot)
 
-        current_total = _count_overlaps(model)
+        current_total, _ = _compute_overlap_stats(model, grid)
         if current_total >= prev_total and not improved:
             break
         prev_total = current_total
 
     if verbose:
-        final = _count_overlaps(model)
+        final, _ = _compute_overlap_stats(model, grid)
         if final > 0:
             print(f"  Greedy resolution: {final} overlaps remaining (board may be too dense)")
 
 
 def _push_apart_one(
-    movable: Component,
-    fixed: Component,
-    strength: float,
-    grid_mm: float,
-    board: BoardOutline | None = None,
+    movable: Component, fixed: Component, strength: float,
+    grid_mm: float, board: BoardOutline | None = None,
 ) -> None:
-    """Push the movable component away from a fixed component (edge connector).
-
-    Args:
-        movable: Component to move (interior component)
-        fixed: Fixed component to move away from (edge connector on perimeter)
-        strength: Multiplier for push distance
-        grid_mm: Minimum movement (1.5x grid unit)
-    """
-    # Compute overlap on each axis
     ax1, ay1, ax2, ay2 = movable.bbox
     bx1, by1, bx2, by2 = fixed.bbox
 
@@ -630,14 +788,10 @@ def _push_apart_one(
     overlap_y = min(ay2, by2) - max(ay1, by1)
 
     if overlap_x <= 0 or overlap_y <= 0:
-        return  # No actual overlap
+        return
 
-    # Ensure minimum push distance = 1.5x grid unit to guarantee progress
     push_mm = max(grid_mm * 1.5, 0.15)
 
-    # Edge connectors live on the perimeter, so move interior parts toward the
-    # board center instead of letting the generic minimum-overlap axis push them
-    # sideways into another perimeter part.
     if board is not None and fixed.is_edge_connector:
         board_cx = (board.x_min + board.x_max) / 2.0
         board_cy = (board.y_min + board.y_max) / 2.0
@@ -652,7 +806,6 @@ def _push_apart_one(
             movable.y += center_dy * push_y
         return
 
-    # Push along axis of minimum separation for minimal displacement
     if overlap_x <= overlap_y:
         push_x = max(overlap_x * strength, push_mm)
         push_y = 0
@@ -660,7 +813,6 @@ def _push_apart_one(
         push_x = 0
         push_y = max(overlap_y * strength, push_mm)
 
-    # Determine push direction: move movable away from fixed
     dx = 1 if movable.x >= fixed.x else -1
     dy = 1 if movable.y >= fixed.y else -1
 
@@ -669,17 +821,6 @@ def _push_apart_one(
 
 
 def _push_apart(c1: Component, c2: Component, strength: float, grid_mm: float) -> None:
-    """Push two overlapping components apart along axis of minimum separation.
-
-    The direction is chosen to minimize displacement (push along axis
-    where overlap is smallest). For severe overlaps, pushes on both axes.
-
-    Args:
-        c1, c2: Overlapping components
-        strength: Multiplier for push distance
-        grid_mm: Minimum movement (1.5x grid unit)
-    """
-    # Compute overlap on each axis
     ax1, ay1, ax2, ay2 = c1.bbox
     bx1, by1, bx2, by2 = c2.bbox
 
@@ -687,37 +828,29 @@ def _push_apart(c1: Component, c2: Component, strength: float, grid_mm: float) -
     overlap_y = min(ay2, by2) - max(ay1, by1)
 
     if overlap_x <= 0 or overlap_y <= 0:
-        return  # No actual overlap
+        return
 
-    # For severe overlaps (>70% of smaller dimension), push on both axes
     c1_min = min(c1.effective_width, c1.effective_height)
     c2_min = min(c2.effective_width, c2.effective_height)
     severity_threshold = 0.7 * min(c1_min, c2_min)
 
     push_both = (overlap_x > severity_threshold) or (overlap_y > severity_threshold)
 
-    # Ensure minimum push distance = 1.5x grid unit to guarantee progress
     push_mm = max(grid_mm * 1.5, 0.15)
 
-    # Calculate push distances
     if push_both:
-        # Push along diagonal (both axes) for severe overlap
         push_x = max(overlap_x * strength * 0.5, push_mm)
         push_y = max(overlap_y * strength * 0.5, push_mm)
     elif overlap_x <= overlap_y:
-        # Push along X axis (smaller overlap)
         push_x = max(overlap_x * strength, push_mm)
         push_y = 0
     else:
-        # Push along Y axis (smaller overlap)
         push_x = 0
         push_y = max(overlap_y * strength, push_mm)
 
-    # Determine push direction based on relative positions
     dx = 1 if c2.x >= c1.x else -1
     dy = 1 if c2.y >= c1.y else -1
 
-    # Apply push
     if c1.is_fixed and not c2.is_fixed:
         c2.x += dx * push_x
         c2.y += dy * push_y
@@ -725,7 +858,6 @@ def _push_apart(c1: Component, c2: Component, strength: float, grid_mm: float) -
         c1.x -= dx * push_x
         c1.y -= dy * push_y
     else:
-        # Split push between both components
         c1.x -= dx * push_x / 2.0
         c1.y -= dy * push_y / 2.0
         c2.x += dx * push_x / 2.0
@@ -733,43 +865,27 @@ def _push_apart(c1: Component, c2: Component, strength: float, grid_mm: float) -
 
 
 def _nudge_caps_to_ics(
-    model: BoardModel,
-    rules: list,
+    model: BoardModel, rules: list,
     interior_bbox: tuple[float, float, float, float] | None = None,
     verbose: bool = False,
+    cached_decap_map: dict | None = None,
+    grid: SpatialGrid | None = None,
 ) -> None:
-    """Nudge decoupling caps toward their associated ICs after legalization.
-
-    Legalization resolves overlaps by pushing components apart, which often
-    moves decoupling caps far from their ICs.  This pass moves caps back
-    toward their ICs in small steps, stopping before creating overlaps
-    or boundary violations.
-
-    The algorithm:
-    1. Build the decoupling map (IC → caps).
-    2. For each cap that's farther than max_distance_mm from its IC,
-       move it toward the IC in small increments.
-    3. Stop if an overlap or boundary violation would occur.
-    4. Repeat for up to 5 passes (caps may need to "wait their turn"
-       as other caps move).
-    """
     board = model.board
     components = list(model.components)
 
-    # Find the decoupling_proximity rule params
-    max_dist = 5.0  # default
+    max_dist = 5.0
     for rule in rules:
         if rule.name == 'decoupling_proximity':
             max_dist = rule.params.get('max_distance_mm', 5.0)
             break
     else:
-        return  # no decoupling rule — nothing to do
+        return
 
-    decap_map = _build_decoupling_map(model)
+    decap_map = cached_decap_map if cached_decap_map is not None else _build_decoupling_map(model)
     if not decap_map:
         return
 
-    # Build movable set for overlap checks
     step_sizes = [2.0, 1.0, 0.5, 0.25, 0.1]
 
     for pass_num in range(5):
@@ -789,9 +905,8 @@ def _nudge_caps_to_ics(
 
                 dist = math.hypot(ic.x - cap.x, ic.y - cap.y)
                 if dist <= max_dist:
-                    continue  # already close enough
+                    continue
 
-                # Direction from cap toward IC
                 dx = ic.x - cap.x
                 dy = ic.y - cap.y
                 if dx == 0 and dy == 0:
@@ -800,53 +915,76 @@ def _nudge_caps_to_ics(
                 dx /= length
                 dy /= length
 
-                # Try moving in decreasing step sizes
-                for step in step_sizes:
-                    new_x = cap.x + dx * step
-                    new_y = cap.y + dy * step
+                cap_start_x, cap_start_y = cap.x, cap.y
+                cap_start_rot = cap.rotation
+                cap_nonsquare = _is_non_square(cap)
+                best_result = None
 
-                    # Clamp to bounds
-                    half_w = cap.effective_width / 2.0
-                    half_h = cap.effective_height / 2.0
-                    if interior_bbox:
-                        x_min = interior_bbox[0] + half_w
-                        x_max = interior_bbox[2] - half_w
-                        y_min = interior_bbox[1] + half_h
-                        y_max = interior_bbox[3] - half_h
-                    else:
-                        x_min = board.x_min + half_w
-                        x_max = board.x_max - half_w
-                        y_min = board.y_min + half_h
-                        y_max = board.y_max - half_h
+                rotations = [cap_start_rot]
+                if cap_nonsquare:
+                    rotations.append((cap_start_rot + 90) % 360)
 
-                    new_x = max(x_min, min(new_x, x_max))
-                    new_y = max(y_min, min(new_y, y_max))
+                for try_rot in rotations:
+                    if try_rot != cap_start_rot:
+                        cap.set_rotation(try_rot)
 
-                    # Check if this move creates overlaps
-                    old_x, old_y = cap.x, cap.y
-                    cap.x = new_x
-                    cap.y = new_y
+                    for step in step_sizes:
+                        new_x = cap_start_x + dx * step
+                        new_y = cap_start_y + dy * step
 
-                    has_overlap = any(
-                        cap.overlaps(other)
-                        for other in components
-                        if other is not cap and not other.is_fixed
-                    )
+                        half_w = cap.effective_width / 2.0
+                        half_h = cap.effective_height / 2.0
+                        if interior_bbox:
+                            x_min = interior_bbox[0] + half_w
+                            x_max = interior_bbox[2] - half_w
+                            y_min = interior_bbox[1] + half_h
+                            y_max = interior_bbox[3] - half_h
+                        else:
+                            x_min = board.x_min + half_w
+                            x_max = board.x_max - half_w
+                            y_min = board.y_min + half_h
+                            y_max = board.y_max - half_h
 
-                    if not has_overlap:
-                        new_dist = math.hypot(ic.x - new_x, ic.y - new_y)
-                        if new_dist < dist:
-                            any_moved = True
-                            break  # accept this step
-                    else:
-                        cap.x = old_x
-                        cap.y = old_y
+                        new_x = max(x_min, min(new_x, x_max))
+                        new_y = max(y_min, min(new_y, y_max))
+
+                        cap.x = new_x
+                        cap.y = new_y
+
+                        has_overlap = any(
+                            cap.overlaps(other)
+                            for other in components
+                            if other is not cap and not other.is_fixed
+                        )
+
+                        if not has_overlap:
+                            new_dist = math.hypot(ic.x - new_x, ic.y - new_y)
+                            if new_dist < dist:
+                                if (best_result is None or new_dist < best_result[3]
+                                        or (new_dist == best_result[3]
+                                            and try_rot == cap_start_rot
+                                            and best_result[2] != cap_start_rot)):
+                                    best_result = (new_x, new_y, try_rot, new_dist)
+                                break
+                        else:
+                            cap.x = cap_start_x
+                            cap.y = cap_start_y
+
+                    cap.x, cap.y = cap_start_x, cap_start_y
+                    if try_rot != cap_start_rot:
+                        cap.set_rotation(cap_start_rot)
+
+                if best_result is not None:
+                    cap.x = best_result[0]
+                    cap.y = best_result[1]
+                    if cap.rotation != best_result[2]:
+                        cap.set_rotation(best_result[2])
+                    any_moved = True
 
         if not any_moved:
             break
 
     if verbose:
-        # Report remaining violations
         violations = 0
         for ic_ref, cap_refs in decap_map.items():
             ic = model.get_component(ic_ref)
@@ -866,17 +1004,11 @@ def _nudge_caps_to_ics(
 
 
 def _count_overlaps(model: BoardModel) -> int:
-    """Count overlapping component pairs."""
-    count = 0
-    for i, c1 in enumerate(model.components):
-        for c2 in model.components[i + 1:]:
-            if c1.overlaps(c2):
-                count += 1
+    count, _ = _compute_overlap_stats(model)
     return count
 
 
 def _count_oob(model: BoardModel) -> int:
-    """Count out-of-bounds components, excluding edge connectors."""
     count = 0
     board = model.board
     for comp in model.components:
@@ -889,16 +1021,5 @@ def _count_oob(model: BoardModel) -> int:
 
 
 def _compute_total_overlap_area(model: BoardModel) -> float:
-    """Compute total overlap area across all overlapping component pairs.
-
-    Used by _legalizer_score to prevent creating fewer but deeper overlaps.
-    The old score (100000 * overlaps) optimized for count only, causing the
-    legalizer to create 7 overlaps at 309mm² vs 30 at 130mm².
-    """
-    total = 0.0
-    components = list(model.components)
-    for i, c1 in enumerate(components):
-        for c2 in components[i + 1:]:
-            if c1.overlaps(c2):
-                total += c1.overlap_area(c2)
-    return total
+    _, total_area = _compute_overlap_stats(model)
+    return total_area
