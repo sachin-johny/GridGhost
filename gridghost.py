@@ -114,7 +114,13 @@ def cmd_place(args) -> None:
 
     # Step 2: Select board profile
     print("Step 2: Selecting board profile...")
-    profile = get_profile(args.profile)
+    profile_name = args.profile
+    if profile_name == "auto":
+        ic_types = {'ic', 'mcu', 'regulator'}
+        has_ics = any(getattr(c, 'component_type', '') in ic_types for c in model.components)
+        profile_name = "mcu_peripheral" if has_ics else "generic"
+        print(f"  Auto-detected: {'MCU/peripheral (ICs found)' if has_ics else 'generic (no ICs)'}")
+    profile = get_profile(profile_name)
     print(f"  Profile: {profile.display_name}")
     print(f"  Weights: alpha={profile.alpha}, beta={profile.beta}, gamma={profile.gamma}, delta={profile.delta}")
     if profile.active_rules():
@@ -342,9 +348,9 @@ def main():
     p_place.add_argument("input", help="Path to .kicad_pcb file")
     p_place.add_argument("-o", "--output", help="Output .kicad_pcb path")
     p_place.add_argument(
-        "-p", "--profile", default="generic",
-        choices=["mcu_peripheral", "power_supply", "rf_frontend", "mixed_signal", "generic", "small_board"],
-        help="Board profile (default: generic)",
+        "-p", "--profile", default="auto",
+        choices=["auto", "mcu_peripheral", "power_supply", "rf_frontend", "mixed_signal", "generic", "small_board"],
+        help="Board profile (default: auto — selects mcu_peripheral if ICs detected, otherwise generic)",
     )
     p_place.add_argument("-a", "--algorithm", default="grid", choices=ALGORITHMS,
                          help="Placement algorithm (default: grid)")
