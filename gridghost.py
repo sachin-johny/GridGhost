@@ -38,6 +38,18 @@ ALGORITHMS = ("force-directed", "grid")
 
 def _ensure_board_capacity(model: BoardModel, target_density: float = 0.35) -> None:
     """Expand board if component density exceeds target."""
+    if getattr(model, 'user_defined_outline', False):
+        # Respect user-drawn Edge.Cuts — warn but don't expand
+        board = model.board
+        board_area = board.width * board.height
+        if board_area > 0:
+            comp_area = sum(c.effective_width * c.effective_height for c in model.components)
+            density = comp_area / board_area
+            if density > target_density:
+                print(f"  Note: density {density:.2f} > {target_density:.2f} "
+                      f"(user Edge.Cuts respected, no expansion)")
+        return
+
     import math
     board = model.board
     board_area = board.width * board.height

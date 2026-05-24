@@ -238,6 +238,7 @@ class BoardModel:
     components: list[Component] = field(default_factory=list)
     nets: list[Net] = field(default_factory=list)
     source_file: str = ""
+    user_defined_outline: bool = False
 
     # ---- Lookup helpers ----
 
@@ -300,6 +301,7 @@ class BoardModel:
                 for n in self.nets
             ],
             "source_file": self.source_file,
+            "user_defined_outline": self.user_defined_outline,
         }
 
     def to_json(self, path: str) -> None:
@@ -357,6 +359,7 @@ class BoardModel:
             components=components,
             nets=nets,
             source_file=data.get("source_file", ""),
+            user_defined_outline=data.get("user_defined_outline", False),
         )
 
     @classmethod

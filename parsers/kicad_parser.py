@@ -220,6 +220,16 @@ def _infer_component_type(ref: str, footprint: str, value: str) -> str:
 # Board outline extraction
 # ---------------------------------------------------------------------------
 
+def _has_edge_cuts(sexp: list) -> bool:
+    """Return True if any geometry exists on the Edge.Cuts layer."""
+    for tag in ("gr_rect", "gr_line", "gr_poly", "gr_circle"):
+        for expr in find_all(sexp, tag):
+            layer = find_first(expr, "layer")
+            if layer and len(layer) > 1 and "Edge.Cuts" in str(layer[1]):
+                return True
+    return False
+
+
 def _extract_board_outline(sexp: list) -> BoardOutline:
     """Extract board outline from Edge.Cuts geometry."""
     points_x = []
@@ -390,6 +400,7 @@ class KiCadParser:
         self._build_net_id_map()
 
         board_outline = _extract_board_outline(sexp)
+        has_edge_cuts = _has_edge_cuts(sexp)
         components = self._extract_components()
         nets = self._extract_nets()
 
@@ -410,6 +421,7 @@ class KiCadParser:
             components=components,
             nets=nets,
             source_file=str(self.filepath),
+            user_defined_outline=has_edge_cuts,
         )
         return model
 

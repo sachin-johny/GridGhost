@@ -200,6 +200,26 @@ def _estimate_min_edge_space(
     return total / 2
 
 
+def _max_connector_depth(connectors: List["Component"]) -> float:
+    """Max perpendicular extent across all connectors on any edge.
+
+    Tries each connector at each edge rotation to find the worst-case
+    depth the connector zone must reserve.
+    """
+    max_depth = 0.0
+    for conn in connectors:
+        for edge in ("bottom", "top", "left", "right"):
+            rot = _compute_connector_rotation(conn, edge)
+            old = conn.rotation
+            conn.set_rotation(rot)
+            w = conn.effective_width
+            h = conn.effective_height
+            conn.set_rotation(old)
+            depth = h if edge in ("bottom", "top") else w
+            max_depth = max(max_depth, depth)
+    return max_depth
+
+
 def _expand_interior_for_connectors(
     ib: tuple[float, float, float, float],
     connectors: List["Component"],
@@ -282,13 +302,27 @@ def smart_grid_place(
         )
     ]
 
+    # Compute effective margin: reserve perimeter for connectors on user-defined boards
+    effective_margin = margin
+    if getattr(model, 'user_defined_outline', False) and edge_connectors:
+        conn_depth = _max_connector_depth(edge_connectors)
+        effective_margin = margin + conn_depth + 1.0
+        min_dim = min(model.board.width, model.board.height)
+        max_allowed = min_dim * 0.35
+        if effective_margin > max_allowed:
+            print(f"  Note: capping connector reserve to {max_allowed:.1f}mm "
+                  f"(board {min_dim:.1f}mm too tight for {effective_margin:.1f}mm)")
+            effective_margin = max(margin, max_allowed)
+        print(f"  Connector-aware margin: {margin:.1f} -> {effective_margin:.1f}mm "
+              f"(depth reserve {conn_depth:.1f}mm)")
+
     # Phase 2: Net-cluster-based interior placement
     if interior:
-        _place_interior(model, interior, margin, spacing_factor)
+        _place_interior(model, interior, effective_margin, spacing_factor)
 
     # Phase 2.5: Quadratic analytical placement
     if interior:
-        quadratic_place(model, margin=margin, n_iterations=3, verbose=False)
+        quadratic_place(model, margin=effective_margin, n_iterations=3, verbose=False)
 
     # Phase 2.7: Rough-place connectors so SA sees interior↔connector nets
     if edge_connectors and interior:
@@ -314,12 +348,12 @@ def smart_grid_place(
             sa_n_iter = int(sa_iterations // 8 + t * (sa_iterations // 4 - sa_iterations // 8))
             sa_n_iter = max(sa_n_iter, sa_iterations // 8)
         conn_refs = {c.ref for c in edge_connectors} if edge_connectors else None
-        _optimize_interior_sa(model, interior, margin, n_iter=sa_n_iter,
+        _optimize_interior_sa(model, interior, effective_margin, n_iter=sa_n_iter,
                               rules=rules, fixed_refs=conn_refs)
 
     # Phase 3.5: recentre interior cluster in usable board area
     if interior:
-        _recentre_interior_cluster(model, interior, margin)
+        _recentre_interior_cluster(model, interior, effective_margin)
 
     # Phase 4: Interior bbox computed AFTER optimization
     ib = _compute_interior_bbox(interior, model.board, margin)
