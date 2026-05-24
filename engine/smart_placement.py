@@ -290,10 +290,13 @@ def smart_grid_place(
     if interior:
         quadratic_place(model, margin=margin, n_iterations=3, verbose=False)
 
-    # Phase 3: SA optimization (HPWL minimization, no connectors present)
-    # v9: reduced iterations — the main SA (annealer.py) does the heavy lifting.
-    # This interior SA is a lightweight pre-optimization to give the main SA
-    # a better starting point.
+    # Phase 2.7: Rough-place connectors so SA sees interior↔connector nets
+    if edge_connectors and interior:
+        _rough_place_connectors(model, edge_connectors, interior, margin)
+
+    # Phase 3: SA optimization — interior only moves, but HPWL includes
+    # fixed connector positions so interior components are pulled toward
+    # their connected connectors (prevents center collapse).
     if interior:
         board = model.board
         board_area = board.width * board.height
@@ -310,7 +313,9 @@ def smart_grid_place(
             t = (density - 0.20) / 0.10
             sa_n_iter = int(sa_iterations // 8 + t * (sa_iterations // 4 - sa_iterations // 8))
             sa_n_iter = max(sa_n_iter, sa_iterations // 8)
-        _optimize_interior_sa(model, interior, margin, n_iter=sa_n_iter, rules=rules)
+        conn_refs = {c.ref for c in edge_connectors} if edge_connectors else None
+        _optimize_interior_sa(model, interior, margin, n_iter=sa_n_iter,
+                              rules=rules, fixed_refs=conn_refs)
 
     # Phase 3.5: recentre interior cluster in usable board area
     if interior:
@@ -787,25 +792,42 @@ def _optimize_interior_sa(
     n_iter: int = 500,
     overlap_weight: float = 10.0,
     rules: list | None = None,
+    fixed_refs: set[str] | None = None,
 ) -> None:
     """Simulated annealing to minimize HPWL + overlap + constraint penalty for interior components.
 
     v9: optimized to use incremental HPWL and overlap computation instead of
     O(n²) full recomputation per iteration.  This makes the interior SA much
     faster, especially for boards with many components.
+
+    When fixed_refs is provided (connector refs with pre-placed positions),
+    those refs are included in HPWL computation so SA pulls interior
+    components toward connected connectors.
     """
     import random
     board = model.board
     x_min, x_max = board.x_min + margin, board.x_max - margin
     y_min, y_max = board.y_min + margin, board.y_max - margin
 
-    # Only optimize HPWL between interior components — exclude edge connectors
-    interior_refs = {c.ref for c in interior}
+    # HPWL refs: interior + fixed connectors (so SA sees interior↔connector nets)
+    interior_only_refs = {c.ref for c in interior}
+    hpwl_refs = set(interior_only_refs)
+    if fixed_refs:
+        hpwl_refs |= fixed_refs
     interior_set = set(id(c) for c in interior)
 
-    # Build index for fast interior overlap checks
+    # Weighted HPWL: interior-only + fraction of connector↔interior nets
+    # Using full connector HPWL dominates SA and hurts interior optimization.
+    # A 30% weight gives a gentle pull toward connectors without starving
+    # interior↔interior optimization.
+    _conn_weight = 0.3 if fixed_refs else 0.0
+
     def _fast_hpwl():
-        return _compute_hpwl(model, interior_refs)
+        if _conn_weight > 0:
+            ih = _compute_hpwl(model, interior_only_refs)
+            fh = _compute_hpwl(model, hpwl_refs)
+            return ih + _conn_weight * (fh - ih)
+        return _compute_hpwl(model, hpwl_refs)
 
     def _fast_overlap():
         total = 0.0
@@ -893,6 +915,91 @@ def _optimize_interior_sa(
     for c in interior:
         if c.ref in best_positions:
             c.x, c.y = best_positions[c.ref]
+
+
+# =============================================================================
+# ROUGH CONNECTOR PLACEMENT (pre-SA anchors)
+# =============================================================================
+
+def _rough_place_connectors(
+    model: "BoardModel",
+    connectors: List["Component"],
+    interior: List["Component"],
+    margin: float,
+) -> None:
+    """Rough-place connectors on perimeter based on net connectivity.
+
+    Uses post-quadratic interior positions to determine each connector's
+    best edge.  These positions serve as fixed anchors during interior SA
+    so HPWL includes interior↔connector nets and pulls interior components
+    toward their connected connectors.
+    """
+    if not connectors or not interior:
+        return
+
+    board = model.board
+    ib = _compute_interior_bbox(interior, board, margin)
+    ib_x_min, ib_y_min, ib_x_max, ib_y_max = ib
+
+    edge_midpoints = {
+        "bottom": ((ib_x_min + ib_x_max) / 2, ib_y_max),
+        "right":  (ib_x_max, (ib_y_min + ib_y_max) / 2),
+        "top":    ((ib_x_min + ib_x_max) / 2, ib_y_min),
+        "left":   (ib_x_min, (ib_y_min + ib_y_max) / 2),
+    }
+
+    interior_refs = {c.ref for c in interior}
+    conn_margin = 3.0
+
+    for conn in connectors:
+        connected_x: list[float] = []
+        connected_y: list[float] = []
+
+        for net in model.nets:
+            if _is_power_net(net.name):
+                continue
+            has_conn = conn.ref in {r for r, _ in net.pins}
+            if not has_conn:
+                continue
+            for ref, _ in net.pins:
+                if ref in interior_refs:
+                    comp = model.get_component(ref)
+                    if comp:
+                        connected_x.append(comp.x)
+                        connected_y.append(comp.y)
+
+        if connected_x:
+            target_x = sum(connected_x) / len(connected_x)
+            target_y = sum(connected_y) / len(connected_y)
+        else:
+            target_x = (ib_x_min + ib_x_max) / 2
+            target_y = (ib_y_min + ib_y_max) / 2
+
+        best_edge = min(
+            edge_midpoints,
+            key=lambda e: math.hypot(
+                target_x - edge_midpoints[e][0],
+                target_y - edge_midpoints[e][1]))
+
+        half_w = conn.effective_width / 2
+        half_h = conn.effective_height / 2
+
+        if best_edge == "bottom":
+            conn.x = max(ib_x_min + half_w, min(target_x, ib_x_max - half_w))
+            conn.y = ib_y_max + conn_margin + half_h
+        elif best_edge == "top":
+            conn.x = max(ib_x_min + half_w, min(target_x, ib_x_max - half_w))
+            conn.y = ib_y_min - conn_margin - half_h
+        elif best_edge == "left":
+            conn.x = ib_x_min - conn_margin - half_w
+            conn.y = max(ib_y_min + half_h, min(target_y, ib_y_max - half_h))
+        else:  # right
+            conn.x = ib_x_max + conn_margin + half_w
+            conn.y = max(ib_y_min + half_h, min(target_y, ib_y_max - half_h))
+
+        # Clamp to board bounds
+        conn.x = max(board.x_min + half_w, min(conn.x, board.x_max - half_w))
+        conn.y = max(board.y_min + half_h, min(conn.y, board.y_max - half_h))
 
 
 # =============================================================================
@@ -1147,7 +1254,30 @@ def _place_connectors_perimeter(
             group_centers.append(((ib_x_min + ib_x_max) / 2,
                                   (ib_y_min + ib_y_max) / 2))
 
-    # Divide groups into 4 batches of ~N/4 connectors
+    # Compute proportional target counts per edge based on edge lengths
+    total_perimeter = sum(edge_lengths[e] for e in edges)
+    n_connectors = len(connectors)
+    targets = []
+    for edge in edges:
+        t = round(n_connectors * edge_lengths[edge] / total_perimeter)
+        targets.append(t)
+
+    # Round-off correction: adjust longest edges first
+    diff = n_connectors - sum(targets)
+    if diff != 0:
+        edge_order = sorted(range(4), key=lambda i: edge_lengths[edges[i]],
+                            reverse=True)
+        for i in edge_order:
+            if diff == 0:
+                break
+            if diff > 0:
+                targets[i] += 1
+                diff -= 1
+            else:
+                targets[i] -= 1
+                diff += 1
+
+    # Assign groups to edges proportionally, preferring net proximity
     sorted_groups = sorted(enumerate(groups),
                            key=lambda x: len(x[1].connectors), reverse=True)
 
@@ -1156,68 +1286,25 @@ def _place_connectors_perimeter(
 
     for gi, group in sorted_groups:
         g_count = len(group.connectors)
-        best_batch = min(range(4), key=lambda b: batch_counts[b])
+        gcx, gcy = group_centers[gi]
+
+        remaining = [targets[i] - batch_counts[i] for i in range(4)]
+        available = [i for i in range(4) if remaining[i] > 0]
+
+        if not available:
+            best_batch = max(range(4), key=lambda b: remaining[b])
+        else:
+            best_batch = min(
+                available,
+                key=lambda i: math.hypot(
+                    gcx - edge_midpoints[edges[i]][0],
+                    gcy - edge_midpoints[edges[i]][1]))
+
         batches[best_batch].append(gi)
         batch_counts[best_batch] += g_count
 
-    # Assign each batch to the best edge based on net proximity
-    edge_taken: Set[int] = set()
-    batch_edge: Dict[int, str] = {}
-
-    batch_centers = []
-    for bi, batch in enumerate(batches):
-        if not batch:
-            batch_centers.append(None)
-            continue
-        tcx, tcy, tc = 0.0, 0.0, 0
-        for gi in batch:
-            gcx, gcy = group_centers[gi]
-            tcx += gcx * len(groups[gi].connectors)
-            tcy += gcy * len(groups[gi].connectors)
-            tc += len(groups[gi].connectors)
-        batch_centers.append((tcx / tc, tcy / tc) if tc > 0 else
-                             ((ib_x_min + ib_x_max) / 2,
-                              (ib_y_min + ib_y_max) / 2))
-
-    for bi in sorted(range(4), key=lambda b: -batch_counts[b]):
-        if batch_centers[bi] is None:
-            continue
-        bcx, bcy = batch_centers[bi]
-
-        scored = []
-        for ei, edge in enumerate(edges):
-            if ei in edge_taken:
-                continue
-            ex, ey = edge_midpoints[edge]
-            dist = math.hypot(bcx - ex, bcy - ey)
-            scored.append((dist, ei, edge))
-
-        scored.sort()
-        for _, ei, edge in scored:
-            # Estimate batch width with mating margin for fit check
-            batch_width = sum(
-                _connector_along_edge_extent(c, edge, mating_margin)
-                for gi in batches[bi] for c in groups[gi].connectors
-            ) + gap * max(0, len(batches[bi]) - 1)
-            if batch_width <= edge_lengths[edge] or not edge_taken:
-                batch_edge[bi] = edge
-                edge_taken.add(ei)
-                break
-        else:
-            for ei, edge in enumerate(edges):
-                if ei not in edge_taken:
-                    batch_edge[bi] = edge
-                    edge_taken.add(ei)
-                    break
-
-    # Handle empty batches that didn't get assigned
-    for bi in range(4):
-        if bi not in batch_edge and batches[bi]:
-            for ei, edge in enumerate(edges):
-                if ei not in edge_taken:
-                    batch_edge[bi] = edge
-                    edge_taken.add(ei)
-                    break
+    # Direct mapping: batch i → edge i (built proportionally by edge length)
+    batch_edge: Dict[int, str] = {i: edges[i] for i in range(4) if batches[i]}
 
     # Place connectors on assigned edges
     comp_edge: Dict[str, str] = {}
