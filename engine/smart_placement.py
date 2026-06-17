@@ -449,7 +449,19 @@ def _place_interior(
         _place_cluster_grid(grouped, x_min, y_min, x_max, y_max)
 
     _apply_repulsion(interior, x_min, x_max, y_min, y_max, spacing_factor,
-                     max_iterations=30)
+                     max_iterations=200)
+
+    # Repulsion can leave residual overlaps on dense IC-less boards where
+    # components oscillate between near-feasible states.  Sweep a grid to
+    # clear them before SA — otherwise SA burns most of its iterations
+    # just untangling overlaps instead of optimizing HPWL.
+    remaining = sum(
+        1 for i, a in enumerate(interior)
+        for b in interior[i + 1:]
+        if a.overlaps(b)
+    )
+    if remaining > 0:
+        _greedy_overlap_cleanup(interior, x_min, x_max, y_min, y_max)
 
 
 def _merge_orphan_caps(
@@ -739,9 +751,17 @@ def _apply_repulsion(
     x_min: float, x_max: float,
     y_min: float, y_max: float,
     spacing_factor: float,
-    max_iterations: int = 150,
+    max_iterations: int = 200,
+    stall_tolerance: int = 5,
 ) -> None:
-    """Push components apart to reduce overlaps."""
+    """Push components apart to reduce overlaps.
+
+    ``stall_tolerance`` allows N consecutive no-move iterations before
+    giving up — on dense boards components can oscillate between two
+    near-feasible states, and breaking on the first clean iteration
+    leaves residual overlaps.
+    """
+    stall = 0
     for iteration in range(max_iterations):
         moved = False
 
@@ -775,7 +795,69 @@ def _apply_repulsion(
                               min(cb.y + push * dy, y_max - cb.effective_height/2))
                     moved = True
 
-        if not moved:
+        if moved:
+            stall = 0
+        else:
+            stall += 1
+            if stall >= stall_tolerance:
+                break
+
+
+def _greedy_overlap_cleanup(
+    components: List["Component"],
+    x_min: float, x_max: float,
+    y_min: float, y_max: float,
+    grid_step: float = 0.5,
+) -> None:
+    """Final pass: for any component still overlapping, sweep candidate
+    positions in a grid and pick the one with the fewest overlaps.
+
+    Cheaper than the legalizer's full _greedy_resolve (no HPWL scoring)
+    but enough to clear residual overlaps the repulsion pass couldn't
+    resolve on dense IC-less boards.
+    """
+    directions = [(1, 0), (-1, 0), (0, 1), (0, -1),
+                  (1, 1), (-1, 1), (1, -1), (-1, -1)]
+    distances = [grid_step, grid_step * 2, grid_step * 5,
+                 1.0, 2.0, 4.0, 8.0]
+
+    for _ in range(3):
+        any_resolved = False
+        for comp in components:
+            overlaps_now = sum(1 for o in components
+                               if o is not comp and comp.overlaps(o))
+            if overlaps_now == 0:
+                continue
+
+            old_x, old_y = comp.x, comp.y
+            best_x, best_y = old_x, old_y
+            best_count = overlaps_now
+
+            half_w = comp.effective_width / 2
+            half_h = comp.effective_height / 2
+
+            for dx_dir, dy_dir in directions:
+                for dist in distances:
+                    tx = max(x_min + half_w,
+                             min(old_x + dx_dir * dist, x_max - half_w))
+                    ty = max(y_min + half_h,
+                             min(old_y + dy_dir * dist, y_max - half_h))
+                    comp.x, comp.y = tx, ty
+                    count = sum(1 for o in components
+                                if o is not comp and comp.overlaps(o))
+                    if count < best_count:
+                        best_count = count
+                        best_x, best_y = tx, ty
+                        if count == 0:
+                            break
+                if best_count == 0:
+                    break
+
+            comp.x, comp.y = best_x, best_y
+            if best_count < overlaps_now:
+                any_resolved = True
+
+        if not any_resolved:
             break
 
 
