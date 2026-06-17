@@ -242,7 +242,7 @@ def cmd_place(args) -> None:
 
     legalize(model, grid_mm=lcfg.grid_mm, max_iterations=adaptive_max_iter,
              push_strength=lcfg.push_strength, verbose=True,
-             use_abacus=False,
+             use_abacus=True,
              interior_bbox=interior_bbox)
     print_board_summary(model, "After Legalization")
 
