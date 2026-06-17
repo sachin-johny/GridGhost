@@ -13,7 +13,11 @@ from itertools import combinations
 
 from models.board_model import BoardModel
 from profiles.board_profiles import ConstraintRule
-from engine.constraint_evaluator import evaluate_constraint_penalties
+from engine.constraint_evaluator import (
+    evaluate_constraint_penalties,
+    _build_decoupling_map,
+    _find_crystal_mcu_pairs,
+)
 
 OVERLAP_WEIGHT = 25.0   # stronger — SA should avoid creating overlaps
 BOUNDARY_WEIGHT = 4.0   # stronger — discourage OOB during SA, not just legalization
@@ -81,6 +85,20 @@ class CostState:
         self._constraint_total: float = 0.0
         self._constraint_breakdown: dict[str, float] = {}
 
+        # Cached constraint topology — SA only moves components, it never
+        # changes net connectivity.  Build once and reuse for the lifetime
+        # of this CostState.  The penalty VALUE still depends on positions,
+        # so we still recompute the value every move — but skip the O(nets
+        # × components) topology rebuild.
+        self._decap_map: dict[str, list[str]] | None = None
+        self._crystal_pairs: list[tuple[str, str]] | None = None
+        if self._rules:
+            rule_names = {r.name for r in self._rules if r.enabled}
+            if 'decoupling_proximity' in rule_names:
+                self._decap_map = _build_decoupling_map(model)
+            if 'crystal_mcu' in rule_names:
+                self._crystal_pairs = _find_crystal_mcu_pairs(model)
+
         # Penalty scaling (annealer controls this)
         self._penalty_scale = 1.0
 
@@ -124,7 +142,11 @@ class CostState:
         # Constraint penalties
         if self._rules:
             self._constraint_total, self._constraint_breakdown = (
-                evaluate_constraint_penalties(self.model, self._rules)
+                evaluate_constraint_penalties(
+                    self.model, self._rules,
+                    decap_map=self._decap_map,
+                    crystal_pairs=self._crystal_pairs,
+                )
             )
         else:
             self._constraint_total = 0.0
@@ -248,13 +270,16 @@ class CostState:
         for i in moved_indices:
             self._comp_boundary[i] = self._compute_boundary(self._comps[i].bbox, board)
 
-        # Constraint penalties — recompute only if rules are active
-        # (constraint penalty touches many components, so we do a full
-        # recompute rather than trying incremental updates.  This is O(R)
-        # where R = number of rules, typically 2-4, so it's negligible.)
+        # Constraint penalties — recompute the VALUE (depends on positions)
+        # but skip the topology rebuild (decap_map / crystal_pairs are cached
+        # since net connectivity never changes during SA).
         if self._rules:
             self._constraint_total, self._constraint_breakdown = (
-                evaluate_constraint_penalties(self.model, self._rules)
+                evaluate_constraint_penalties(
+                    self.model, self._rules,
+                    decap_map=self._decap_map,
+                    crystal_pairs=self._crystal_pairs,
+                )
             )
 
         return self.total_cost

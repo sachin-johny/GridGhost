@@ -29,14 +29,17 @@ from profiles.board_profiles import ConstraintRule
 # Helpers
 # ---------------------------------------------------------------------------
 
+_POWER_PREFIXES_TUPLE = (
+    'GND', 'AGND', 'DGND', 'PGND', 'SGND',
+    'VSS', 'VCC', 'VDD', 'VEE', 'VBAT', 'VBUS',
+)
+_GND_PREFIXES_TUPLE = ('GND', 'AGND', 'DGND', 'PGND', 'SGND', 'VSS')
+
+
 def _is_power_net(name: str) -> bool:
     """Check if a net name is a power/ground net."""
     n = name.lstrip('/').upper()
-    prefixes = (
-        'GND', 'AGND', 'DGND', 'PGND', 'SGND',
-        'VSS', 'VCC', 'VDD', 'VEE', 'VBAT', 'VBUS',
-    )
-    if any(n.startswith(p) for p in prefixes):
+    if n.startswith(_POWER_PREFIXES_TUPLE):
         return True
     return bool(re.match(r'^[+\-]\d[\d.]*V', n, re.IGNORECASE))
 
@@ -83,6 +86,8 @@ def _build_decoupling_map(
     if not ics or not caps:
         return {}
 
+    ref_to_type = {c.ref: getattr(c, 'component_type', '') for c in model.components}
+
     # Build net → {refs} for non-GND power nets
     power_nets: dict[str, set[str]] = {}
     for net in model.nets:
@@ -90,7 +95,7 @@ def _build_decoupling_map(
             continue
         clean = net.name.lstrip('/').upper()
         # Exclude GND — everything shares it, no discriminative power
-        if any(clean.startswith(p) for p in ('GND', 'AGND', 'DGND', 'PGND', 'SGND', 'VSS')):
+        if clean.startswith(_GND_PREFIXES_TUPLE):
             continue
         refs = net.component_refs
         power_nets[net.name] = refs
@@ -102,11 +107,8 @@ def _build_decoupling_map(
 
     for net_name, refs in power_nets.items():
         net_ics = refs & ic_refs
-        net_caps = {r for r in refs if r not in ic_refs}
-        # Check if non-IC refs are actually capacitors
-        net_caps = {r for r in net_caps
-                    if any(c.ref == r and getattr(c, 'component_type', '') == 'capacitor'
-                           for c in model.components)}
+        # Check if non-IC refs are actually capacitors via ref→type lookup
+        net_caps = {r for r in refs if r not in ic_refs and ref_to_type.get(r) == 'capacitor'}
         for cap_ref in net_caps:
             cap_to_ics[cap_ref].update(net_ics)
 
@@ -127,6 +129,7 @@ def _build_decoupling_map(
 def penalty_decoupling_proximity(
     model: BoardModel,
     rule: ConstraintRule,
+    decap_map: dict[str, list[str]] | None = None,
 ) -> float:
     """Penalty for decoupling caps too far from their IC.
 
@@ -141,7 +144,8 @@ def penalty_decoupling_proximity(
     Returns the *raw* penalty (before rule.weight multiplication).
     """
     max_dist = rule.params.get('max_distance_mm', 5.0)
-    decap_map = _build_decoupling_map(model)
+    if decap_map is None:
+        decap_map = _build_decoupling_map(model)
 
     total = 0.0
     for ic_ref, cap_refs in decap_map.items():
@@ -200,13 +204,15 @@ def _find_crystal_mcu_pairs(model: BoardModel) -> list[tuple[str, str]]:
 def penalty_crystal_mcu(
     model: BoardModel,
     rule: ConstraintRule,
+    crystal_pairs: list[tuple[str, str]] | None = None,
 ) -> float:
     """Penalty for crystals too far from their associated MCU/IC."""
     max_dist = rule.params.get('max_distance_mm', 10.0)
-    pairs = _find_crystal_mcu_pairs(model)
+    if crystal_pairs is None:
+        crystal_pairs = _find_crystal_mcu_pairs(model)
 
     total = 0.0
-    for crystal_ref, ic_ref in pairs:
+    for crystal_ref, ic_ref in crystal_pairs:
         crystal = model.get_component(crystal_ref)
         ic = model.get_component(ic_ref)
         if not crystal or not ic:
@@ -619,12 +625,19 @@ _RULE_HANDLERS = {
 def evaluate_constraint_penalties(
     model: BoardModel,
     rules: list[ConstraintRule],
+    decap_map: dict[str, list[str]] | None = None,
+    crystal_pairs: list[tuple[str, str]] | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Evaluate all enabled constraint rules.
 
     Returns:
         (total_penalty, breakdown) where breakdown maps
         rule.name → raw penalty (before weight multiplication).
+
+    Optional ``decap_map`` and ``crystal_pairs`` let callers cache the
+    topology (which ICs/caps share power nets, which crystals pair with
+    which ICs) since SA only moves components — it never changes the
+    net connectivity.  Skipping the rebuild is a 10-30× SA speedup.
     """
     total = 0.0
     breakdown: dict[str, float] = {}
@@ -639,7 +652,12 @@ def evaluate_constraint_penalties(
             breakdown[rule.name] = 0.0
             continue
 
-        penalty = handler(model, rule)
+        if rule.name == 'decoupling_proximity':
+            penalty = handler(model, rule, decap_map=decap_map)
+        elif rule.name == 'crystal_mcu':
+            penalty = handler(model, rule, crystal_pairs=crystal_pairs)
+        else:
+            penalty = handler(model, rule)
         breakdown[rule.name] = penalty
         total += rule.weight * penalty
 
