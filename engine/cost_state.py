@@ -92,12 +92,22 @@ class CostState:
         # × components) topology rebuild.
         self._decap_map: dict[str, list[str]] | None = None
         self._crystal_pairs: list[tuple[str, str]] | None = None
+        self._connectors: list | None = None  # list[Component], but annotated as list to avoid import cycle
         if self._rules:
             rule_names = {r.name for r in self._rules if r.enabled}
             if 'decoupling_proximity' in rule_names:
                 self._decap_map = _build_decoupling_map(model)
             if 'crystal_mcu' in rule_names:
                 self._crystal_pairs = _find_crystal_mcu_pairs(model)
+            if 'connector_edge' in rule_names:
+                # Cache Component objects (not refs) — avoids O(N) get_component
+                # lookups per SA move. SA mutates positions but never replaces
+                # the Component instances themselves, so the cache stays valid.
+                self._connectors = [
+                    c for c in model.components
+                    if getattr(c, 'component_type', '') == 'connector'
+                    and not c.is_fixed
+                ]
 
         # Penalty scaling (annealer controls this)
         self._penalty_scale = 1.0
@@ -146,6 +156,7 @@ class CostState:
                     self.model, self._rules,
                     decap_map=self._decap_map,
                     crystal_pairs=self._crystal_pairs,
+                    connectors=self._connectors,
                 )
             )
         else:
@@ -271,14 +282,16 @@ class CostState:
             self._comp_boundary[i] = self._compute_boundary(self._comps[i].bbox, board)
 
         # Constraint penalties — recompute the VALUE (depends on positions)
-        # but skip the topology rebuild (decap_map / crystal_pairs are cached
-        # since net connectivity never changes during SA).
+        # but skip the topology rebuild (decap_map / crystal_pairs /
+        # connectors are cached since net connectivity never changes
+        # during SA).
         if self._rules:
             self._constraint_total, self._constraint_breakdown = (
                 evaluate_constraint_penalties(
                     self.model, self._rules,
                     decap_map=self._decap_map,
                     crystal_pairs=self._crystal_pairs,
+                    connectors=self._connectors,
                 )
             )
 

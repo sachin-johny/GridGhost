@@ -231,6 +231,7 @@ def penalty_crystal_mcu(
 def penalty_connector_edge(
     model: BoardModel,
     rule: ConstraintRule,
+    connectors: list[Component] | None = None,
 ) -> float:
     """Penalty for connectors far from board edges.
 
@@ -240,19 +241,31 @@ def penalty_connector_edge(
 
         excess = max(0, d - max_edge_distance_mm)
         penalty = Σ excess^2
+
+    Optional ``connectors`` lets callers pre-filter the connector list
+    once and reuse it across SA moves. Connector identity (which components
+    are connectors) is invariant during SA — only positions change.
+    Pass the actual Component objects (not refs) to avoid O(N) lookups
+    per call.
     """
     max_edge_dist = rule.params.get('max_edge_distance_mm', 15.0)
     board = model.board
 
     total = 0.0
-    for comp in model.components:
-        if getattr(comp, 'component_type', '') != 'connector':
-            continue
-        if comp.is_fixed:
-            continue
-        d = _distance_to_nearest_edge(comp, board)
-        excess = max(0.0, d - max_edge_dist)
-        total += excess
+    if connectors is None:
+        for comp in model.components:
+            if getattr(comp, 'component_type', '') != 'connector':
+                continue
+            if comp.is_fixed:
+                continue
+            d = _distance_to_nearest_edge(comp, board)
+            excess = max(0.0, d - max_edge_dist)
+            total += excess
+    else:
+        for comp in connectors:
+            d = _distance_to_nearest_edge(comp, board)
+            excess = max(0.0, d - max_edge_dist)
+            total += excess
 
     return total
 
@@ -627,6 +640,7 @@ def evaluate_constraint_penalties(
     rules: list[ConstraintRule],
     decap_map: dict[str, list[str]] | None = None,
     crystal_pairs: list[tuple[str, str]] | None = None,
+    connectors: list[Component] | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Evaluate all enabled constraint rules.
 
@@ -634,10 +648,11 @@ def evaluate_constraint_penalties(
         (total_penalty, breakdown) where breakdown maps
         rule.name → raw penalty (before weight multiplication).
 
-    Optional ``decap_map`` and ``crystal_pairs`` let callers cache the
-    topology (which ICs/caps share power nets, which crystals pair with
-    which ICs) since SA only moves components — it never changes the
-    net connectivity.  Skipping the rebuild is a 10-30× SA speedup.
+    Optional ``decap_map``, ``crystal_pairs``, and ``connectors`` let
+    callers cache the topology (which ICs/caps share power nets, which
+    crystals pair with which ICs, which components are connectors) since
+    SA only moves components — it never changes the net connectivity.
+    Skipping the rebuild is a 10-30× SA speedup.
     """
     total = 0.0
     breakdown: dict[str, float] = {}
@@ -656,6 +671,8 @@ def evaluate_constraint_penalties(
             penalty = handler(model, rule, decap_map=decap_map)
         elif rule.name == 'crystal_mcu':
             penalty = handler(model, rule, crystal_pairs=crystal_pairs)
+        elif rule.name == 'connector_edge':
+            penalty = handler(model, rule, connectors=connectors)
         else:
             penalty = handler(model, rule)
         breakdown[rule.name] = penalty
