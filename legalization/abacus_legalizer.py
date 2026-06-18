@@ -308,11 +308,25 @@ def _resolve_cross_row_overlaps(
     row_pitch = max(c.effective_height for c in movable)
     row_pitch = max(math.ceil(row_pitch / grid_mm) * grid_mm, grid_mm)
 
+    # Wider Y search (Fix 1.7 step 2): include ±0.5×row_pitch and ±1.5×row_pitch
+    # candidates for boards where rows are sparse but components are tall.
+    # Ordered near → far so smaller displacements are preferred.
+    y_candidates = [
+        -row_pitch * 0.5, row_pitch * 0.5,
+        -row_pitch, row_pitch,
+        -row_pitch * 1.5, row_pitch * 1.5,
+        -row_pitch * 2, row_pitch * 2,
+    ]
+
+    # Lazy import to avoid circular dependency (legalizer.py imports abacus_legalizer).
+    from legalization.legalizer import _push_apart
+
     for outer in range(20):
         overlap_pairs = _find_overlap_pairs(movable)
         if not overlap_pairs:
             break
 
+        progress = False
         for c1, c2 in overlap_pairs:
             if not c1.overlaps(c2):
                 continue
@@ -328,8 +342,9 @@ def _resolve_cross_row_overlaps(
                 continue
 
             old_x, old_y = mover.x, mover.y
+            initial_overlaps = _count_overlaps_single(mover, all_components)
             best_x, best_y = old_x, old_y
-            best_overlaps = _count_overlaps_single(mover, all_components)
+            best_overlaps = initial_overlaps
 
             for delta in nudge_dists:
                 for dx in [-delta, delta]:
@@ -348,7 +363,7 @@ def _resolve_cross_row_overlaps(
                     break
 
             if best_overlaps > 0:
-                for dy in [-row_pitch, row_pitch, -row_pitch * 2, row_pitch * 2]:
+                for dy in y_candidates:
                     trial_y = old_y + dy
                     mover.x = old_x
                     mover.y = trial_y
@@ -363,6 +378,51 @@ def _resolve_cross_row_overlaps(
 
             mover.x = best_x
             mover.y = best_y
+            if best_overlaps < initial_overlaps:
+                # Single-mover search reduced overlaps (even if not to zero).
+                progress = True
+
+            # Bidirectional push (Fix 1.7 step 1): only fire when single-mover
+            # search stalled AND the pair still overlaps. Strict acceptance
+            # (pair_after < pair_before) — accepting equal would just shuffle
+            # overlaps around without converging.
+            if best_overlaps == 0 or not c1.overlaps(c2):
+                continue
+
+            c1_old_x, c1_old_y = c1.x, c1.y
+            c2_old_x, c2_old_y = c2.x, c2.y
+            pair_before = _count_pair_overlaps_involving(c1, c2, all_components)
+            _push_apart(c1, c2, 1.0, grid_mm)
+            _clamp_to_bounds(c1, board, interior_bbox)
+            _clamp_to_bounds(c2, board, interior_bbox)
+            pair_after = _count_pair_overlaps_involving(c1, c2, all_components)
+            if pair_after < pair_before:
+                progress = True
+            else:
+                # No strict improvement — revert. The legalizer fallback will
+                # handle residual overlaps via _resolve_overlaps + _greedy_resolve.
+                c1.x, c1.y = c1_old_x, c1_old_y
+                c2.x, c2.y = c2_old_x, c2_old_y
+
+        if not progress:
+            break
+
+
+def _count_pair_overlaps_involving(
+    c1: Component, c2: Component, all_components: list[Component],
+) -> int:
+    """Count overlaps involving c1 or c2 (including the c1↔c2 pair once)."""
+    count = 0
+    for other in all_components:
+        if other is c1 or other is c2:
+            continue
+        if c1.overlaps(other):
+            count += 1
+        if c2.overlaps(other):
+            count += 1
+    if c1.overlaps(c2):
+        count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------
