@@ -886,9 +886,164 @@ def _nudge_caps_to_ics(
     if not decap_map:
         return
 
-    step_sizes = [2.0, 1.0, 0.5, 0.25, 0.1]
+    # Larger step sizes — Abacus can leave caps 50+mm from their ICs (same row
+    # but opposite ends in X), and a 2mm max step would never close that gap
+    # in 5 passes.  Fall back to smaller steps if a large jump is blocked.
+    step_sizes = [16.0, 8.0, 4.0, 2.0, 1.0, 0.5, 0.25, 0.1]
 
-    for pass_num in range(5):
+    def _bbox_center_for_origin(cap, target_cx, target_cy, rotation):
+        """Compute (cap.x, cap.y) so cap's bbox center sits at (target_cx, target_cy).
+
+        Component bbox center is offset from origin by bbox_offset rotated by
+        `rotation` — many ICs have substantial offsets (e.g., DIP packages with
+        origin on pin 1 rather than body center).  Without this correction,
+        spacing math based on cap.x/ic.x leaves bboxes overlapping.
+        """
+        rad = math.radians(rotation)
+        cos_r = math.cos(rad)
+        sin_r = math.sin(rad)
+        # bbox center = (cap.x + ox*cos - oy*sin, cap.y + ox*sin + oy*cos)
+        # => cap.x = target_cx - ox*cos + oy*sin
+        new_x = target_cx - cap.bbox_offset_x * cos_r + cap.bbox_offset_y * sin_r
+        new_y = target_cy - cap.bbox_offset_x * sin_r - cap.bbox_offset_y * cos_r
+        return new_x, new_y
+
+    def _check_position(cap, trial_x, trial_y, ic, components,
+                        board, interior_bbox) -> tuple[float, float, float] | None:
+        """Return (clamped_x, clamped_y, dist) if trial pos is overlap-free, else None.
+
+        Mutates cap.x/cap.y temporarily for the overlap check, always restores.
+        Excludes the IC from the overlap check (cap touching its own IC is fine
+        for decoupling purposes).
+        """
+        half_w = cap.effective_width / 2.0
+        half_h = cap.effective_height / 2.0
+        if interior_bbox:
+            x_min = interior_bbox[0] + half_w
+            x_max = interior_bbox[2] - half_w
+            y_min = interior_bbox[1] + half_h
+            y_max = interior_bbox[3] - half_h
+        else:
+            x_min = board.x_min + half_w
+            x_max = board.x_max - half_w
+            y_min = board.y_min + half_h
+            y_max = board.y_max - half_h
+        clamped_x = max(x_min, min(trial_x, x_max))
+        clamped_y = max(y_min, min(trial_y, y_max))
+
+        saved_x, saved_y = cap.x, cap.y
+        cap.x = clamped_x
+        cap.y = clamped_y
+        try:
+            has_overlap = any(
+                cap.overlaps(other)
+                for other in components
+                if other is not cap and not other.is_fixed and other is not ic
+            )
+            if has_overlap:
+                return None
+            new_dist = math.hypot(ic.x - clamped_x, ic.y - clamped_y)
+            return (clamped_x, clamped_y, new_dist)
+        finally:
+            cap.x = saved_x
+            cap.y = saved_y
+
+    # Phase 1: Direct jump to positions adjacent to IC.  This bypasses the
+    # incremental nudge when the cap is far from the IC and the direct line
+    # is blocked by other components.  Tries 8 candidate slots around the IC
+    # (4 sides + 4 corners) at increasing radii until one fits.
+    # Candidate positions are computed in BBOX space (not origin space) so
+    # components with large bbox_offsets (e.g., DIP ICs with origin on pin 1)
+    # don't end up with bboxes overlapping.
+    for ic_ref, cap_refs in decap_map.items():
+        ic = model.get_component(ic_ref)
+        if not ic:
+            continue
+
+        ic_bbox = ic.bbox
+        ic_bbox_cx = (ic_bbox[0] + ic_bbox[2]) / 2.0
+        ic_bbox_cy = (ic_bbox[1] + ic_bbox[3]) / 2.0
+
+        for cap_ref in cap_refs:
+            cap = model.get_component(cap_ref)
+            if not cap:
+                continue
+            if cap.is_fixed or cap.is_edge_connector:
+                continue
+
+            orig_dist = math.hypot(ic.x - cap.x, ic.y - cap.y)
+            if orig_dist <= max_dist:
+                continue
+
+            cap_start_x, cap_start_y = cap.x, cap.y
+            cap_start_rot = cap.rotation
+            cap_nonsquare = _is_non_square(cap)
+
+            rotations = [cap_start_rot]
+            if cap_nonsquare:
+                rotations.append((cap_start_rot + 90) % 360)
+
+            best_jump: tuple[float, float, float, float] | None = None  # (x, y, rot, dist)
+
+            for try_rot in rotations:
+                if try_rot != cap_start_rot:
+                    cap.set_rotation(try_rot)
+
+                cap_half_w = cap.effective_width / 2.0
+                cap_half_h = cap.effective_height / 2.0
+
+                # Smallest spacing first — prefer tightest packing around IC.
+                for spacing_mult in [1.0, 1.5, 2.0, 3.0, 5.0]:
+                    gap = 0.5 * spacing_mult
+                    # Target bbox-center positions: cap bbox sits `gap` mm
+                    # beyond IC's bbox on the chosen side.
+                    right_cx = ic_bbox[2] + gap + cap_half_w
+                    left_cx = ic_bbox[0] - gap - cap_half_w
+                    below_cy = ic_bbox[3] + gap + cap_half_h
+                    above_cy = ic_bbox[1] - gap - cap_half_h
+
+                    # Convert target bbox-center → cap origin (handles bbox_offset)
+                    candidates_origin = [
+                        _bbox_center_for_origin(cap, right_cx, ic_bbox_cy, try_rot),
+                        _bbox_center_for_origin(cap, left_cx, ic_bbox_cy, try_rot),
+                        _bbox_center_for_origin(cap, ic_bbox_cx, below_cy, try_rot),
+                        _bbox_center_for_origin(cap, ic_bbox_cx, above_cy, try_rot),
+                        _bbox_center_for_origin(cap, right_cx, below_cy, try_rot),
+                        _bbox_center_for_origin(cap, left_cx, below_cy, try_rot),
+                        _bbox_center_for_origin(cap, right_cx, above_cy, try_rot),
+                        _bbox_center_for_origin(cap, left_cx, above_cy, try_rot),
+                    ]
+
+                    found_in_spacing = False
+                    for cand_x, cand_y in candidates_origin:
+                        result = _check_position(cap, cand_x, cand_y, ic,
+                                                 components, board, interior_bbox)
+                        if result is not None and result[2] < orig_dist:
+                            cx, cy, cdist = result
+                            if (best_jump is None or cdist < best_jump[3]
+                                    or (cdist == best_jump[3]
+                                        and try_rot == cap_start_rot
+                                        and best_jump[2] != cap_start_rot)):
+                                best_jump = (cx, cy, try_rot, cdist)
+                            found_in_spacing = True
+                            break
+                    if found_in_spacing:
+                        break
+
+                cap.x, cap.y = cap_start_x, cap_start_y
+                if try_rot != cap_start_rot:
+                    cap.set_rotation(cap_start_rot)
+
+            if best_jump is not None:
+                cap.x = best_jump[0]
+                cap.y = best_jump[1]
+                if cap.rotation != best_jump[2]:
+                    cap.set_rotation(best_jump[2])
+
+    # Phase 2: Incremental nudge along direct line toward IC.
+    # Catches caps that couldn't be reached by phase 1 (no overlap-free slot
+    # adjacent to the IC).  Steps along the cap→IC unit vector.
+    for pass_num in range(8):
         any_moved = False
 
         for ic_ref, cap_refs in decap_map.items():
@@ -918,7 +1073,7 @@ def _nudge_caps_to_ics(
                 cap_start_x, cap_start_y = cap.x, cap.y
                 cap_start_rot = cap.rotation
                 cap_nonsquare = _is_non_square(cap)
-                best_result = None
+                best_result: tuple[float, float, float, float] | None = None
 
                 rotations = [cap_start_rot]
                 if cap_nonsquare:
@@ -932,43 +1087,16 @@ def _nudge_caps_to_ics(
                         new_x = cap_start_x + dx * step
                         new_y = cap_start_y + dy * step
 
-                        half_w = cap.effective_width / 2.0
-                        half_h = cap.effective_height / 2.0
-                        if interior_bbox:
-                            x_min = interior_bbox[0] + half_w
-                            x_max = interior_bbox[2] - half_w
-                            y_min = interior_bbox[1] + half_h
-                            y_max = interior_bbox[3] - half_h
-                        else:
-                            x_min = board.x_min + half_w
-                            x_max = board.x_max - half_w
-                            y_min = board.y_min + half_h
-                            y_max = board.y_max - half_h
-
-                        new_x = max(x_min, min(new_x, x_max))
-                        new_y = max(y_min, min(new_y, y_max))
-
-                        cap.x = new_x
-                        cap.y = new_y
-
-                        has_overlap = any(
-                            cap.overlaps(other)
-                            for other in components
-                            if other is not cap and not other.is_fixed
-                        )
-
-                        if not has_overlap:
-                            new_dist = math.hypot(ic.x - new_x, ic.y - new_y)
-                            if new_dist < dist:
-                                if (best_result is None or new_dist < best_result[3]
-                                        or (new_dist == best_result[3]
-                                            and try_rot == cap_start_rot
-                                            and best_result[2] != cap_start_rot)):
-                                    best_result = (new_x, new_y, try_rot, new_dist)
-                                break
-                        else:
-                            cap.x = cap_start_x
-                            cap.y = cap_start_y
+                        result = _check_position(cap, new_x, new_y, ic,
+                                                 components, board, interior_bbox)
+                        if result is not None and result[2] < dist:
+                            cx, cy, cdist = result
+                            if (best_result is None or cdist < best_result[3]
+                                    or (cdist == best_result[3]
+                                        and try_rot == cap_start_rot
+                                        and best_result[2] != cap_start_rot)):
+                                best_result = (cx, cy, try_rot, cdist)
+                            break
 
                     cap.x, cap.y = cap_start_x, cap_start_y
                     if try_rot != cap_start_rot:

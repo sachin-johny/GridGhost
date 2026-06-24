@@ -1303,10 +1303,16 @@ def _place_connectors_perimeter(
 
     Strategy:
     1. Group connectors by category (power pairs, input, output, data, etc.)
-    2. Compute net-weighted center for each group
-    3. Divide into 4 batches, assign each to nearest edge
-    4. Place with per-connector rotation from pad analysis
-    5. Space using post-rotation along-edge extent + mating margin
+       — used only for priority ordering, not for batch placement.
+    2. For each connector in priority order, score every edge by:
+         - Net proximity: connector's connected components' centroid vs edge midpoint
+         - Available space on the edge (load balancing)
+       Assign to highest-scoring edge that still fits the connector.
+    3. Per-edge placement: connectors sorted by net-centroid along-edge
+       coordinate so a connector whose net neighbors are on the left side of
+       the board ends up on the left side of its assigned edge.
+    4. Per-connector rotation from pad analysis. Space using post-rotation
+       along-edge extent + mating margin.
     """
     ib_x_min, ib_y_min, ib_x_max, ib_y_max = interior_bbox
     board = model.board
@@ -1345,158 +1351,152 @@ def _place_connectors_perimeter(
         "left": (ib_x_min, (ib_y_min + ib_y_max) / 2),
     }
 
-    # Compute net-weighted center for each group
-    group_centers = []
-    for group in groups:
+    ib_cx = (ib_x_min + ib_x_max) / 2
+    ib_cy = (ib_y_min + ib_y_max) / 2
+
+    # Net-weighted centroid per connector: average position of components
+    # sharing any net (signal OR power) with this connector. Falls back to
+    # interior bbox center if the connector has no off-connector neighbors.
+    conn_centroids: Dict[str, tuple[float, float]] = {}
+    for comp in connectors:
         cx, cy, count = 0.0, 0.0, 0
-        for comp in group.connectors:
-            for net in model.nets:
-                conn_refs = {c.ref for c in group.connectors}
-                has_conn = any(ref in conn_refs for ref, _ in net.pins)
-                if not has_conn:
+        for net in model.nets:
+            has_comp = comp.ref in {r for r, _ in net.pins}
+            if not has_comp:
+                continue
+            for ref, _ in net.pins:
+                if ref == comp.ref:
                     continue
-                for ref, _ in net.pins:
-                    if ref in conn_refs:
-                        continue
-                    other = model.get_component(ref)
-                    if other:
-                        cx += other.x
-                        cy += other.y
-                        count += 1
-                        break
+                other = model.get_component(ref)
+                if other:
+                    cx += other.x
+                    cy += other.y
+                    count += 1
         if count > 0:
-            group_centers.append((cx / count, cy / count))
+            conn_centroids[comp.ref] = (cx / count, cy / count)
         else:
-            group_centers.append(((ib_x_min + ib_x_max) / 2,
-                                  (ib_y_min + ib_y_max) / 2))
+            conn_centroids[comp.ref] = (ib_cx, ib_cy)
 
-    # Compute proportional target counts per edge based on edge lengths
-    total_perimeter = sum(edge_lengths[e] for e in edges)
-    n_connectors = len(connectors)
-    targets = []
-    for edge in edges:
-        t = round(n_connectors * edge_lengths[edge] / total_perimeter)
-        targets.append(t)
+    # Phase 1: Per-connector edge assignment.
+    # Process groups in priority order (power pairs first, etc.), and within
+    # each group, outermost-centroid-first so connectors farthest from the
+    # interior center claim their preferred edge before central ones fill it.
+    edge_assignments: Dict[str, List["Component"]] = {e: [] for e in edges}
+    edge_used: Dict[str, float] = {e: 0.0 for e in edges}
 
-    # Round-off correction: adjust longest edges first
-    diff = n_connectors - sum(targets)
-    if diff != 0:
-        edge_order = sorted(range(4), key=lambda i: edge_lengths[edges[i]],
-                            reverse=True)
-        for i in edge_order:
-            if diff == 0:
-                break
-            if diff > 0:
-                targets[i] += 1
-                diff -= 1
-            else:
-                targets[i] -= 1
-                diff += 1
+    for group in groups:
+        sorted_conns = sorted(
+            group.connectors,
+            key=lambda c: math.hypot(conn_centroids[c.ref][0] - ib_cx,
+                                     conn_centroids[c.ref][1] - ib_cy),
+            reverse=True,
+        )
 
-    # Assign groups to edges proportionally, preferring net proximity
-    sorted_groups = sorted(enumerate(groups),
-                           key=lambda x: len(x[1].connectors), reverse=True)
+        for comp in sorted_conns:
+            ccx, ccy = conn_centroids[comp.ref]
 
-    batches: List[List[int]] = [[] for _ in range(4)]
-    batch_counts = [0] * 4
+            best_edge: Optional[str] = None
+            best_score = -float("inf")
 
-    for gi, group in sorted_groups:
-        g_count = len(group.connectors)
-        gcx, gcy = group_centers[gi]
+            for edge in edges:
+                along = _connector_along_edge_extent(comp, edge, mating_margin)
+                remaining = edge_lengths[edge] - edge_used[edge]
 
-        remaining = [targets[i] - batch_counts[i] for i in range(4)]
-        available = [i for i in range(4) if remaining[i] > 0]
+                # Skip edges that can't fit this connector (with small tolerance)
+                if along > remaining + 0.5:
+                    continue
 
-        if not available:
-            best_batch = max(range(4), key=lambda b: remaining[b])
-        else:
-            best_batch = min(
-                available,
-                key=lambda i: math.hypot(
-                    gcx - edge_midpoints[edges[i]][0],
-                    gcy - edge_midpoints[edges[i]][1]))
+                em_x, em_y = edge_midpoints[edge]
+                prox_dist = math.hypot(ccx - em_x, ccy - em_y)
+                prox_score = 1.0 / (1.0 + prox_dist)
+                # Normalised remaining space — prefer less-loaded edges to
+                # distribute connectors evenly when proximity is similar.
+                space_score = (remaining / edge_lengths[edge]
+                               if edge_lengths[edge] > 0 else 0.0)
+                score = prox_score + 0.3 * space_score
 
-        batches[best_batch].append(gi)
-        batch_counts[best_batch] += g_count
+                if score > best_score:
+                    best_score = score
+                    best_edge = edge
 
-    # Direct mapping: batch i → edge i (built proportionally by edge length)
-    batch_edge: Dict[int, str] = {i: edges[i] for i in range(4) if batches[i]}
+            if best_edge is None:
+                # Connector doesn't fit anywhere — fall back to least-loaded
+                # edge and let bbox clamping deal with overflow.
+                best_edge = min(edges, key=lambda e: edge_used[e])
 
-    # Place connectors on assigned edges
+            along = _connector_along_edge_extent(comp, best_edge, mating_margin)
+            edge_used[best_edge] += along + gap
+            edge_assignments[best_edge].append(comp)
+
+    # Phase 2: Place connectors on each assigned edge.
+    # Sort each edge's connectors by their net centroid along the edge so a
+    # connector whose net neighbours are on the left side of the board ends
+    # up on the left side of its edge.
     comp_edge: Dict[str, str] = {}
 
-    for bi, batch in enumerate(batches):
-        if not batch or bi not in batch_edge:
+    for edge in edges:
+        comps_on_edge = edge_assignments[edge]
+        if not comps_on_edge:
             continue
 
-        edge = batch_edge[bi]
+        if edge in ("bottom", "top"):
+            comps_on_edge.sort(key=lambda c: conn_centroids[c.ref][0])
+        else:
+            comps_on_edge.sort(key=lambda c: conn_centroids[c.ref][1])
+
+        total_needed = sum(
+            _connector_along_edge_extent(c, edge, mating_margin)
+            for c in comps_on_edge
+        ) + gap * max(0, len(comps_on_edge) - 1)
         available = edge_lengths[edge]
-
-        batch_groups = [groups[gi] for gi in batch]
-        # Compute total space needed using rotation-aware per-connector spacing
-        total_needed = 0.0
-        for g in batch_groups:
-            for comp in g.connectors:
-                total_needed += _connector_along_edge_extent(comp, edge, mating_margin)
-            total_needed += gap
-        total_needed = max(0, total_needed - gap)  # no trailing gap
-
         offset = max(0.0, (available - total_needed) / 2.0)
         pos = offset
 
-        for group in batch_groups:
-            for comp in group.connectors:
-                # Compute per-connector rotation from pad geometry
-                rot = _compute_connector_rotation(comp, edge)
-                comp.set_rotation(rot)
+        for comp in comps_on_edge:
+            rot = _compute_connector_rotation(comp, edge)
+            comp.set_rotation(rot)
 
-                w = comp.effective_width   # X-extent after rotation
-                h = comp.effective_height  # Y-extent after rotation
-                em = conn_margin[edge]
+            w = comp.effective_width   # X-extent after rotation
+            h = comp.effective_height  # Y-extent after rotation
+            em = conn_margin[edge]
 
-                # Along-edge extent = dimension parallel to the edge
-                along = w if edge in ("bottom", "top") else h
+            along = w if edge in ("bottom", "top") else h
 
-                if edge == "bottom":
-                    cx = ib_x_min + pos + along / 2
-                    cy = ib_y_max + em + h / 2
-                elif edge == "top":
-                    cx = ib_x_min + pos + along / 2
-                    cy = ib_y_min - em - h / 2
-                elif edge == "left":
-                    cx = ib_x_min - em - w / 2
-                    cy = ib_y_min + pos + along / 2
-                else:  # right
-                    cx = ib_x_max + em + w / 2
-                    cy = ib_y_min + pos + along / 2
+            if edge == "bottom":
+                cx = ib_x_min + pos + along / 2
+                cy = ib_y_max + em + h / 2
+            elif edge == "top":
+                cx = ib_x_min + pos + along / 2
+                cy = ib_y_min - em - h / 2
+            elif edge == "left":
+                cx = ib_x_min - em - w / 2
+                cy = ib_y_min + pos + along / 2
+            else:  # right
+                cx = ib_x_max + em + w / 2
+                cy = ib_y_min + pos + along / 2
 
-                comp.x = cx
-                comp.y = cy
+            comp.x = cx
+            comp.y = cy
 
-                # Bbox-aware clamp: adjust position so actual bbox stays
-                # within board (accounts for bbox_offset from footprint origin)
-                if getattr(comp, "component_type", "") == "connector":
-                    b = pad_bbox(comp)
-                else:
-                    b = comp.bbox
+            # Bbox-aware clamp: adjust position so actual bbox stays
+            # within board (accounts for bbox_offset from footprint origin)
+            if getattr(comp, "component_type", "") == "connector":
+                b = pad_bbox(comp)
+            else:
+                b = comp.bbox
 
-                if b[0] < board.x_min:
-                    comp.x += board.x_min - b[0]
-                elif b[2] > board.x_max:
-                    comp.x -= b[2] - board.x_max
-                # b = comp.bbox
-                if b[1] < board.y_min:
-                    comp.y += board.y_min - b[1]
-                elif b[3] > board.y_max:
-                    comp.y -= b[3] - board.y_max
+            if b[0] < board.x_min:
+                comp.x += board.x_min - b[0]
+            elif b[2] > board.x_max:
+                comp.x -= b[2] - board.x_max
+            if b[1] < board.y_min:
+                comp.y += board.y_min - b[1]
+            elif b[3] > board.y_max:
+                comp.y -= b[3] - board.y_max
 
-                comp_edge[comp.ref] = edge
+            comp_edge[comp.ref] = edge
 
-                # Advance by along-edge extent + mating margin
-                # mating_margin ensures physical space for cable/mating
-                pos += along + mating_margin
-
-            pos += gap
+            pos += along + mating_margin + gap
 
     _resolve_corners(connectors, comp_edge, board, margin, gap)
 

@@ -250,12 +250,55 @@ def cmd_place(args) -> None:
     # Use the legalizer's greedy resolver instead of SA's overlap resolver.
     # The SA resolver doesn't check if resolving one overlap creates new ones.
     # The legalizer's greedy resolver checks all neighbors before accepting moves.
-    post_legal_overlaps = count_overlaps(model)
+    #
+    # Cap-IC overlaps introduced by the cap-IC nudge are intentional (decoupling
+    # caps placed adjacent to their ICs may share courtyard space).  Count
+    # overlaps excluding cap↔IC pairs so the cleanup doesn't undo the nudge.
+    from engine.constraint_evaluator import _build_decoupling_map
+    final_decap_map = (_build_decoupling_map(model)
+                       if getattr(model, 'active_rules', None) else None)
+    cap_ic_pairs: set[tuple[str, str]] = set()
+    if final_decap_map:
+        for ic_ref, cap_refs in final_decap_map.items():
+            for cap_ref in cap_refs:
+                cap_ic_pairs.add((min(ic_ref, cap_ref), max(ic_ref, cap_ref)))
+
+    def _overlaps_excluding_cap_ic(m: BoardModel) -> int:
+        if not cap_ic_pairs:
+            return count_overlaps(m)
+        n = 0
+        comps = m.components
+        for i in range(len(comps)):
+            for j in range(i + 1, len(comps)):
+                a, b = comps[i], comps[j]
+                if not a.overlaps(b):
+                    continue
+                key = (min(a.ref, b.ref), max(a.ref, b.ref))
+                if key in cap_ic_pairs:
+                    continue
+                n += 1
+        return n
+
+    post_legal_overlaps = _overlaps_excluding_cap_ic(model)
     if post_legal_overlaps > 0:
-        print(f"  Post-legalization overlap resolution ({post_legal_overlaps} overlaps)...")
-        from legalization.legalizer import _greedy_resolve
+        print(f"  Post-legalization overlap resolution ({post_legal_overlaps} "
+              f"non-cap-IC overlaps)...")
+        from legalization.legalizer import _greedy_resolve, _nudge_caps_to_ics
         _greedy_resolve(model, lcfg.grid_mm, True, interior_bbox)
+        # The greedy cleanup treats every overlap as bad, so it can push caps
+        # away from their ICs while clearing other overlaps.  Re-run the
+        # cap-IC nudge to restore decoupling adjacency before HPWL recovery.
+        if final_decap_map and getattr(model, 'active_rules', None):
+            _nudge_caps_to_ics(model, model.active_rules, interior_bbox,
+                               verbose=True, cached_decap_map=final_decap_map)
         print_board_summary(model, "After Post-Legalization Overlap Resolution")
+
+        # The greedy cleanup moves components to clear overlaps without much
+        # HPWL care.  Run cell_slide + pair_swap now that the board is clean
+        # to recover HPWL lost in the cleanup.
+        from legalization.post_legalize import post_legalization_refine
+        post_legalization_refine(
+            model, lcfg.grid_mm, interior_bbox, True, final_decap_map)
 
     # Step 8: Final cost evaluation
     costs_after = cost_fn.evaluate(model)

@@ -430,18 +430,41 @@ def post_legalization_refine(
     verbose: bool,
     cached_decap_map: dict | None,
 ) -> None:
-    """Run post-legalization HPWL recovery: slide -> swap -> slide."""
-    # Safety check: skip if there are remaining overlaps
-    overlaps, _ = _compute_overlap_stats(model)
-    if overlaps > 0:
-        if verbose:
-            print(f"  Post-legalization refine: skipping ({overlaps} overlaps remain)")
-        return
+    """Run post-legalization HPWL recovery: slide -> swap -> slide.
 
+    cell_slide checks each trial position against all neighbors before
+    accepting (via _has_any_overlap), so it is safe to run even when
+    residual overlaps exist — it just won't help the overlapping
+    components themselves.  Pair swap requires both endpoints
+    overlap-free, so it is skipped if any overlap remains.
+    """
+    overlaps, _ = _compute_overlap_stats(model)
     oob = _count_oob(model)
+
     if oob > 0:
         if verbose:
             print(f"  Post-legalization refine: skipping ({oob} out-of-bounds)")
+        return
+
+    if overlaps > 0:
+        if verbose:
+            print(f"  Post-legalization refine: cell-slide only "
+                  f"({overlaps} overlaps remain, pair-swap needs clean board)")
+        if verbose:
+            from engine.cost_function import total_hpwl
+            hpwl_before = total_hpwl(model)
+        cell_slide(model, grid_mm, interior_bbox, verbose, cached_decap_map)
+        if verbose:
+            try:
+                from engine.cost_function import total_hpwl
+                hpwl_after = total_hpwl(model)
+                pct = ((hpwl_before - hpwl_after) / hpwl_before * 100
+                       if hpwl_before > 0 else 0.0)
+                print(f"  Post-legalization refine (slide-only): HPWL "
+                      f"{hpwl_before:.1f} -> {hpwl_after:.1f} "
+                      f"({pct:+.2f}%)")
+            except Exception:
+                pass
         return
 
     if verbose:

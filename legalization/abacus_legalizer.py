@@ -29,7 +29,8 @@ def abacus_legalize(
 
     orig_positions = {id(c): (c.x, c.y, c.rotation) for c in movable}
 
-    rows = _assign_rows(movable, grid_mm, board, interior_bbox, model=model)
+    rows = _assign_rows(movable, grid_mm, board, interior_bbox, model=model,
+                        cached_decap_map=cached_decap_map)
 
     if verbose:
         print(f"  Abacus: {len(rows)} rows, {len(movable)} movable components")
@@ -70,6 +71,7 @@ def _assign_rows(
     board: BoardOutline,
     interior_bbox: tuple[float, float, float, float] | None = None,
     model: BoardModel | None = None,
+    cached_decap_map: dict | None = None,
 ) -> list[tuple[float, float, list[Component]]]:
     if not components:
         return []
@@ -93,12 +95,13 @@ def _assign_rows(
         row_map[row_idx].append(comp)
         comp_row[id(comp)] = row_idx
 
+    comp_map = {c.ref: c for c in components}
+
     # Net-topology-aware row merging: components sharing signal nets
     # preferentially placed in the same row if displacement is small.
     if model is not None:
         from engine.cost_state import _is_power_net
         net_comps: dict[int, list[Component]] = {}
-        comp_map = {c.ref: c for c in components}
         for net_idx, net in enumerate(model.nets):
             if _is_power_net(net.name):
                 continue
@@ -134,6 +137,38 @@ def _assign_rows(
                         row_map[target_row] = []
                     row_map[target_row].append(c)
                     comp_row[id(c)] = target_row
+
+    # Decoupling topology: pull each cap into its assigned IC's row so the
+    # legalizer doesn't put them on opposite sides of the board.  Power nets
+    # are excluded from the signal-net merging above, so without this pass
+    # decoupling caps end up wherever their initial Y placed them — typically
+    # far from the IC after SA condenses the cluster.
+    # Use a larger displacement tolerance than signal-net merging (4× row_pitch
+    # vs 2×) since cap-IC proximity is the whole point of the constraint rule.
+    if cached_decap_map:
+        for ic_ref, cap_refs in cached_decap_map.items():
+            ic = comp_map.get(ic_ref)
+            if ic is None:
+                continue
+            ic_row_idx = comp_row.get(id(ic))
+            if ic_row_idx is None:
+                continue
+            for cap_ref in cap_refs:
+                cap = comp_map.get(cap_ref)
+                if cap is None:
+                    continue
+                cap_row_idx = comp_row.get(id(cap))
+                if cap_row_idx is None or cap_row_idx == ic_row_idx:
+                    continue
+                target_y = y_min + ic_row_idx * row_pitch + row_pitch / 2
+                displacement = abs(target_y - cap.y)
+                if displacement < 4.0 * row_pitch:
+                    if cap_row_idx in row_map and cap in row_map[cap_row_idx]:
+                        row_map[cap_row_idx].remove(cap)
+                    if ic_row_idx not in row_map:
+                        row_map[ic_row_idx] = []
+                    row_map[ic_row_idx].append(cap)
+                    comp_row[id(cap)] = ic_row_idx
 
     row_map = {k: v for k, v in row_map.items() if v}
 
