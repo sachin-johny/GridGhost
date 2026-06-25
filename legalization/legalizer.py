@@ -94,6 +94,17 @@ def legalize(
     from legalization.post_legalize import post_legalization_refine
     post_legalization_refine(model, grid_mm, interior_bbox, verbose, cached_decap_map)
 
+    # Step 10: Cap-IC overlap cleanup.
+    # _nudge_caps_to_ics above intentionally allows caps to overlap their own
+    # IC (Phase 2 places the cap at IC center because the IC is excluded from
+    # its overlap check).  That keeps caps close for decoupling but produces
+    # illegal placements.  This final pass moves any such cap to the closest
+    # overlap-free slot adjacent to its IC, leaving all other components
+    # untouched.  Runs after post-legalization refine so nothing re-introduces
+    # the overlap afterward.
+    if rules:
+        _cleanup_cap_ic_overlaps(model, cached_decap_map, interior_bbox, verbose)
+
     if verbose:
         overlaps_after, _ = _compute_overlap_stats(model, grid)
         oob_after = _count_oob(model)
@@ -1129,6 +1140,157 @@ def _nudge_caps_to_ics(
             print(f"  Cap-IC nudge: {violations} caps still beyond {max_dist:.0f}mm threshold")
         else:
             print(f"  Cap-IC nudge: all caps within {max_dist:.0f}mm of their ICs")
+
+
+def _cleanup_cap_ic_overlaps(
+    model: BoardModel,
+    decap_map: dict | None,
+    interior_bbox: tuple[float, float, float, float] | None = None,
+    verbose: bool = False,
+) -> None:
+    """Move caps that overlap their assigned IC to the closest free adjacent slot.
+
+    _nudge_caps_to_ics intentionally lets a cap overlap its own IC (Phase 2
+    places it at the IC center via an IC-excluding overlap check).  That keeps
+    the cap close for decoupling but is geometrically illegal.  This pass
+    finds each such cap and relocates it to the nearest slot that sits just
+    outside the IC's bbox, checking overlap against *all* components (IC
+    included).  Leaves every other component where it is.
+
+    The candidate search mirrors _nudge_caps_to_ics Phase 1: 8 slots (4
+    sides + 4 corners) at spacings 0.5→2.5 mm, smallest spacing first so the
+    cap ends up packed tightly against the IC rather than drifting away.
+    """
+    if not decap_map:
+        return
+
+    board = model.board
+    components = list(model.components)
+
+    def _bbox_center_for_origin(cap, target_cx, target_cy, rotation):
+        rad = math.radians(rotation)
+        cos_r = math.cos(rad)
+        sin_r = math.sin(rad)
+        new_x = target_cx - cap.bbox_offset_x * cos_r + cap.bbox_offset_y * sin_r
+        new_y = target_cy - cap.bbox_offset_x * sin_r - cap.bbox_offset_y * cos_r
+        return new_x, new_y
+
+    def _slot_overlap_free(cap, trial_x, trial_y, ic) -> bool:
+        """Return True if cap at (trial_x, trial_y) overlaps nothing (IC included).
+
+        Mutates cap.x/cap.y temporarily; always restores.
+        """
+        half_w = cap.effective_width / 2.0
+        half_h = cap.effective_height / 2.0
+        if interior_bbox:
+            x_min = interior_bbox[0] + half_w
+            x_max = interior_bbox[2] - half_w
+            y_min = interior_bbox[1] + half_h
+            y_max = interior_bbox[3] - half_h
+        else:
+            x_min = board.x_min + half_w
+            x_max = board.x_max - half_w
+            y_min = board.y_min + half_h
+            y_max = board.y_max - half_h
+        if not (x_min <= trial_x <= x_max and y_min <= trial_y <= y_max):
+            return False
+
+        saved_x, saved_y = cap.x, cap.y
+        cap.x = trial_x
+        cap.y = trial_y
+        try:
+            for other in components:
+                if other is cap or other.is_fixed:
+                    continue
+                if cap.overlaps(other):
+                    return False
+            return True
+        finally:
+            cap.x = saved_x
+            cap.y = saved_y
+
+    moved = 0
+    unresolved = 0
+    for ic_ref, cap_refs in decap_map.items():
+        ic = model.get_component(ic_ref)
+        if not ic:
+            continue
+
+        for cap_ref in cap_refs:
+            cap = model.get_component(cap_ref)
+            if not cap:
+                continue
+            if cap.is_fixed or cap.is_edge_connector:
+                continue
+            if not cap.overlaps(ic):
+                continue
+
+            ic_bbox = ic.bbox
+            ic_bbox_cx = (ic_bbox[0] + ic_bbox[2]) / 2.0
+            ic_bbox_cy = (ic_bbox[1] + ic_bbox[3]) / 2.0
+
+            cap_start_x, cap_start_y = cap.x, cap.y
+            cap_start_rot = cap.rotation
+            rotations = [cap_start_rot]
+            if _is_non_square(cap):
+                rotations.append((cap_start_rot + 90) % 360)
+
+            best: tuple[float, float, float, float] | None = None  # (x, y, rot, dist)
+
+            for try_rot in rotations:
+                if try_rot != cap_start_rot:
+                    cap.set_rotation(try_rot)
+
+                cap_half_w = cap.effective_width / 2.0
+                cap_half_h = cap.effective_height / 2.0
+
+                for spacing_mult in [1.0, 1.5, 2.0, 3.0, 5.0]:
+                    gap = 0.5 * spacing_mult
+                    right_cx = ic_bbox[2] + gap + cap_half_w
+                    left_cx = ic_bbox[0] - gap - cap_half_w
+                    below_cy = ic_bbox[3] + gap + cap_half_h
+                    above_cy = ic_bbox[1] - gap - cap_half_h
+
+                    candidates_origin = [
+                        _bbox_center_for_origin(cap, right_cx, ic_bbox_cy, try_rot),
+                        _bbox_center_for_origin(cap, left_cx, ic_bbox_cy, try_rot),
+                        _bbox_center_for_origin(cap, ic_bbox_cx, below_cy, try_rot),
+                        _bbox_center_for_origin(cap, ic_bbox_cx, above_cy, try_rot),
+                        _bbox_center_for_origin(cap, right_cx, below_cy, try_rot),
+                        _bbox_center_for_origin(cap, left_cx, below_cy, try_rot),
+                        _bbox_center_for_origin(cap, right_cx, above_cy, try_rot),
+                        _bbox_center_for_origin(cap, left_cx, above_cy, try_rot),
+                    ]
+
+                    for cand_x, cand_y in candidates_origin:
+                        if not _slot_overlap_free(cap, cand_x, cand_y, ic):
+                            continue
+                        dist = math.hypot(ic.x - cand_x, ic.y - cand_y)
+                        if (best is None or dist < best[3]
+                                or (dist == best[3]
+                                    and try_rot == cap_start_rot
+                                    and best[2] != cap_start_rot)):
+                            best = (cand_x, cand_y, try_rot, dist)
+                        break
+                    if best is not None:
+                        break
+
+                cap.x, cap.y = cap_start_x, cap_start_y
+                if try_rot != cap_start_rot:
+                    cap.set_rotation(cap_start_rot)
+
+            if best is not None:
+                cap.x = best[0]
+                cap.y = best[1]
+                if cap.rotation != best[2]:
+                    cap.set_rotation(best[2])
+                moved += 1
+            else:
+                unresolved += 1
+
+    if verbose and (moved or unresolved):
+        print(f"  Cap-IC overlap cleanup: moved {moved} caps adjacent to their ICs"
+              + (f", {unresolved} still overlapping (no free adjacent slot)" if unresolved else ""))
 
 
 def _count_overlaps(model: BoardModel) -> int:
