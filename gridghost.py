@@ -20,9 +20,10 @@ from parsers.kicad_parser import KiCadParser
 from parsers.placement_writer import apply_placement, export_positions_json, write_debug_bboxes
 from engine.net_clustering import cluster_components, compute_seed_positions
 from engine.grid_placement import grid_place, force_directed_place
-from engine.smart_placement import smart_grid_place
+from engine.smart_placement import smart_grid_place, _is_vertical_connector, _compute_interior_bbox
 from engine.cost_function import CostFunction, total_hpwl, count_overlaps, count_out_of_bounds
 from engine.annealer import run_sa, SAConfig
+from engine.placement_prepass import preplace_caps_near_ics
 from legalization.legalizer import legalize
 from profiles.board_profiles import get_profile, list_profiles, BoardProfile
 from utils.display import (
@@ -177,6 +178,28 @@ def cmd_place(args) -> None:
 
     print_board_summary(model, "After Placement")
 
+    # Step 4.5: Pre-place decoupling caps adjacent to their ICs.
+    # Gives SA a good starting configuration so the group-aware density
+    # grid has correct grouping from t=0. Gated on decoupling_proximity
+    # rule (only mcu_peripheral enables it today).
+    if any(r.name == 'decoupling_proximity' and r.enabled for r in profile.rules):
+        interior_comps_pp = [
+            c for c in model.components
+            if not c.is_fixed and (
+                getattr(c, 'component_type', '') != 'connector'
+                or _is_vertical_connector(c)
+            )
+        ]
+        interior_bbox_pp = (
+            _compute_interior_bbox(interior_comps_pp, model.board, 5.0)
+            if interior_comps_pp else None
+        )
+        n_moved = preplace_caps_near_ics(
+            model, profile.rules, interior_bbox=interior_bbox_pp, verbose=False
+        )
+        if n_moved:
+            print(f"  Pre-placed {n_moved} decoupling cap(s) near their ICs")
+
     # Step 5.5: Post-placement optimization
     # Default is enhanced greedy+swap (no global SA).
     # Use --sa to additionally run global SA before greedy.
@@ -230,7 +253,6 @@ def cmd_place(args) -> None:
 
     # Compute interior bbox for legalizer so it clamps interior components
     # away from edge connectors
-    from engine.smart_placement import _is_vertical_connector, _compute_interior_bbox
     interior_comps = [
         c for c in model.components
         if not c.is_fixed and (

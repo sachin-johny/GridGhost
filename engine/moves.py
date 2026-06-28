@@ -58,7 +58,16 @@ def do_translate(
     bias_dx: float = 0.0,
     bias_dy: float = 0.0,
 ) -> MoveUndo:
-    """Pick a random component and apply a random displacement."""
+    """Pick a random component and apply a random displacement.
+
+    Group-aware: when the selected component is an IC with assigned
+    decoupling caps, the caps are translated by the same delta. Keeps
+    cap-IC groups together so the density penalty (which treats the
+    group as one unit) doesn't fight the decoupling_proximity constraint.
+
+    Caps are clamped to board bounds — a temporarily broken group is
+    acceptable; the next nudge pass restores adjacency.
+    """
     idx = random.choice(moveable_indices)
     comp = model.components[idx]
     old = (idx, comp.x, comp.y, comp.rotation)
@@ -68,7 +77,45 @@ def do_translate(
     comp.x += dx
     comp.y += dy
 
-    return MoveUndo(move_type='translate', old_states=[old])
+    old_states = [old]
+
+    ic_types = {'ic', 'mcu', 'regulator'}
+    if getattr(comp, 'component_type', '') in ic_types:
+        # Reuse the decoupling map published by CostState on the model
+        # (avoids rebuilding it on every translate call).
+        decap_map = getattr(model, '_decap_map_cache', None)
+        if decap_map is None:
+            try:
+                from engine.constraint_evaluator import _build_decoupling_map
+                decap_map = _build_decoupling_map(model)
+                model._decap_map_cache = decap_map
+            except Exception:
+                decap_map = {}
+
+        cap_refs = decap_map.get(comp.ref, []) if decap_map else []
+        if cap_refs:
+            ref_to_idx = getattr(model, '_comp_ref_idx_map', None)
+            if ref_to_idx is None:
+                ref_to_idx = {c.ref: i for i, c in enumerate(model.components)}
+                model._comp_ref_idx_map = ref_to_idx
+
+            board = model.board
+            for cap_ref in cap_refs:
+                cap_idx = ref_to_idx.get(cap_ref)
+                if cap_idx is None:
+                    continue
+                cap = model.components[cap_idx]
+                if cap.is_fixed or cap.is_edge_connector:
+                    continue
+                old_states.append((cap_idx, cap.x, cap.y, cap.rotation))
+                half_w = cap.effective_width / 2.0
+                half_h = cap.effective_height / 2.0
+                cap.x = max(board.x_min + half_w,
+                            min(cap.x + dx, board.x_max - half_w))
+                cap.y = max(board.y_min + half_h,
+                            min(cap.y + dy, board.y_max - half_h))
+
+    return MoveUndo(move_type='translate', old_states=old_states)
 
 
 def do_swap(

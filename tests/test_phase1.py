@@ -698,6 +698,82 @@ def test_snapshot_restore():
         f"Restored cost {restored_cost} != original {original_cost}"
 
 
+def test_density_gated_by_decap_rule():
+    """Density penalty must be 0 when decoupling rule is inactive,
+    and non-zero when active and components are clustered."""
+    from profiles.board_profiles import ConstraintRule
+
+    model = _make_test_model()
+
+    # No rules → density must be 0 (gating proof)
+    cs_no_rules = CostState(model)
+    assert cs_no_rules.density_penalty == 0.0, \
+        "Density should be 0 without decoupling rule"
+    assert cs_no_rules._decap_map is None, \
+        "_decap_map should be None without decoupling rule"
+
+    # With decoupling rule → density fires when components cluster.
+    # Cluster all movable components into one corner to force high Gini.
+    decap_rule = ConstraintRule(
+        name="decoupling_proximity",
+        weight=4.0,
+        params={"max_distance_mm": 5.0},
+    )
+    cs = CostState(model, rules=[decap_rule])
+    assert cs._decap_map is not None, \
+        "_decap_map should be built when decoupling rule active"
+    # C1 and C2 share VCC with U1 — they should be assigned to U1.
+    cap_refs = set()
+    for caps in cs._decap_map.values():
+        cap_refs.update(caps)
+    assert "C1" in cap_refs and "C2" in cap_refs, \
+        f"C1/C2 should be assigned as decoupling caps, got {cap_refs}"
+
+    # Cluster movable components into one corner of the 10x10 grid
+    for c in model.components:
+        if not c.is_fixed:
+            c.x = 1.0
+            c.y = 1.0
+    cs.incremental_update({i for i, c in enumerate(model.components) if not c.is_fixed})
+    assert cs.density_penalty > 0.0, \
+        "Density penalty should be > 0 when components are clustered"
+
+
+def test_snapshot_restore_with_density():
+    """Snapshot/restore must round-trip density state cleanly when
+    the decoupling rule is active (otherwise SA silent regression)."""
+    from profiles.board_profiles import ConstraintRule
+
+    model = _make_test_model()
+    decap_rule = ConstraintRule(
+        name="decoupling_proximity",
+        weight=4.0,
+        params={"max_distance_mm": 5.0},
+    )
+    cs = CostState(model, rules=[decap_rule])
+    original_cost = cs.total_cost
+    original_density = cs.density_penalty
+
+    # Move a component, snapshot, update, then restore
+    comp = model.components[1]
+    comp.x += 10.0
+    snap = cs.snapshot({1})
+    cs.incremental_update({1})
+    moved_cost = cs.total_cost
+    assert moved_cost != original_cost, "Cost should change after move"
+
+    # Restore
+    comp.x -= 10.0
+    cs.restore(snap)
+    restored_cost = cs.total_cost
+    restored_density = cs.density_penalty
+
+    assert abs(restored_cost - original_cost) < 0.01, \
+        f"Restored cost {restored_cost} != original {original_cost}"
+    assert abs(restored_density - original_density) < 0.01, \
+        f"Restored density {restored_density} != original {original_density}"
+
+
 # ---------------------------------------------------------------------------
 # Phase 6: Move Operator Tests
 # ---------------------------------------------------------------------------
@@ -707,16 +783,26 @@ def test_translate_move_and_revert():
     moveable = get_moveable_indices(model)
     assert len(moveable) > 0
 
+    # Group-aware translate may move 1+ components: if the picked component
+    # is an IC with assigned decoupling caps, the caps move with it.
     undo = do_translate(model, moveable, 0.5, 5.0)
-    assert len(undo.old_states) == 1
+    assert len(undo.old_states) >= 1
 
-    idx, old_x, old_y, old_rot = undo.old_states[0]
-    comp = model.components[idx]
-    assert comp.x != old_x or comp.y != old_y, "Translate should change position"
+    # Capture pre-revert positions, then revert and verify all restored.
+    pre_revert = [(i, model.components[i].x, model.components[i].y)
+                  for i, _, _, _ in undo.old_states]
+    # At least the picked component should have moved
+    idx0, old_x0, old_y0, _ = undo.old_states[0]
+    assert (model.components[idx0].x != old_x0
+            or model.components[idx0].y != old_y0), \
+        "Translate should change position"
 
     revert_move(model, undo)
-    assert abs(comp.x - old_x) < 0.001, "X should be restored"
-    assert abs(comp.y - old_y) < 0.001, "Y should be restored"
+    for idx, old_x, old_y, _ in undo.old_states:
+        assert abs(model.components[idx].x - old_x) < 0.001, \
+            f"Component {idx} X should be restored"
+        assert abs(model.components[idx].y - old_y) < 0.001, \
+            f"Component {idx} Y should be restored"
 
 
 def test_swap_move_and_revert():
@@ -959,6 +1045,8 @@ def main():
     run_test("CostState matches full compute", test_cost_state_matches_full_compute)
     run_test("Incremental update matches full", test_incremental_update_matches_full)
     run_test("Snapshot restore", test_snapshot_restore)
+    run_test("Density gated by decap rule", test_density_gated_by_decap_rule)
+    run_test("Snapshot restore with density", test_snapshot_restore_with_density)
 
     print("\nPhase 6: Move Operators:")
     run_test("Translate move and revert", test_translate_move_and_revert)
