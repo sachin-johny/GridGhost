@@ -192,10 +192,15 @@ def do_median(
         comp.y += dy
         return MoveUndo(move_type='median', old_states=[old])
 
-    # Build ref→component index once (cached on model for performance)
-    if not hasattr(model, '_comp_ref_map'):
-        model._comp_ref_map = {c.ref: c for c in model.components}
-    ref_map = model._comp_ref_map
+    # Build ref→component index once (cached on model for performance).
+    # BoardModel.get_component maintains this index lazily and rebuilds
+    # automatically if components are appended/removed.
+    ref_map = None
+    if hasattr(model, '_comp_ref_map') and len(model._comp_ref_map) == len(model.components):
+        ref_map = model._comp_ref_map
+    else:
+        ref_map = {c.ref: c for c in model.components}
+        model._comp_ref_map = ref_map
 
     for net in model.nets:
         if net.name not in comp_nets:

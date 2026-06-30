@@ -609,7 +609,11 @@ def _build_swap_candidates(
     for idx in moveable_indices:
         comp = model.components[idx]
         comp_area[idx] = comp.effective_width * comp.effective_height
-        comp_nets[idx] = cost_state._comp_nets[idx]
+        # Store as a sorted list so downstream iteration is deterministic
+        # (set iteration varies with id() under ASLR, which made the
+        # swap-candidate order — and therefore the entire greedy+swap
+        # trajectory — non-deterministic across runs).
+        comp_nets[idx] = sorted(cost_state._comp_nets[idx])
         # HPWL contribution
         total = 0.0
         for net_name in comp_nets[idx]:

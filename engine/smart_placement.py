@@ -769,14 +769,18 @@ def _apply_repulsion(
             for cb in components[i + 1:]:
                 dx = cb.x - ca.x
                 dy = cb.y - ca.y
-                dist = math.sqrt(dx * dx + dy * dy)
+                dist_sq = dx * dx + dy * dy
 
                 min_dist = max(
                     ca.effective_width, ca.effective_height,
                     cb.effective_width, cb.effective_height
                 ) * spacing_factor * 0.8
+                min_dist_sq = min_dist * min_dist
 
-                if dist < min_dist:
+                if dist_sq < min_dist_sq:
+                    # Only pay the sqrt cost when an overlap is actually
+                    # detected — saves O(n²) sqrt calls per iteration.
+                    dist = math.sqrt(dist_sq) if dist_sq > 0.01 else 0.0
                     if dist < 0.1:
                         angle = (ca.x + ca.y) * 0.5
                         dx, dy = math.cos(angle), math.sin(angle)

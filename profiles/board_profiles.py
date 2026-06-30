@@ -9,10 +9,26 @@ Each profile sets:
 
 from __future__ import annotations
 
-import yaml
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 from pathlib import Path
+
+
+def _require_yaml():
+    """Lazy-import PyYAML, raising a helpful error if it's not installed.
+
+    PyYAML is an optional dependency — it's only needed when loading or
+    saving custom board profiles from YAML files.  The default pipeline
+    uses the built-in dict profiles, so most users never need it.
+    """
+    try:
+        import yaml  # type: ignore
+        return yaml
+    except ImportError as exc:  # pragma: no cover - exercised only without pyyaml
+        raise ImportError(
+            "PyYAML is required for YAML board profile loading/saving. "
+            "Install it with: pip install pyyaml"
+        ) from exc
 
 
 @dataclass
@@ -171,6 +187,7 @@ def list_profiles() -> list[BoardProfile]:
 
 def load_profile_from_yaml(path: str) -> BoardProfile:
     """Load a custom board profile from a YAML file."""
+    yaml = _require_yaml()
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     rules = [
         ConstraintRule(
@@ -195,6 +212,7 @@ def load_profile_from_yaml(path: str) -> BoardProfile:
 
 def save_profile_to_yaml(profile: BoardProfile, path: str) -> None:
     """Save a board profile to a YAML file."""
+    yaml = _require_yaml()
     data = {
         "name": profile.name,
         "display_name": profile.display_name,

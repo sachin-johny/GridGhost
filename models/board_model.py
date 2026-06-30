@@ -8,8 +8,15 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+
+
+# Pre-compiled regexes for Component.is_edge_connector — previously
+# re.search() ran on every property access in tight loops.
+_RE_VERTICAL_THT = re.compile(r'Vertical|THT', re.IGNORECASE)
+_RE_HORIZONTAL = re.compile(r'Horizontal|Angled|Side', re.IGNORECASE)
 
 
 @dataclass
@@ -68,11 +75,17 @@ class Component:
     _courtyard_rot_w: float = field(default=0.0, repr=False, compare=False)
     _courtyard_rot_h: float = field(default=0.0, repr=False, compare=False)
 
+    # Cached at construction — footprint/value/component_type never change
+    # after parse time, so this avoids re-running regex on every tight-loop
+    # access (legalizer/SA hit this many times per iteration).
+    is_edge_connector: bool = field(default=False, repr=False, compare=False, init=False)
+
     _POSITION_FIELDS = frozenset({'x', 'y', 'rotation', 'bbox_offset_x', 'bbox_offset_y'})
 
     def __post_init__(self):
         self._update_courtyard_sizes()
         self._dirty = True
+        self.is_edge_connector = self._compute_is_edge_connector()
 
     def __setattr__(self, name: str, value) -> None:
         super().__setattr__(name, value)
@@ -155,26 +168,31 @@ class Component:
         if ox2 <= ox1 or oy2 <= oy1:
             return 0.0
         return (ox2 - ox1) * (oy2 - oy1)
-    
-    @property
-    def is_edge_connector(self) -> bool:
-        """True for edge-mount connectors placed on the board perimeter.
 
-        These connectors intentionally overhang the board edge (pads are
-        inside, body extends outward) and should be excluded from OOB counts.
+    def _compute_is_edge_connector(self) -> bool:
+        """Compute the is_edge_connector flag once at construction.
+
+        True for edge-mount connectors placed on the board perimeter.
+        These intentionally overhang the board edge (pads inside, body
+        extends outward) and should be excluded from OOB counts.
         Vertical/THT connectors are interior components, not edge connectors.
         """
-        import re
         if getattr(self, 'component_type', '') != "connector":
             return False
-        fp  = getattr(self, 'footprint', '') or ''
+        fp = getattr(self, 'footprint', '') or ''
         val = getattr(self, 'value', '') or ''
         name = fp + ' ' + val
-        if re.search(r'Vertical|THT', name, re.IGNORECASE):
+        if _RE_VERTICAL_THT.search(name):
             return False
-        if re.search(r'Horizontal|Angled|Side', name, re.IGNORECASE):
+        if _RE_HORIZONTAL.search(name):
             return True
-        return not re.search(r'Vertical|THT', name, re.IGNORECASE)
+        return not _RE_VERTICAL_THT.search(name)
+
+    # Restore identity-based hashing so Component instances can be stored in
+    # sets/dicts (used by the legalizer's SpatialGrid broad-phase index).
+    # dataclass with eq=True sets __hash__ to None; we override with identity
+    # hashing since we never compare distinct instances for field equality.
+    __hash__ = object.__hash__
 
 
 @dataclass
@@ -243,10 +261,21 @@ class BoardModel:
     # ---- Lookup helpers ----
 
     def get_component(self, ref: str) -> Optional[Component]:
-        for c in self.components:
-            if c.ref == ref:
-                return c
-        return None
+        """Return the component with the given ref, or None.
+
+        Uses a lazily-built dict index for O(1) lookup.  The index is
+        rebuilt automatically if len(self.components) changes.  If you
+        replace a component in-place, call rebuild_ref_index() to refresh.
+        """
+        idx = getattr(self, '_comp_ref_map', None)
+        if idx is None or len(idx) != len(self.components):
+            idx = {c.ref: c for c in self.components}
+            self._comp_ref_map = idx
+        return idx.get(ref)
+
+    def rebuild_ref_index(self) -> None:
+        """Force a rebuild of the ref -> Component index."""
+        self._comp_ref_map = {c.ref: c for c in self.components}
 
     def get_net(self, name: str) -> Optional[Net]:
         for n in self.nets:

@@ -105,22 +105,30 @@ def _build_decoupling_map(
     # cap → set of IC refs that share at least one power net
     cap_to_ics: dict[str, set[str]] = defaultdict(set)
 
-    for net_name, refs in power_nets.items():
+    # Iterate power_nets and net_caps in sorted order so the
+    # cap_to_ics insertion order (and downstream min() tie-breaking in
+    # the round-robin) is deterministic across runs. Without this, set
+    # iteration order varies with id() under ASLR, leading to different
+    # cap→IC assignments and different SA trajectories.
+    for net_name in sorted(power_nets.keys()):
+        refs = power_nets[net_name]
         net_ics = refs & ic_refs
         # Check if non-IC refs are actually capacitors via ref→type lookup
         net_caps = {r for r in refs if r not in ic_refs and ref_to_type.get(r) == 'capacitor'}
-        for cap_ref in net_caps:
+        for cap_ref in sorted(net_caps):
             cap_to_ics[cap_ref].update(net_ics)
 
     # Distribute caps round-robin: each cap goes to the IC with the
     # fewest caps currently assigned (among ICs that share its power net).
     # This ensures every IC gets decoupling caps, not just one.
     ic_caps: dict[str, list[str]] = defaultdict(list)
-    for cap_ref, candidate_ics in cap_to_ics.items():
+    for cap_ref in sorted(cap_to_ics.keys()):
+        candidate_ics = cap_to_ics[cap_ref]
         if not candidate_ics:
             continue
-        # Pick the IC with fewest caps assigned so far
-        best_ic = min(candidate_ics, key=lambda r: len(ic_caps[r]))
+        # Pick the IC with fewest caps assigned so far. Sort to break
+        # ties deterministically (min() returns the first minimum).
+        best_ic = min(sorted(candidate_ics), key=lambda r: len(ic_caps[r]))
         ic_caps[best_ic].append(cap_ref)
 
     return dict(ic_caps)

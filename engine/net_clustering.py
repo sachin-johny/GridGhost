@@ -13,7 +13,7 @@ import math
 from collections import defaultdict
 from typing import Optional
 
-import networkx as nx
+from engine._pure_graph import Graph, louvain_communities
 
 from models.board_model import BoardModel, Component, BoardOutline
 
@@ -21,7 +21,7 @@ from models.board_model import BoardModel, Component, BoardOutline
 from engine.cost_state import _is_power_net
 
 
-def build_net_hypergraph(model: BoardModel) -> nx.Graph:
+def build_net_hypergraph(model: BoardModel) -> Graph:
     """Build a weighted graph where nodes are components and edges represent shared nets.
 
     Edge weight = number of shared nets between two components.
@@ -35,7 +35,7 @@ def build_net_hypergraph(model: BoardModel) -> nx.Graph:
     insight from the user's suggestion: use +3V3, +12V labels to link
     caps to their ICs.
     """
-    G = nx.Graph()
+    G = Graph()
 
     # Add all movable components as nodes
     comp_type_map: dict[str, str] = {}
@@ -69,7 +69,7 @@ def build_net_hypergraph(model: BoardModel) -> nx.Graph:
 
 
 def _add_power_rail_edges(
-    G: nx.Graph,
+    G: Graph,
     model: BoardModel,
     comp_type_map: dict[str, str],
 ) -> None:
@@ -275,7 +275,7 @@ def _ensure_ic_has_caps(
                 cluster.append(best_cap_ref)
 
 
-def _greedy_clustering(G: nx.Graph, n_clusters: int) -> list[list[str]]:
+def _greedy_clustering(G: Graph, n_clusters: int) -> list[list[str]]:
     """Balanced greedy clustering with soft size constraint.
 
     Seed clusters from highest-degree nodes, then assign each remaining
@@ -323,11 +323,11 @@ def _greedy_clustering(G: nx.Graph, n_clusters: int) -> list[list[str]]:
     return clusters
 
 
-def _louvain_clustering(G: nx.Graph, n_clusters: int) -> list[list[str]]:
-    """Community detection using Louvain method via networkx."""
+def _louvain_clustering(G: Graph, n_clusters: int) -> list[list[str]]:
+    """Community detection using the Louvain method (pure-Python implementation)."""
     try:
-        communities = nx.community.louvain_communities(G, weight="weight")
-    except AttributeError:
+        communities = louvain_communities(G, weight="weight")
+    except Exception:
         communities = _greedy_clustering(G, n_clusters)
         return communities
 

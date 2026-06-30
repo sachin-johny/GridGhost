@@ -16,8 +16,6 @@ from __future__ import annotations
 import math
 from itertools import combinations
 
-import numpy as np
-
 from models.board_model import BoardModel, Component, Net
 from profiles.board_profiles import ConstraintRule
 from engine.constraint_evaluator import evaluate_constraint_penalties
@@ -121,6 +119,37 @@ def count_overlaps(model: BoardModel) -> int:
     return count
 
 
+def overlap_penalty_and_count(model: BoardModel) -> tuple[float, int]:
+    """Single O(n^2) pass returning (total_overlap_area, overlap_pair_count).
+
+    Replaces the two separate O(n^2) scans previously done by
+    ``total_overlap_penalty`` and ``count_overlaps``.  ``Component.overlaps``
+    is essentially the same AABB test as the bounds check inside
+    ``overlap_area``, so doing both in one pass halves the work.
+    """
+    total_area = 0.0
+    count = 0
+    components = model.components
+    n = len(components)
+    for i in range(n):
+        ci = components[i]
+        ax1, ay1, ax2, ay2 = ci.bbox
+        for j in range(i + 1, n):
+            cj = components[j]
+            bx1, by1, bx2, by2 = cj.bbox
+            # Quick AABB reject — avoid the function-call overhead of
+            # overlap_area when there is no overlap at all.
+            ox1 = ax1 if ax1 > bx1 else bx1
+            oy1 = ay1 if ay1 > by1 else by1
+            ox2 = ax2 if ax2 < bx2 else bx2
+            oy2 = ay2 if ay2 < by2 else by2
+            if ox2 <= ox1 or oy2 <= oy1:
+                continue
+            count += 1
+            total_area += (ox2 - ox1) * (oy2 - oy1)
+    return total_area, count
+
+
 # ---------------------------------------------------------------------------
 # Boundary Penalty
 # ---------------------------------------------------------------------------
@@ -200,7 +229,8 @@ class CostFunction:
     def evaluate(self, model: BoardModel) -> dict[str, float]:
         """Evaluate all cost terms and return a detailed breakdown."""
         hpwl = total_hpwl(model)
-        overlap = total_overlap_penalty(model)
+        # Single O(n^2) pass for both overlap area and overlap count.
+        overlap, overlap_count = overlap_penalty_and_count(model)
         boundary = total_boundary_penalty(model)
 
         # Constraint penalties — fully implemented via constraint_evaluator
@@ -221,7 +251,7 @@ class CostFunction:
             "overlap": overlap,
             "boundary": boundary,
             "constraint": constraint,
-            "overlap_count": count_overlaps(model),
+            "overlap_count": overlap_count,
             "oob_count": count_out_of_bounds(model),
         }
         # Merge per-rule breakdown so display code can show details
