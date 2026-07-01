@@ -305,14 +305,22 @@ def cmd_place(args) -> None:
     if post_legal_overlaps > 0:
         print(f"  Post-legalization overlap resolution ({post_legal_overlaps} "
               f"non-cap-IC overlaps)...")
-        from legalization.legalizer import _greedy_resolve, _nudge_caps_to_ics
+        from legalization.legalizer import (
+            _greedy_resolve, _nudge_caps_to_ics, _cleanup_cap_ic_overlaps,
+        )
         _greedy_resolve(model, lcfg.grid_mm, True, interior_bbox)
         # The greedy cleanup treats every overlap as bad, so it can push caps
         # away from their ICs while clearing other overlaps.  Re-run the
         # cap-IC nudge to restore decoupling adjacency before HPWL recovery.
+        # _nudge_caps_to_ics intentionally lets a cap overlap its own IC (its
+        # overlap check excludes the IC), so the cleanup companion must run
+        # afterward to relocate such caps to a free adjacent slot — otherwise
+        # the nudge leaves illegal cap-IC overlaps behind.
         if final_decap_map and getattr(model, 'active_rules', None):
             _nudge_caps_to_ics(model, model.active_rules, interior_bbox,
                                verbose=True, cached_decap_map=final_decap_map)
+            _cleanup_cap_ic_overlaps(model, final_decap_map, interior_bbox,
+                                     verbose=True)
         print_board_summary(model, "After Post-Legalization Overlap Resolution")
 
         # The greedy cleanup moves components to clear overlaps without much
