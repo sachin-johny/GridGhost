@@ -34,6 +34,8 @@ def print_cost_breakdown(costs: dict, title: str = "Cost Breakdown") -> None:
     print(f"  Overlap penalty:   {costs['overlap']:.2f}")
     print(f"  Boundary penalty:  {costs['boundary']:.2f}")
     print(f"  Constraint penalty:{costs['constraint']:.2f}")
+    if 'density' in costs:
+        print(f"  Density penalty:   {costs['density']:.2f}")
     # Show per-rule constraint breakdown if present
     constraint_keys = [k for k in costs if k.startswith('constraint_') and k != 'constraint']
     if constraint_keys:

@@ -198,6 +198,63 @@ def count_out_of_bounds(model: BoardModel) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Density Penalty (ePlace-style Gini coefficient on a 10x10 grid)
+# ---------------------------------------------------------------------------
+
+def _gini_density_penalty(model: BoardModel, rules: list | None = None) -> float:
+    """Gini coefficient of cell-occupancy on a 10x10 grid, scaled by total.
+
+    Mirrors the density penalty in CostState so CostFunction.evaluate and
+    CostState.normalized_cost agree. Returns 0 when components are uniformly
+    distributed; increases as they cluster into fewer cells.
+
+    Decoupling caps assigned to an IC are absorbed into the IC's cell
+    (counted once at the IC's position) so density doesn't fight the
+    decoupling_proximity constraint — same grouping logic as CostState.
+    """
+    from engine.cost_state import DENSITY_GRID
+    from engine.constraint_evaluator import _build_decoupling_map
+
+    board = model.board
+    cell_w = (board.x_max - board.x_min) / DENSITY_GRID
+    cell_h = (board.y_max - board.y_min) / DENSITY_GRID
+    if cell_w <= 0 or cell_h <= 0:
+        return 0.0
+
+    # Build cap-IC grouping (only when decoupling rule is active)
+    grouped_cap_refs: set[str] = set()
+    if rules:
+        decap_map = _build_decoupling_map(model)
+        if decap_map:
+            for cap_refs in decap_map.values():
+                grouped_cap_refs.update(cap_refs)
+
+    grid = [0] * (DENSITY_GRID * DENSITY_GRID)
+    total = 0
+    bx_min = board.x_min
+    by_min = board.y_min
+    for c in model.components:
+        if c.is_fixed or c.is_edge_connector:
+            continue
+        if c.ref in grouped_cap_refs:
+            continue  # absorbed into IC's cell
+        gx = int((c.x - bx_min) / cell_w)
+        gy = int((c.y - by_min) / cell_h)
+        gx = max(0, min(DENSITY_GRID - 1, gx))
+        gy = max(0, min(DENSITY_GRID - 1, gy))
+        grid[gx + gy * DENSITY_GRID] += 1
+        total += 1
+
+    if total == 0:
+        return 0.0
+    n = DENSITY_GRID * DENSITY_GRID
+    s = sorted(grid)
+    cum = sum((i + 1) * v for i, v in enumerate(s))
+    gini = (2 * cum) / (n * total) - (n + 1) / n
+    return gini * total
+
+
+# ---------------------------------------------------------------------------
 # Combined Cost Function
 # ---------------------------------------------------------------------------
 
@@ -238,12 +295,32 @@ class CostFunction:
             model, self.rules
         )
 
+        # Density penalty (ePlace-style Gini on a 10x10 grid). Active when
+        # the decoupling_proximity rule is enabled (matches CostState gating).
+        # Reported here so the post-placement cost breakdown reflects the
+        # same spreading pressure the optimizer felt during SA/greedy.
+        density = 0.0
+        if self.rules and any(r.name == 'decoupling_proximity' and r.enabled for r in self.rules):
+            density = _gini_density_penalty(model, self.rules)
+
         total = (
             self.alpha * hpwl +
             self.beta * overlap +
             self.gamma * boundary +
             self.delta * constraint
         )
+        # Add density at the adaptive weight CostState uses, so evaluate()
+        # and CostState.normalized_cost agree on the density contribution.
+        from engine.cost_state import density_adaptive_weight
+        board_area = model.board.width * model.board.height
+        if board_area > 0:
+            comp_area = sum(c.effective_width * c.effective_height for c in model.components)
+            n_moveable = sum(1 for c in model.components if not c.is_fixed and not c.is_edge_connector)
+            dw = density_adaptive_weight(comp_area / board_area, n_moveable)
+        else:
+            from engine.cost_state import DENSITY_WEIGHT
+            dw = DENSITY_WEIGHT
+        total += dw * density
 
         result = {
             "total": total,
@@ -251,6 +328,7 @@ class CostFunction:
             "overlap": overlap,
             "boundary": boundary,
             "constraint": constraint,
+            "density": density,
             "overlap_count": overlap_count,
             "oob_count": count_out_of_bounds(model),
         }

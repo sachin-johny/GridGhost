@@ -12,6 +12,7 @@
 - **Smart interior-first placement** — places interior components (ICs + passives) via cluster-based grid layout, then positions edge connectors around the interior perimeter with pad-based rotation so they face outward correctly
 - **Force-directed placement** — alternative algorithm using attractive (HPWL gradient) and repulsive (inverse-distance) forces with cooling schedule for convergence
 - **Simulated annealing (v8 strategy)** — adaptive cooling with penalty scaling (hot SA discounts overlaps for exploration, cold SA enforces them), reheating rounds, and greedy refinement with hard overlap rejection
+- **Density-aware spreading** — ePlace-style Gini coefficient on a 10×10 cell-occupancy grid adds a soft spreading force so HPWL doesn't collapse everything into a center-of-mass cluster. Weight is adaptive — scaled down for dense/packed boards (no room to spread) and up for sparse boards. A fill-first spread move operator in the interior SA jumps components from overcrowded cells to empty cells within the outline, with SA's Metropolis acceptance filtering HPWL-disastrous jumps
 - **Dedicated overlap resolver** — after greedy refinement, force-resolves any remaining overlaps by pushing component pairs apart, accepting HPWL increases to guarantee zero overlaps before legalization
 - **Incremental cost computation** — O(k) per SA move using sorted sweep-line index and per-net HPWL caching, with snapshot/restore for move rejection
 - **10 constraint rules** — decoupling proximity, crystal-MCU, connector-edge, thermal grouping, high-current path, bulk cap input, antenna keepout, analog/digital separation, matched length, and ground-plane clearance
@@ -125,13 +126,14 @@ Pass `--interactive` to adjust cost weights and rule priorities before placement
 ## Cost Function
 
 ```text
-Total Cost = α · HPWL + β · Overlap + γ · Boundary + δ · Σ(wₖ · Cₖ)
+Total Cost = α · HPWL + β · Overlap + γ · Boundary + δ · Σ(wₖ · Cₖ) + w_density · Gini
 ```
 
 - **HPWL** — Half-perimeter wirelength. Clique model for nets with 4 or fewer pins (pairwise Manhattan distances, normalized), star model for nets with more than 4 pins (distances to center-of-mass auxiliary point). Power/ground nets are excluded since their HPWL is nearly constant regardless of placement.
 - **Overlap** — Courtyard intersection area between component pairs. Penalized proportionally so the SA gradient can optimize it continuously.
 - **Boundary** — Linear distance penalty for components whose bounding box extends outside the board outline. Edge connectors (horizontal/surface-mount) are excluded since they intentionally overhang the board edge.
 - **Constraints** — Rule-based penalties, each producing a continuous non-negative value proportional to violation severity. See the constraint rules section below.
+- **Density (Gini)** — Soft spreading force, active when the `decoupling_proximity` rule is enabled. Penalizes inequality of cell-occupancy on a 10×10 grid so components use the full board area instead of collapsing to the center. The weight `w_density` is adaptive — scaled down for dense/packed boards (no room to spread) and up for sparse boards. Decoupling caps assigned to an IC are absorbed into the IC's cell so density doesn't fight the decoupling constraint.
 
 ### SA Penalty Scaling
 
@@ -168,7 +170,7 @@ The default `grid` algorithm uses a multi-phase approach that produces better re
 3. **IC-affinity ordering** — within each cluster, order components so each IC is immediately followed by its closest passives (power-domain round-robin for decoupling caps, then shared-net affinity for remaining passives)
 4. **Grid placement** — assign clusters to board sub-regions, place IC groups in center-first grid cells with passives in a ring around each IC
 5. **Repulsion pass** — push overlapping components apart with spacing proportional to component size
-6. **Interior SA** — simulated annealing on interior components only (connectors excluded to prevent pulling toward original KiCad positions)
+6. **Interior SA** — simulated annealing on interior components only (connectors excluded to prevent pulling toward original KiCad positions). Includes ePlace-style Gini density penalty and a fill-first spread move operator that jumps components from overcrowded cells to empty cells within the board outline
 7. **Re-centre** — shift the interior cluster so its centroid is at the center of the usable board area
 8. **Connector perimeter placement** — compute the interior bbox, expand it so connectors fit on each edge, then place connectors on the perimeter with pad-based rotation (analyzing pad geometry to determine the correct facing direction)
 9. **Overlap resolution** — resolve all remaining overlaps between connectors and interior components
@@ -204,12 +206,14 @@ GridGhost/
 │   ├── smart_placement.py         # Smart multi-phase placement engine
 │                                  # Interior-first → SA → re-centre → connector perimeter;
 │                                  # pad-based facing direction; interior bbox expansion;
-│                                  # power-domain-aware decoupling cap grouping
+│                                  # power-domain-aware decoupling cap grouping;
+│                                  # density-aware SA with fill-first spread move operator
 │   ├── cost_function.py           # HPWL (clique/star) + overlap + boundary costs
 │                                  # Constraint rule integration via constraint_evaluator
 │   ├── cost_state.py              # Incremental O(k) cost computation for SA
 │                                  # Sorted sweep-line index; per-net HPWL cache;
-│                                  # snapshot/restore; penalty scaling
+│                                  # snapshot/restore; penalty scaling;
+│                                  # adaptive-weight Gini density penalty
 │   ├── constraint_evaluator.py    # 10 constraint rule penalty functions
 │                                  # Continuous penalties for SA gradient optimization
 │   ├── moves.py                   # SA move operators (translate, swap, rotate, median)

@@ -26,15 +26,75 @@ OVERLAP_COUNT_WEIGHT = 12.0  # extra penalty per overlapping pair
 
 # Density-equality penalty (Gini coefficient on a 10x10 cell-occupancy grid).
 # Penalizes inequality of cell-occupancy — 0 when components are uniformly
-# spread, increases as they cluster. Weight is intentionally small: density
-# is a soft signal that should not override HPWL/overlap, just nudge SA
-# toward filling the bbox.
+# spread, increases as they cluster.
+#
+# Tuning: 0.4 was negligible, 8.0 caused 5-22% HPWL regression on 4/5 test
+# boards while only marginally improving spread. 3.0 keeps density as a soft
+# signal (~5-12% of HPWL). The actual filling of empty cells is done by the
+# spread MOVE OPERATOR (smart_placement._pick_spread_move) which JUMPS
+# components to empty cells within the outline — fill first, expand only if
+# no empty cells remain.
+#
+# Use density_adaptive_weight(board_density, n_components) at call sites
+# instead of reading this constant directly — it scales the base weight DOWN
+# for small/dense boards (no room to spread) and UP for sparse boards.
 #
 # Cap-IC grouping: decoupling caps assigned to an IC are absorbed into the
 # IC's cell (counted as ONE unit at the IC's position). This prevents the
 # Gini penalty from fighting the decoupling_proximity constraint.
-DENSITY_WEIGHT = 0.4
+DENSITY_WEIGHT = 3.0
 DENSITY_GRID = 10
+
+
+def density_adaptive_weight(board_density: float, n_components: int = 0,
+                            grid_cells: int = DENSITY_GRID * DENSITY_GRID) -> float:
+    """Scale DENSITY_WEIGHT by board density AND component count per cell.
+
+    Two factors multiply:
+
+    1. Board density (physical room to spread):
+       - Sparse (< 0.20):       1.5x — lots of empty space, push hard.
+       - Medium (0.20–0.30):    1.0x — base weight.
+       - Dense (0.30–0.40):     0.5x — limited room, gentle nudge.
+       - Very dense (> 0.40):   0.2x — almost no room, barely nudge.
+
+    2. Component count per grid cell (congestion potential):
+       - Low (< 0.65):          1.0x — plenty of cells, spreading helps.
+       - Tight (0.65–0.70):     0.7x — getting crowded.
+       - Very tight (0.70–0.78):0.5x — spreading shreds HPWL.
+       - Packed (> 0.78):       0.25x — barely nudge, no room to spread.
+
+    The second factor is critical: a fixed weight that helps cbb (0.68
+    comps/cell, -14.7% HPWL) catastrophically hurts test4 (0.82 comps/cell,
+    +8% HPWL) and test6 (0.74 comps/cell, +7% HPWL) because those boards
+    have too many components competing for too few cells — the density
+    force just pulls components apart with nowhere good to put them.
+    """
+    # Factor 1: board density (room to spread physically)
+    if board_density < 0.20:
+        density_scale = 1.5
+    elif board_density < 0.30:
+        density_scale = 1.0
+    elif board_density < 0.40:
+        density_scale = 0.5
+    else:
+        density_scale = 0.2
+
+    # Factor 2: component count per cell (congestion potential)
+    if n_components > 0:
+        comps_per_cell = n_components / grid_cells
+        if comps_per_cell > 0.78:
+            count_scale = 0.25  # packed — barely nudge
+        elif comps_per_cell > 0.70:
+            count_scale = 0.5   # very tight — spreading shreds HPWL
+        elif comps_per_cell > 0.65:
+            count_scale = 0.7   # tight — reduce force
+        else:
+            count_scale = 1.0   # plenty of room — full force
+    else:
+        count_scale = 1.0
+
+    return DENSITY_WEIGHT * density_scale * count_scale
 
 _POWER_PREFIXES = (
     'GND', 'AGND', 'DGND', 'PGND', 'SGND',
@@ -136,6 +196,18 @@ class CostState:
         self._density_cell_w: float = 0.0
         self._density_cell_h: float = 0.0
         self._density_penalty: float = 0.0
+        # Adaptive density weight — scaled by board density AND component
+        # count per cell so dense/packed boards (no room to spread) get a
+        # gentle nudge while sparse boards get a strong push.
+        # See density_adaptive_weight() for the rationale.
+        board_area = model.board.width * model.board.height
+        if board_area > 0:
+            comp_area = sum(c.effective_width * c.effective_height for c in model.components)
+            n_moveable = sum(1 for c in model.components if not c.is_fixed and not c.is_edge_connector)
+            self._density_weight = density_adaptive_weight(
+                comp_area / board_area, n_moveable)
+        else:
+            self._density_weight = DENSITY_WEIGHT
 
         # Penalty scaling (annealer controls this)
         self._penalty_scale = 1.0
@@ -523,7 +595,7 @@ class CostState:
         constraint = CONSTRAINT_WEIGHT * self._constraint_total * self._penalty_scale
         # Density is intentionally NOT scaled by penalty_scale — it's a soft
         # signal that should influence SA at all temperatures.
-        density = DENSITY_WEIGHT * self._density_penalty
+        density = self._density_weight * self._density_penalty
         return hpwl + overlap + boundary + constraint + density
 
     @property
@@ -534,7 +606,7 @@ class CostState:
                 + OVERLAP_COUNT_WEIGHT * self.overlap_count
                 + BOUNDARY_WEIGHT * self._boundary_sum()
                 + CONSTRAINT_WEIGHT * self._constraint_total
-                + DENSITY_WEIGHT * self._density_penalty)
+                + self._density_weight * self._density_penalty)
 
     @property
     def hpwl(self) -> float:

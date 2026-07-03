@@ -969,7 +969,73 @@ def _optimize_interior_sa(
         constraint = constraint_raw
 
     cost = hpwl + overlap_weight * overlap + constraint_weight * constraint
-    rudy_active = len(interior) >= 100
+    # ePlace-style density spreading force (Gini coefficient on a 10x10 grid).
+    # Without this, HPWL pulls everything toward the net center-of-mass and
+    # SA collapses into a center-band cluster (edges/corners stay empty).
+    # Density gives SA a proactive reason to fill empty bins. Mirrors the
+    # Gini penalty in CostState (used by greedy) so the two phases agree.
+    # Cap-IC grouping: decoupling caps assigned to an IC are absorbed into
+    # the IC's cell so density doesn't fight the decoupling_proximity rule.
+    from engine.cost_state import DENSITY_GRID, density_adaptive_weight
+    from engine.constraint_evaluator import _build_decoupling_map
+    # Adaptive density weight — dense/packed boards get a gentle nudge,
+    # sparse boards a strong push. Scales by BOTH board density AND
+    # component count per cell (the latter is what distinguishes cbb
+    # which benefits from density vs test4 which regresses).
+    board_area = board.width * board.height
+    if board_area > 0:
+        comp_area = sum(c.effective_width * c.effective_height for c in interior)
+        density_weight = density_adaptive_weight(
+            comp_area / board_area, len(interior))
+    else:
+        density_weight = 8.0
+    decap_map = _build_decoupling_map(model) if rules else None
+    grouped_cap_refs: set[str] = set()
+    if decap_map:
+        for cap_refs in decap_map.values():
+            grouped_cap_refs.update(cap_refs)
+    interior_refs = {c.ref for c in interior}
+
+    def _fast_density() -> float:
+        """Gini coefficient of 10x10 cell-occupancy for interior components.
+
+        Caps assigned to an IC are absorbed into the IC's cell (counted once
+        at the IC's position) so spreading doesn't pull decoupling caps away.
+        """
+        cell_w = (board.x_max - board.x_min) / DENSITY_GRID
+        cell_h = (board.y_max - board.y_min) / DENSITY_GRID
+        if cell_w <= 0 or cell_h <= 0:
+            return 0.0
+        grid = [0] * (DENSITY_GRID * DENSITY_GRID)
+        total = 0
+        bx_min = board.x_min
+        by_min = board.y_min
+        for c in interior:
+            if c.ref in grouped_cap_refs:
+                continue  # absorbed into IC's cell
+            gx = int((c.x - bx_min) / cell_w)
+            gy = int((c.y - by_min) / cell_h)
+            gx = max(0, min(DENSITY_GRID - 1, gx))
+            gy = max(0, min(DENSITY_GRID - 1, gy))
+            grid[gx + gy * DENSITY_GRID] += 1
+            total += 1
+        if total == 0:
+            return 0.0
+        n = DENSITY_GRID * DENSITY_GRID
+        s = sorted(grid)
+        cum = sum((i + 1) * v for i, v in enumerate(s))
+        gini = (2 * cum) / (n * total) - (n + 1) / n
+        return gini * total
+
+    density = _fast_density()
+    cost += density_weight * density
+    # RUDY spreading force — activates for any non-trivial board (>=30 interior
+    # components). The old >=100 threshold disabled RUDY for small/mid boards
+    # (e.g. cbb at 68 comps), leaving no force to push components toward empty
+    # edges/corners — SA collapsed into a center-band cluster. RUDY here is
+    # wired into the Metropolis acceptance cost (see new_cost += new_rudy_cost
+    # below), so it acts as a true spreading force, not just a move bias.
+    rudy_active = len(interior) >= 30
     rudy_weight = 0.2
     rudy_penalty = 0.0
     if rudy_active:
@@ -984,21 +1050,147 @@ def _optimize_interior_sa(
     cooling = (T_end / T_start) ** (1.0 / max(n_iter, 1))
     rng     = random.Random(42)
 
+    # Spread move operator: periodically move a component from an overcrowded
+    # cell to a less-used cell. Strategy is "fill first, expand if needed":
+    #   1. If there are EMPTY cells (count=0) within the outline: JUMP a
+    #      component from an overcrowded cell to a random empty cell. This
+    #      actually fills the available outline space — the old nudge-only
+    #      variant just shuffled components around the cluster edge.
+    #   2. If no empty cells remain but overcrowding persists: nudge toward
+    #      the least-dense neighbor (expansion mode).
+    #
+    # SA evaluates each move via Metropolis acceptance — bad jumps (HPWL
+    # explosion) get rejected, so we don't need to be HPWL-aware here. The
+    # acceptance step is the HPWL filter.
+    #
+    # Gating: only in the HOT phase (t_ratio > 0.5) when SA can accept
+    # density-favoring moves that increase HPWL. Disabled for tiny boards
+    # (<20 comps) where the Gini penalty alone handles spreading.
+    spread_enabled = len(interior) >= 20
+    spread_interval = 50  # 1 spread move per 50 iterations
+    cell_w_spread = (board.x_max - board.x_min) / DENSITY_GRID
+    cell_h_spread = (board.y_max - board.y_min) / DENSITY_GRID
+
+    def _pick_spread_move():
+        """Fill-first spread move. Returns (comp, target_x, target_y) or None.
+
+        Priority: empty cells first (fill the outline), then least-dense
+        neighbor (expand at the cluster edge if no empties remain).
+        """
+        # Build occupancy grid (interior only, cap-IC grouped like density)
+        grid = [0] * (DENSITY_GRID * DENSITY_GRID)
+        for c in interior:
+            if c.ref in grouped_cap_refs:
+                continue
+            gx = int((c.x - board.x_min) / cell_w_spread) if cell_w_spread > 0 else 0
+            gy = int((c.y - board.y_min) / cell_h_spread) if cell_h_spread > 0 else 0
+            gx = max(0, min(DENSITY_GRID - 1, gx))
+            gy = max(0, min(DENSITY_GRID - 1, gy))
+            grid[gx + gy * DENSITY_GRID] += 1
+
+        # Need real overcrowding somewhere to bother
+        max_occ = max(grid) if grid else 0
+        if max_occ < 3:
+            return None
+
+        # Source: an overcrowded cell (within 1 of max occupancy)
+        dense_cells = [i for i, v in enumerate(grid) if v >= max_occ - 1]
+        if not dense_cells:
+            return None
+        dense_cell = rng.choice(dense_cells)
+        dgx = dense_cell % DENSITY_GRID
+        dgy = dense_cell // DENSITY_GRID
+
+        # Find a movable component in the dense cell
+        candidates = []
+        for c in interior:
+            if c.ref in grouped_cap_refs:
+                continue
+            gx = int((c.x - board.x_min) / cell_w_spread) if cell_w_spread > 0 else 0
+            gy = int((c.y - board.y_min) / cell_h_spread) if cell_h_spread > 0 else 0
+            gx = max(0, min(DENSITY_GRID - 1, gx))
+            gy = max(0, min(DENSITY_GRID - 1, gy))
+            if gx == dgx and gy == dgy:
+                candidates.append(c)
+        if not candidates:
+            return None
+        comp = rng.choice(candidates)
+
+        # FILL FIRST: jump to a random empty cell within the outline.
+        # SA's Metropolis acceptance filters HPWL-disastrous jumps; the
+        # accepted jumps are what actually fill edges/corners.
+        empty_cells = [i for i, v in enumerate(grid) if v == 0]
+        if empty_cells:
+            target_cell = rng.choice(empty_cells)
+            tgx = target_cell % DENSITY_GRID
+            tgy = target_cell // DENSITY_GRID
+            target_x = board.x_min + (tgx + 0.5) * cell_w_spread
+            target_y = board.y_min + (tgy + 0.5) * cell_h_spread
+        else:
+            # EXPAND IF NEEDED: no empty cells, nudge toward least-dense
+            # neighbor (8-connected). Only useful if neighbor is meaningfully
+            # less crowded than the source.
+            best_dir = None
+            best_occ = float('inf')
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    nx, ny = dgx + dx, dgy + dy
+                    if nx < 0 or nx >= DENSITY_GRID or ny < 0 or ny >= DENSITY_GRID:
+                        continue
+                    occ = grid[nx + ny * DENSITY_GRID]
+                    if occ < best_occ:
+                        best_occ = occ
+                        best_dir = (dx, dy)
+            if best_dir is None or best_occ >= max_occ - 1:
+                return None
+            dx, dy = best_dir
+            target_x = comp.x + dx * cell_w_spread
+            target_y = comp.y + dy * cell_h_spread
+
+        # Clamp to interior bounds (component center stays in usable area)
+        target_x = max(x_min + comp.effective_width / 2,
+                       min(target_x, x_max - comp.effective_width / 2))
+        target_y = max(y_min + comp.effective_height / 2,
+                       min(target_y, y_max - comp.effective_height / 2))
+        return comp, target_x, target_y
+
     # Track best solution
     best_cost = cost
     best_positions = {c.ref: (c.x, c.y) for c in interior}
 
     for it in range(n_iter):
-        comp        = rng.choice(interior)
-        old_x, old_y = comp.x, comp.y
+        # Spread move: only in the HOT phase (t_ratio > 0.5) when SA can
+        # accept big jumps. In the cold phase, spread moves are too
+        # disruptive — they jump components far from their net partners and
+        # get rejected, wasting iterations that should be used for refinement.
+        t_ratio = math.log(T + 1.0) / math.log(T_start + 1.0) if T_start > 0 else 0.0
+        t_ratio = max(0.0, min(1.0, t_ratio))
+        do_spread = (spread_enabled and t_ratio > 0.5
+                     and it % spread_interval == 0)
 
-        step    = T * 2.0
-        comp.x  = max(x_min + comp.effective_width  / 2,
-                      min(old_x + rng.uniform(-step, step),
-                          x_max - comp.effective_width  / 2))
-        comp.y  = max(y_min + comp.effective_height / 2,
-                      min(old_y + rng.uniform(-step, step),
-                          y_max - comp.effective_height / 2))
+        if do_spread:
+            spread_result = _pick_spread_move()
+        else:
+            spread_result = None
+
+        if spread_result is not None:
+            comp, new_x, new_y = spread_result
+            old_x, old_y = comp.x, comp.y
+            comp.x, comp.y = new_x, new_y
+        else:
+            # Normal random jitter move
+            comp        = rng.choice(interior)
+            old_x, old_y = comp.x, comp.y
+
+            step    = T * 2.0
+            comp.x  = max(x_min + comp.effective_width  / 2,
+                          min(old_x + rng.uniform(-step, step),
+                              x_max - comp.effective_width  / 2))
+            comp.y  = max(y_min + comp.effective_height / 2,
+                          min(old_y + rng.uniform(-step, step),
+                              y_max - comp.effective_height / 2))
 
         # Incremental: only recompute what changed
         new_hpwl = _fast_hpwl()
@@ -1009,6 +1201,9 @@ def _optimize_interior_sa(
             new_constraint_raw, _ = evaluate_constraint_penalties(model, rules)
             new_constraint = new_constraint_raw
         new_cost = new_hpwl + overlap_weight * new_overlap + constraint_weight * new_constraint
+        # Density recomputed every iteration — O(n) with n=68 for cbb, cheap.
+        # Spreading force must be felt on every move or SA will collapse back.
+        new_cost += density_weight * _fast_density()
         new_rudy_cost = rudy_cost
         if rudy_active and it % 50 == 0:
             try:

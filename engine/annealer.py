@@ -242,8 +242,15 @@ def _run_sa_pass(
     # Current overlap count (incremental, updated each move)
     current_overlap_count = cost_state.overlap_count
 
-    # RUDY congestion state - only for dense boards
-    rudy_active = (config.rudy_weight > 0 and len(model.components) >= 100)
+    # RUDY congestion state — active for any non-trivial board (>=30 comps).
+    # The old >=100 threshold disabled RUDY for small/mid boards, leaving SA
+    # with no spreading force. Lowered to 30 so boards like cbb (68 comps)
+    # get congestion-driven spreading. NOTE: in this annealer path RUDY enters
+    # acceptance only as a best-state tiebreaker (lines below); the actual
+    # spreading force comes from the RUDY gradient used as a translate-move
+    # bias. For a true acceptance-cost spreading force, see smart_placement.py
+    # _optimize_interior_sa where RUDY is added to new_cost directly.
+    rudy_active = (config.rudy_weight > 0 and len(model.components) >= 30)
     rudy_penalty = 0.0
     rudy_step_counter = 0
     if rudy_active:
