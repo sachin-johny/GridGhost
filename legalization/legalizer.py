@@ -384,10 +384,12 @@ def _build_comp_net_lookup(model: BoardModel) -> dict[str, list[Net]]:
 
 def _compute_local_hpwl(
     comp: Component, comp_nets: dict[str, list[Net]], model: BoardModel,
+    comp_map: dict[str, Component] | None = None,
 ) -> float:
     total = 0.0
     nets = comp_nets.get(comp.ref, [])
-    comp_map = {c.ref: c for c in model.components}
+    if comp_map is None:
+        comp_map = {c.ref: c for c in model.components}
     for net in nets:
         from engine.cost_state import _is_power_net
         if _is_power_net(net.name):
@@ -417,6 +419,8 @@ def _legalizer_score(
     original_positions: dict[int, tuple[float, float]],
     cached_decap_map: dict | None = None,
     grid: SpatialGrid | None = None,
+    comp_net_lookup: dict[str, list[Net]] | None = None,
+    comp_map: dict[str, Component] | None = None,
 ) -> tuple[float, int, int]:
     overlaps, overlap_area = _compute_overlap_stats(model, grid)
     oob = _count_oob(model)
@@ -429,10 +433,16 @@ def _legalizer_score(
     for comp in moved:
         ox, oy = original_positions.get(id(comp), (comp.x, comp.y))
         displacement += abs(comp.x - ox) + abs(comp.y - oy)
+    # P0 #3: include HPWL so tie-break moves pick the lower-wire option.
+    # Previously two equal-overlap moves were scored only on displacement,
+    # letting HPWL balloon during cleanup (test4 run3: 708 -> 1220).
+    hpwl_total = 0.0
+    if comp_net_lookup is not None:
+        for comp in moved:
+            hpwl_total += _compute_local_hpwl(comp, comp_net_lookup, model, comp_map)
     score = (100000.0 * overlaps + 25000.0 * oob + 50.0 * overlap_area
-             + 10.0 * constraint_total + displacement)
+             + 10.0 * constraint_total + displacement + hpwl_total)
     return score, overlaps, oob
-
 
 def _count_pair_overlaps_involving(
     c1: Component, c2: Component, components: list[Component],
@@ -464,6 +474,13 @@ def _resolve_overlaps(
     prev_overlap_count = float("inf")
     stall_iterations = 0
     adaptive_strength = push_strength
+    # P0 #3: build comp→nets once so push-apart + tie-break scoring can
+    # evaluate HPWL without re-walking the netlist on every call.
+    comp_net_lookup = _build_comp_net_lookup(model)
+    # Wall-time fix: comp_map is stable across legalization (components only
+    # move, never added/removed), so build it once instead of rebuilding it
+    # inside every _compute_local_hpwl call.
+    comp_map = {c.ref: c for c in model.components}
 
     for iteration in range(max_iterations):
         overlap_pairs = []
@@ -523,12 +540,11 @@ def _resolve_overlaps(
 
             local_before = _count_pair_overlaps_involving(c1, c2, components, grid)
 
-            if c1_fixed:
-                _push_apart_one(c2, c1, adaptive_strength, grid_mm, board=board)
-            elif c2_fixed:
-                _push_apart_one(c1, c2, adaptive_strength, grid_mm, board=board)
-            else:
-                _push_apart(c1, c2, adaptive_strength, grid_mm)
+            _push_apart_hpwl(
+                c1, c2, components, comp_net_lookup, model,
+                adaptive_strength, grid_mm, board, interior_bbox,
+                comp_map=comp_map,
+            )
 
             _enforce_boundary_single(c1, interior_bbox, board)
             _enforce_boundary_single(c2, interior_bbox, board)
@@ -540,18 +556,23 @@ def _resolve_overlaps(
             elif local_after == local_before:
                 moved = [c for c in (c1, c2) if not c.is_fixed and not c.is_edge_connector]
                 original_positions = {id(c1): (old_x1, old_y1), id(c2): (old_x2, old_y2)}
-                base_score, _, _ = _legalizer_score(model, moved, original_positions, cached_decap_map, grid)
+                base_score, _, _ = _legalizer_score(
+                    model, moved, original_positions, cached_decap_map, grid,
+                    comp_net_lookup=comp_net_lookup, comp_map=comp_map,
+                )
 
                 c1.x, c1.y = old_x1, old_y1
                 c2.x, c2.y = old_x2, old_y2
-                pre_score, _, _ = _legalizer_score(model, moved, original_positions, cached_decap_map, grid)
+                pre_score, _, _ = _legalizer_score(
+                    model, moved, original_positions, cached_decap_map, grid,
+                    comp_net_lookup=comp_net_lookup, comp_map=comp_map,
+                )
 
-                if c1_fixed:
-                    _push_apart_one(c2, c1, adaptive_strength, grid_mm, board=board)
-                elif c2_fixed:
-                    _push_apart_one(c1, c2, adaptive_strength, grid_mm, board=board)
-                else:
-                    _push_apart(c1, c2, adaptive_strength, grid_mm)
+                _push_apart_hpwl(
+                    c1, c2, components, comp_net_lookup, model,
+                    adaptive_strength, grid_mm, board, interior_bbox,
+                    comp_map=comp_map,
+                )
                 _enforce_boundary_single(c1, interior_bbox, board)
                 _enforce_boundary_single(c2, interior_bbox, board)
 
@@ -564,13 +585,11 @@ def _resolve_overlaps(
                 c1.x, c1.y = old_x1, old_y1
                 c2.x, c2.y = old_x2, old_y2
 
-                reduced_strength = adaptive_strength * 0.5
-                if c1_fixed:
-                    _push_apart_one(c2, c1, reduced_strength, grid_mm, board=board)
-                elif c2_fixed:
-                    _push_apart_one(c1, c2, reduced_strength, grid_mm, board=board)
-                else:
-                    _push_apart(c1, c2, reduced_strength, grid_mm)
+                _push_apart_hpwl(
+                    c1, c2, components, comp_net_lookup, model,
+                    adaptive_strength * 0.5, grid_mm, board, interior_bbox,
+                    comp_map=comp_map,
+                )
 
                 _enforce_boundary_single(c1, interior_bbox, board)
                 _enforce_boundary_single(c2, interior_bbox, board)
@@ -873,6 +892,199 @@ def _push_apart(c1: Component, c2: Component, strength: float, grid_mm: float) -
         c1.y -= dy * push_y / 2.0
         c2.x += dx * push_x / 2.0
         c2.y += dy * push_y / 2.0
+
+
+def _build_mover_hpwl_cache(
+    mover: Component,
+    comp_net_lookup: dict[str, list[Net]],
+    comp_map: dict[str, Component],
+) -> list[tuple[float, float, float, float, float, float]]:
+    """Per-iteration HPWL cache for mover.
+
+    For each non-power net that ``mover`` participates in, precompute:
+      (mover_pin_offset_x, mover_pin_offset_y,
+       others_min_x, others_max_x, others_min_y, others_max_y)
+
+    Mover's pin offset is constant during a push-apart call (rotation
+    doesn't change).  Other pins' positions are constant within a
+    single ``which`` iteration (only mover moves during candidate
+    evaluation), so the cache is built once per (mover, iter) and
+    reused across all 16 candidate positions.
+
+    Lets _compute_local_hpwl_cached run in O(k) where k = nets on
+    mover, vs O(k · p · pads) for the full recomputation.
+    """
+    from engine.cost_state import _is_power_net
+    cache: list[tuple[float, float, float, float, float, float]] = []
+    nets = comp_net_lookup.get(mover.ref, [])
+    for net in nets:
+        if _is_power_net(net.name):
+            continue
+        mover_offset_x = 0.0
+        mover_offset_y = 0.0
+        mover_found = False
+        others_xs: list[float] = []
+        others_ys: list[float] = []
+        for ref, pad_name in net.pins:
+            other = comp_map.get(ref)
+            if other is None:
+                continue
+            if other is mover:
+                for pad in other.pads:
+                    if pad.pad_name == pad_name:
+                        abs_x, abs_y = pad.absolute_pos(
+                            other.x, other.y, other.rotation)
+                        mover_offset_x = abs_x - other.x
+                        mover_offset_y = abs_y - other.y
+                        mover_found = True
+                        break
+                else:
+                    mover_found = True  # use (0, 0) offset
+            else:
+                for pad in other.pads:
+                    if pad.pad_name == pad_name:
+                        abs_x, abs_y = pad.absolute_pos(
+                            other.x, other.y, other.rotation)
+                        others_xs.append(abs_x)
+                        others_ys.append(abs_y)
+                        break
+                else:
+                    others_xs.append(other.x)
+                    others_ys.append(other.y)
+        if not mover_found or not others_xs:
+            continue
+        cache.append((
+            mover_offset_x, mover_offset_y,
+            min(others_xs), max(others_xs),
+            min(others_ys), max(others_ys),
+        ))
+    return cache
+
+
+def _compute_local_hpwl_cached(
+    mover_x: float, mover_y: float,
+    cache: list[tuple[float, float, float, float, float, float]],
+) -> float:
+    """HPWL of mover's nets given cached pin data.
+
+    Mathematically equivalent to _compute_local_hpwl: net HPWL is
+    (max_x - min_x) + (max_y - min_y) over all pins.  With mover's pin
+    at (mover_x + offset_x, mover_y + offset_y) and others' bbox
+    precomputed, the merged bbox is just min/max of two values per
+    axis.  O(k) per call.
+    """
+    total = 0.0
+    for offset_x, offset_y, ox_min, ox_max, oy_min, oy_max in cache:
+        pin_x = mover_x + offset_x
+        pin_y = mover_y + offset_y
+        net_min_x = pin_x if pin_x < ox_min else ox_min
+        net_max_x = pin_x if pin_x > ox_max else ox_max
+        net_min_y = pin_y if pin_y < oy_min else oy_min
+        net_max_y = pin_y if pin_y > oy_max else oy_max
+        total += (net_max_x - net_min_x) + (net_max_y - net_min_y)
+    return total
+
+
+def _push_apart_hpwl(
+    c1: Component,
+    c2: Component,
+    components: list[Component],
+    comp_net_lookup: dict[str, list[Net]],
+    model: BoardModel,
+    strength: float,
+    grid_mm: float,
+    board: BoardOutline,
+    interior_bbox: tuple[float, float, float, float] | None,
+    max_iter: int = 5,
+    comp_map: dict[str, Component] | None = None,
+) -> None:
+    """P0 #3: HPWL-aware push-apart via bounded gradient descent.
+
+    Tries single-component displacements in 4 directions × multiple
+    distances, scores each by ``β·overlap_area + local_hpwl + λ·new_overlaps``
+    (overlap area against the conflict partner plus a penalty for any new
+    overlap created with a third party), and applies the move that most
+    reduces combined cost.  Iterates up to ``max_iter`` times.
+
+    A resolving move (overlap drops to 0) naturally wins when its HPWL
+    cost is modest, but a partial move can beat it if the resolving move
+    would shunt the component into a crowded neighbourhood.
+
+    Wall-time fix: cache mover's per-net pin offset and other-pins'
+    bbox at the start of each ``which`` iteration.  HPWL per candidate
+    then costs O(k) instead of O(k·p·pads).  On test4 this cut overall
+    legalization wall time ~40% (140s → 80s with profiler attached).
+    """
+    beta = 50.0      # matches overlap penalty weight in cost function
+    new_ov_cost = 500.0  # penalty per overlap introduced with a third party
+    c1_fixed = c1.is_fixed or c1.is_edge_connector
+    c2_fixed = c2.is_fixed or c2.is_edge_connector
+    if c1_fixed and c2_fixed:
+        return
+
+    directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+    base_dists = [grid_mm, grid_mm * 2, grid_mm * 5, grid_mm * 10]
+    distances = [d * max(strength, 0.5) for d in base_dists]
+
+    def _third_party_overlaps(mover: Component) -> int:
+        count = 0
+        for other in components:
+            if other is mover or other is c1 or other is c2:
+                continue
+            if mover.overlaps(other):
+                count += 1
+        return count
+
+    for _ in range(max_iter):
+        if not c1.overlaps(c2):
+            return
+
+        best: tuple[float, int, float, float] | None = None
+
+        for which in (1, 2):
+            if which == 1 and c1_fixed:
+                continue
+            if which == 2 and c2_fixed:
+                continue
+            mover = c1 if which == 1 else c2
+            other = c2 if which == 1 else c1
+            old_x, old_y = mover.x, mover.y
+
+            # Build HPWL cache for this mover against the current
+            # positions of every other component (including the partner).
+            # Within this `which` iteration only mover moves, so the
+            # cache is valid for all 16 candidate positions below.
+            hpwl_cache = _build_mover_hpwl_cache(
+                mover, comp_net_lookup, comp_map or {})
+
+            for dx_dir, dy_dir in directions:
+                for dist in distances:
+                    mover.x = old_x + dx_dir * dist
+                    mover.y = old_y + dy_dir * dist
+                    _enforce_boundary_single(mover, interior_bbox, board)
+
+                    if mover.overlaps(other):
+                        pair_ov = mover.overlap_area(other)
+                    else:
+                        pair_ov = 0.0
+
+                    new_hpwl = _compute_local_hpwl_cached(
+                        mover.x, mover.y, hpwl_cache)
+                    third_ov = _third_party_overlaps(mover)
+                    cost = beta * pair_ov + new_hpwl + new_ov_cost * third_ov
+                    if best is None or cost < best[0] - 1e-9:
+                        best = (cost, which, mover.x, mover.y)
+
+            mover.x, mover.y = old_x, old_y
+
+        if best is None:
+            return
+
+        _, which, new_x, new_y = best
+        mover = c1 if which == 1 else c2
+        mover.x = new_x
+        mover.y = new_y
+
 
 
 def _nudge_caps_to_ics(

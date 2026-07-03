@@ -65,6 +65,59 @@ def abacus_legalize(
 # Row assignment with net-topology awareness
 # ---------------------------------------------------------------------------
 
+def _hpwl_y_delta_for_comp(
+    comp: Component,
+    target_y: float,
+    comp_nets: dict[str, list],
+    comp_map: dict[str, Component],
+) -> float:
+    """HPWL Y-span change from moving ``comp`` to ``target_y``.
+
+    Only the Y-axis contribution is computed because row assignment only
+    changes Y.  Returns a delta where negative = HPWL decreases (better).
+    Power nets are skipped (consistent with the SA cost function).
+    """
+    from engine.cost_state import _is_power_net
+    delta_y = target_y - comp.y
+    if abs(delta_y) < 1e-6:
+        return 0.0
+
+    nets = comp_nets.get(comp.ref, [])
+    if not nets:
+        return 0.0
+
+    total_delta = 0.0
+    for net in nets:
+        if _is_power_net(net.name):
+            continue
+        old_y_min = math.inf
+        old_y_max = -math.inf
+        new_y_min = math.inf
+        new_y_max = -math.inf
+        for ref, pad_name in net.pins:
+            other = comp_map.get(ref)
+            if not other:
+                continue
+            abs_y = None
+            for pad in other.pads:
+                if pad.pad_name == pad_name:
+                    _, abs_y = pad.absolute_pos(other.x, other.y, other.rotation)
+                    break
+            if abs_y is None:
+                abs_y = other.y
+            old_y_min = min(old_y_min, abs_y)
+            old_y_max = max(old_y_max, abs_y)
+            if ref == comp.ref:
+                abs_y += delta_y
+            new_y_min = min(new_y_min, abs_y)
+            new_y_max = max(new_y_max, abs_y)
+        if old_y_max > old_y_min:
+            total_delta += (new_y_max - new_y_min) - (old_y_max - old_y_min)
+    return total_delta
+
+
+
+
 def _assign_rows(
     components: list[Component],
     grid_mm: float,
@@ -77,7 +130,6 @@ def _assign_rows(
         return []
 
     max_height = max(c.effective_height for c in components)
-    row_pitch = max(math.ceil(max_height / grid_mm) * grid_mm, grid_mm)
 
     if interior_bbox:
         y_min = interior_bbox[1]
@@ -85,6 +137,25 @@ def _assign_rows(
     else:
         y_min = board.y_min
         y_max = board.y_max
+    board_h = y_max - y_min
+
+    # P0 #2: Adaptive row count.
+    # Natural row count (board_h / max_height) is too coarse when one tall
+    # outlier (e.g. FPGA) dictates row pitch for 80 small caps.  Cap minimum
+    # components/row at ~8 so a 82-component board gets ≥11 rows, dropping
+    # cross-row overlap count by an order of magnitude on test4-class boards.
+    # Row pitch derived from the target row count, but floored at median
+    # component height + 10% slack so the typical component fits cleanly;
+    # tall outliers span adjacent rows and are handled by cross-row cleanup.
+    natural_rows = max(1, math.ceil(board_h / max_height)) if max_height > 0 else 1
+    min_rows_by_count = max(1, math.ceil(len(components) / 8))
+    n_rows = max(natural_rows, min_rows_by_count)
+
+    sorted_heights = sorted(c.effective_height for c in components)
+    median_height = sorted_heights[len(sorted_heights) // 2]
+    target_pitch = board_h / n_rows if n_rows > 0 else max_height
+    row_pitch = max(target_pitch, median_height * 1.1, grid_mm)
+    row_pitch = max(math.ceil(row_pitch / grid_mm) * grid_mm, grid_mm)
 
     row_map: dict[int, list[Component]] = {}
     comp_row: dict[int, int] = {}
@@ -97,10 +168,18 @@ def _assign_rows(
 
     comp_map = {c.ref: c for c in components}
 
-    # Net-topology-aware row merging: components sharing signal nets
-    # preferentially placed in the same row if displacement is small.
+    # P0 #1: HPWL-aware net-topology row merging.
+    # For each component on a signal net, evaluate HPWL Y-delta for each
+    # candidate row (rows already holding a net-mate) and pick the row
+    # that most reduces HPWL, subject to a displacement tolerance.  This
+    # replaces the previous "pull into the most-voted row" heuristic,
+    # which often dragged a component to the wrong end of a long net and
+    # inflated Y-span.  Move only when HPWL strictly decreases.
     if model is not None:
         from engine.cost_state import _is_power_net
+        from legalization.legalizer import _build_comp_net_lookup
+        comp_nets_lookup = _build_comp_net_lookup(model)
+
         net_comps: dict[int, list[Component]] = {}
         for net_idx, net in enumerate(model.nets):
             if _is_power_net(net.name):
@@ -115,28 +194,44 @@ def _assign_rows(
         for net_idx, comps in net_comps.items():
             if not comps:
                 continue
-            row_votes: dict[int, int] = {}
+            rows_on_net: set[int] = set()
             for c in comps:
                 r = comp_row.get(id(c))
                 if r is not None:
-                    row_votes[r] = row_votes.get(r, 0) + 1
-            if not row_votes:
+                    rows_on_net.add(r)
+            if not rows_on_net:
                 continue
-            target_row = max(row_votes, key=row_votes.get)
 
             for c in comps:
                 current_row = comp_row.get(id(c))
-                if current_row is None or current_row == target_row:
+                if current_row is None:
                     continue
-                target_y = y_min + target_row * row_pitch + row_pitch / 2
-                displacement = abs(target_y - c.y)
-                if displacement < 2.0 * row_pitch:
+                best_row = current_row
+                best_score = 0.0  # baseline: no move (score = -delta - disp_penalty)
+                for cand_row in rows_on_net:
+                    if cand_row == current_row:
+                        continue
+                    target_y = y_min + cand_row * row_pitch + row_pitch / 2
+                    displacement = abs(target_y - c.y)
+                    if displacement >= 2.0 * row_pitch:
+                        continue
+                    hpwl_delta = _hpwl_y_delta_for_comp(
+                        c, target_y, comp_nets_lookup, comp_map,
+                    )
+                    # Higher score = better.  Reward HPWL reduction (negative
+                    # delta) and break ties toward smaller displacement.
+                    score = -hpwl_delta - 0.01 * displacement
+                    if score > best_score + 1e-9:
+                        best_score = score
+                        best_row = cand_row
+
+                if best_row != current_row:
                     if current_row in row_map and c in row_map[current_row]:
                         row_map[current_row].remove(c)
-                    if target_row not in row_map:
-                        row_map[target_row] = []
-                    row_map[target_row].append(c)
-                    comp_row[id(c)] = target_row
+                    if best_row not in row_map:
+                        row_map[best_row] = []
+                    row_map[best_row].append(c)
+                    comp_row[id(c)] = best_row
 
     # Decoupling topology: pull each cap into its assigned IC's row so the
     # legalizer doesn't put them on opposite sides of the board.  Power nets
