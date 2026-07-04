@@ -554,19 +554,22 @@ class CostState:
         self,
         old_states: list[tuple[int, float, float, float]],
     ) -> dict[int, tuple[float, float, float, float]]:
-        """Reconstruct pre-move bounding boxes from MoveUndo state."""
-        result: dict[int, tuple[float, float, float, float]] = {}
-        for idx, old_x, old_y, old_rot in old_states:
-            comp = self._comps[idx]
-            old_width = comp.width if old_rot in (0.0, 180.0) else comp.height
-            old_height = comp.height if old_rot in (0.0, 180.0) else comp.width
-            result[idx] = (
-                old_x - old_width / 2.0,
-                old_y - old_height / 2.0,
-                old_x + old_width / 2.0,
-                old_y + old_height / 2.0,
-            )
-        return result
+        """Reconstruct pre-move bounding boxes from MoveUndo state.
+
+        Uses ``Component.bbox_at`` so the reconstructed bbox matches what
+        ``Component.bbox`` would actually return at the old pose — including
+        courtyard margin and the rotated bbox_offset.  The previous
+        implementation used raw ``width``/``height`` (missing courtyard
+        margin) and ignored ``bbox_offset_x``/``bbox_offset_y``, which
+        silently corrupted the xmin spatial index over many SA moves and
+        caused incremental cost to drift from from-scratch recompute.
+
+        Regression covered by ``test_snapshot_restore_n_moves_property``.
+        """
+        return {
+            idx: self._comps[idx].bbox_at(old_x, old_y, old_rot)
+            for idx, old_x, old_y, old_rot in old_states
+        }
 
     def _comp_nets_moved(self, moved_indices: set[int]) -> set[str]:
         nets: set[str] = set()

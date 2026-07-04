@@ -121,6 +121,38 @@ class Component:
     def set_rotation(self, angle: float):
         self.rotation = angle % 360.0
 
+    def bbox_at(self, x: float, y: float, rotation: float) -> tuple[float, float, float, float]:
+        """Compute the bbox the component WOULD have at an arbitrary pose.
+
+        Returns the same value ``self.bbox`` would return if the component
+        were moved to (x, y, rotation) — including courtyard margin and the
+        rotated bbox_offset — WITHOUT mutating the component's state or
+        invalidating its cache.
+
+        Used by ``CostState.old_bboxes_from_states`` to reconstruct pre-move
+        bboxes for the SA snapshot/restore spatial index.  The previous
+        implementation used raw ``width``/``height`` (missing courtyard
+        margin) and ignored ``bbox_offset_x``/``bbox_offset_y``, which
+        silently corrupted the xmin index over many moves and caused
+        incremental cost to drift from from-scratch recompute — see
+        ``test_snapshot_restore_n_moves_property``.
+        """
+        rad = math.radians(rotation)
+        cos_a = math.cos(rad)
+        sin_a = -math.sin(rad)  # KiCad uses clockwise-positive rotation
+        rot90 = int(rotation) % 180 == 90
+        if rot90:
+            eff_w = self._courtyard_rot_w
+            eff_h = self._courtyard_rot_h
+        else:
+            eff_w = self._courtyard_w
+            eff_h = self._courtyard_h
+        half_w = eff_w / 2.0
+        half_h = eff_h / 2.0
+        cx = x + self.bbox_offset_x * cos_a - self.bbox_offset_y * sin_a
+        cy = y + self.bbox_offset_x * sin_a + self.bbox_offset_y * cos_a
+        return (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+
     @property
     def _is_rotated_90(self) -> bool:
         if self._dirty:

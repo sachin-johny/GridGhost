@@ -257,6 +257,78 @@ def test_json_roundtrip():
         os.unlink(pcb_path)
 
 
+def test_zero_courtyard_fallback():
+    """A footprint with no geometry and no pads must NOT produce a
+    zero-area component — the SA could then "overlap" it for free.
+
+    The parser's _extract_fp_geometry falls back to (2.0, 2.0, 0.0, 0.0)
+    when no fp_line/fp_rect/fp_circle/fp_arc/fp_poly and no pads are found,
+    and clamps each dimension to max(., 0.5) for footprints that have only
+    a single tiny pad.  This test locks that behaviour in so a future
+    parser refactor can't silently regress it.
+    """
+    # Construct a minimal .kicad_pcb with one footprint that has NO
+    # courtyard graphics and NO pads — only a Reference property.
+    # The parser must still produce a Component with a non-zero bbox.
+    bare_footprint_pcb = """(kicad_pcb
+      (version 20240108)
+      (general (thickness 1.6))
+      (layers (0 "F.Cu" signal) (31 "B.Cu" signal) (32 "B.Adhes" user))
+      (net 0 "")
+      (footprint "TestLib:BareFootprint"
+        (layer "F.Cu")
+        (at 50.0 50.0)
+        (property "Reference" "U1" (at 0 0) (layer "F.SilkS"))
+        (property "Value" "unknown" (at 0 0) (layer "F.SilkS"))
+      )
+    )"""
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".kicad_pcb", mode="w", delete=False
+    ) as f:
+        f.write(bare_footprint_pcb)
+        pcb_path = f.name
+
+    try:
+        parser = KiCadParser(pcb_path)
+        model = parser.parse()
+        assert len(model.components) == 1, "Should parse the bare footprint"
+        comp = model.components[0]
+        # Effective dimensions must be > 0 — no zero-area component.
+        assert comp.effective_width > 0.0, \
+            f"effective_width should be > 0 for bare footprint, got {comp.effective_width}"
+        assert comp.effective_height > 0.0, \
+            f"effective_height should be > 0 for bare footprint, got {comp.effective_height}"
+        # The fallback is (2.0, 2.0) before courtyard margin; with default
+        # courtyard_margin=0.5 (parser's bbox_margin), effective should be 3.0.
+        # Just assert >= 0.5mm minimum so the test is robust to fallback tuning.
+        assert comp.effective_width >= 0.5, \
+            f"effective_width should be >= 0.5mm, got {comp.effective_width}"
+        assert comp.effective_height >= 0.5, \
+            f"effective_height should be >= 0.5mm, got {comp.effective_height}"
+        # bbox must be non-degenerate (x_min < x_max, y_min < y_max).
+        x_min, y_min, x_max, y_max = comp.bbox
+        assert x_max > x_min, \
+            f"bbox x_max ({x_max}) must be > x_min ({x_min}) for bare footprint"
+        assert y_max > y_min, \
+            f"bbox y_max ({y_max}) must be > y_min ({y_min}) for bare footprint"
+        # Two bare footprints at the same position must overlap — proves
+        # the SA can't "stack" them for free.
+        from models.board_model import Component as _C
+        comp2 = _C(
+            ref="U2",
+            x=comp.x,
+            y=comp.y,
+            width=comp.width,
+            height=comp.height,
+            courtyard_margin=comp.courtyard_margin,
+        )
+        assert comp.overlaps(comp2), \
+            "Two bare footprints at the same position must overlap (non-zero bbox)"
+    finally:
+        os.unlink(pcb_path)
+
+
 # ---------------------------------------------------------------------------
 # Net Clustering Tests
 # ---------------------------------------------------------------------------
@@ -873,6 +945,95 @@ def test_snapshot_restore_with_density():
         f"Restored density {restored_density} != original {original_density}"
 
 
+def test_snapshot_restore_n_moves_property():
+    """Property test: after N random SA moves with snapshot/restore on each,
+    incremental cost must match a from-scratch CostState recompute.
+
+    This is the single most common source of SA converging to a placement
+    that *looks* good by the tracked cost but is actually worse than a full
+    recompute would say.  The existing 1-move test only catches gross bugs;
+    this N-move version catches drift that accumulates over many accepts
+    and rejects (e.g. an overlap entry that gets dropped from _pair_overlaps
+    but never re-added on restore, or a density-grid cell that's off by one).
+
+    Runs 40 moves with deterministic seed so failures are reproducible.
+    """
+    import random as _random
+
+    _random.seed(0xC0FFEE)  # deterministic
+    # Also seed engine.moves' random module — it has its own `import random`,
+    # so seeding our local _random doesn't affect it.  We seed the engine
+    # module's RNG directly to get reproducible move selection.
+    from engine import moves as _moves_mod
+    _moves_mod.random.seed(0xC0FFEE)
+
+    model = _make_test_model()
+    moveable = get_moveable_indices(model)
+    assert len(moveable) >= 2, "test model needs >=2 moveable components"
+
+    cs = CostState(model)
+    initial_normalized = cs.normalized_cost
+
+    for step in range(40):
+        mt = select_move_type(0.5)  # mid-temperature
+        if mt == 'translate':
+            undo = do_translate(model, moveable, 0.5, 3.0)
+        elif mt == 'swap':
+            undo = do_swap(model, moveable)
+        elif mt == 'rotate':
+            undo = do_rotate(model, moveable)
+        else:
+            undo = do_median(model, moveable, 0.5, 0.5)
+
+        if not undo.old_states:
+            continue
+
+        moved = affected_indices(undo)
+        old_bboxes = cs.old_bboxes_from_states(undo.old_states)
+        snap = cs.snapshot(moved, old_bboxes=old_bboxes)
+        incremental_cost = cs.incremental_update(moved)
+
+        # Compare against a from-scratch CostState on the SAME model state.
+        fresh = CostState(model)
+        fresh.update_penalty_scale(cs._penalty_scale)
+        from_scratch_cost = fresh.total_cost
+
+        assert abs(incremental_cost - from_scratch_cost) < 0.5, (
+            f"Step {step} ({mt}): incremental={incremental_cost:.4f} "
+            f"!= from_scratch={from_scratch_cost:.4f} "
+            f"(delta={incremental_cost - from_scratch_cost:.4f}). "
+            f"This is the SA-vs-truth drift bug — incremental cost tracking "
+            f"desynced from a full recompute after {step} moves."
+        )
+
+        # Metropolis accept/reject with seed-deterministic probability.
+        # When rejected, restore model AND cost_state (the SA pattern).
+        delta = incremental_cost - snap.get('hpwl', 0) - snap.get('overlap_penalty', 0)
+        accept = delta < 0 or _random.random() < 0.5  # 50% accept for test stress
+        if not accept:
+            revert_move(model, undo)
+            cs.restore(snap)
+
+    # After 40 moves, verify the cost_state's view still matches a fresh
+    # CostState on the final model state — catches cumulative drift even
+    # when every individual step passed the per-step check.
+    final_incremental = cs.total_cost
+    final_fresh = CostState(model)
+    final_fresh.update_penalty_scale(cs._penalty_scale)
+    final_from_scratch = final_fresh.total_cost
+    assert abs(final_incremental - final_from_scratch) < 1.0, (
+        f"After 40 moves: incremental={final_incremental:.4f} "
+        f"!= from_scratch={final_from_scratch:.4f}. "
+        f"Cumulative drift in incremental cost tracking."
+    )
+
+    # Also verify normalized_cost (used for best-state tracking) matches.
+    assert abs(cs.normalized_cost - final_fresh.normalized_cost) < 1.0, (
+        f"normalized_cost drift: cs={cs.normalized_cost:.4f} "
+        f"fresh={final_fresh.normalized_cost:.4f}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Phase 6: Move Operator Tests
 # ---------------------------------------------------------------------------
@@ -1100,6 +1261,7 @@ def main():
     print("\nParser Tests:")
     run_test("KiCad parser", test_kicad_parser)
     run_test("JSON roundtrip", test_json_roundtrip)
+    run_test("Zero-courtyard fallback", test_zero_courtyard_fallback)
 
     print("\nNet Clustering Tests:")
     run_test("Build net hypergraph", test_build_hypergraph)
@@ -1149,6 +1311,7 @@ def main():
     run_test("Snapshot restore", test_snapshot_restore)
     run_test("Density gated by decap rule", test_density_gated_by_decap_rule)
     run_test("Snapshot restore with density", test_snapshot_restore_with_density)
+    run_test("Snapshot restore N moves property", test_snapshot_restore_n_moves_property)
 
     print("\nPhase 6: Move Operators:")
     run_test("Translate move and revert", test_translate_move_and_revert)
