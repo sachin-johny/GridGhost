@@ -230,8 +230,104 @@ def _has_edge_cuts(sexp: list) -> bool:
     return False
 
 
+def _collect_edge_cuts_shapes(sexp: list) -> list[dict]:
+    """Collect every closed shape on Edge.Cuts as a bbox + area record.
+
+    Used by _extract_board_outline_and_keepouts to distinguish the outer
+    outline (largest-area closed shape) from internal cutouts (mounting
+    holes, connector slots) that must become keepouts.
+
+    Only CLOSED shapes can be cutouts — gr_line segments that form part
+    of a polyline outline are handled separately by _extract_board_outline
+    which already takes the global AABB.  Here we collect gr_rect,
+    gr_poly, and gr_circle because each is a single closed shape with a
+    well-defined bbox.
+
+    Returns a list of dicts:
+        [{"x_min", "y_min", "x_max", "y_max", "area", "kind": "rect"|"poly"|"circle"}, ...]
+    """
+    shapes: list[dict] = []
+
+    # gr_rect on Edge.Cuts — closed by definition
+    for gr_rect in find_all(sexp, "gr_rect"):
+        layer = find_first(gr_rect, "layer")
+        if not layer or len(layer) < 2 or "Edge.Cuts" not in str(layer[1]):
+            continue
+        start_pt = find_first(gr_rect, "start")
+        end_pt = find_first(gr_rect, "end")
+        if not (start_pt and len(start_pt) >= 3 and end_pt and len(end_pt) >= 3):
+            continue
+        x1, y1 = try_float(start_pt[1]), try_float(start_pt[2])
+        x2, y2 = try_float(end_pt[1]), try_float(end_pt[2])
+        x_min, x_max = min(x1, x2), max(x1, x2)
+        y_min, y_max = min(y1, y2), max(y1, y2)
+        shapes.append({
+            "x_min": x_min, "y_min": y_min,
+            "x_max": x_max, "y_max": y_max,
+            "area": (x_max - x_min) * (y_max - y_min),
+            "kind": "rect",
+        })
+
+    # gr_poly on Edge.Cuts — closed by definition (polygon)
+    for gr_poly in find_all(sexp, "gr_poly"):
+        layer = find_first(gr_poly, "layer")
+        if not layer or len(layer) < 2 or "Edge.Cuts" not in str(layer[1]):
+            continue
+        pts_expr = find_first(gr_poly, "pts")
+        if not pts_expr:
+            continue
+        xs, ys = [], []
+        for xy in find_all(pts_expr, "xy"):
+            if len(xy) >= 3:
+                xs.append(try_float(xy[1]))
+                ys.append(try_float(xy[2]))
+        if len(xs) < 3:
+            continue
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+        # Polygon area via shoelace — signed, take abs.
+        area = 0.0
+        for i in range(len(xs)):
+            j = (i + 1) % len(xs)
+            area += xs[i] * ys[j] - xs[j] * ys[i]
+        shapes.append({
+            "x_min": x_min, "y_min": y_min,
+            "x_max": x_max, "y_max": y_max,
+            "area": abs(area) / 2.0,
+            "kind": "poly",
+        })
+
+    # gr_circle on Edge.Cuts — closed by definition
+    for gr_circle in find_all(sexp, "gr_circle"):
+        layer = find_first(gr_circle, "layer")
+        if not layer or len(layer) < 2 or "Edge.Cuts" not in str(layer[1]):
+            continue
+        center = find_first(gr_circle, "center")
+        end = find_first(gr_circle, "end")
+        if not (center and len(center) >= 3 and end and len(end) >= 3):
+            continue
+        cx, cy = try_float(center[1]), try_float(center[2])
+        ex, ey = try_float(end[1]), try_float(end[2])
+        r = math.sqrt((ex - cx) ** 2 + (ey - cy) ** 2)
+        shapes.append({
+            "x_min": cx - r, "y_min": cy - r,
+            "x_max": cx + r, "y_max": cy + r,
+            "area": math.pi * r * r,
+            "kind": "circle",
+        })
+
+    return shapes
+
+
 def _extract_board_outline(sexp: list) -> BoardOutline:
-    """Extract board outline from Edge.Cuts geometry."""
+    """Extract board outline from Edge.Cuts geometry.
+
+    Takes the global AABB of all Edge.Cuts geometry (rects, lines,
+    polys, circles).  Internal cutouts that are entirely inside the
+    outer outline don't enlarge the AABB, so this returns the correct
+    outer outline.  Cutouts themselves are extracted separately by
+    _collect_edge_cuts_shapes and turned into keepouts by the parser.
+    """
     points_x = []
     points_y = []
 
@@ -293,6 +389,51 @@ def _extract_board_outline(sexp: list) -> BoardOutline:
         x_max=max(points_x) + margin,
         y_max=max(points_y) + margin,
     )
+
+
+def _extract_keepouts_from_edge_cuts(
+    sexp: list,
+    outer_outline: BoardOutline,
+) -> list[BoardOutline]:
+    """Identify internal cutouts on Edge.Cuts and return them as keepouts.
+
+    Strategy: every closed shape on Edge.Cuts whose bbox is STRICTLY
+    INSIDE the outer outline (with a small tolerance) is treated as an
+    internal cutout — a mounting hole, connector slot, etc.  The largest
+    closed shape is assumed to BE the outer outline (or part of it) and
+    is NOT turned into a keepout.
+
+    Edge case: if there's only one closed shape and it's the same size
+    as the outer outline, no keepouts are produced (the board has no
+    internal cutouts).  If there are no closed shapes (only gr_line
+    polyline outlines), no keepouts are produced either.
+    """
+    shapes = _collect_edge_cuts_shapes(sexp)
+    if not shapes:
+        return []
+
+    # The outer outline is the largest closed shape (by area).  In a
+    # typical board, the outer outline is a gr_rect or gr_poly covering
+    # the whole board, and any smaller closed shape is a cutout.
+    largest_area = max(s["area"] for s in shapes)
+    # 5% tolerance — a cutout is at most 95% of the outer outline's area
+    # in any realistic board.  (Mounting holes are tiny by comparison.)
+    outer_threshold = largest_area * 0.95
+
+    keepouts: list[BoardOutline] = []
+    for s in shapes:
+        if s["area"] >= outer_threshold:
+            continue  # This IS the outer outline, not a cutout
+        # Sanity check: the cutout should be strictly inside the outer
+        # outline.  If it extends outside (overlapping the board edge),
+        # it's probably a slot/notch rather than a hole — still treat
+        # it as a keepout because components shouldn't be placed there.
+        keepouts.append(BoardOutline(
+            x_min=s["x_min"], y_min=s["y_min"],
+            x_max=s["x_max"], y_max=s["y_max"],
+        ))
+
+    return keepouts
 
 
 def _infer_board_from_components(components: list[Component]) -> BoardOutline:
@@ -416,12 +557,20 @@ class KiCadParser:
         if _needs_inferred_board(board_outline, components):
             board_outline = _infer_board_from_components(components)
 
+        # Extract internal cutouts (mounting holes, slots) as keepouts.
+        # Only attempt this when there's a real Edge.Cuts outline —
+        # inferred-from-components boards have no cutouts by definition.
+        keepouts: list[BoardOutline] = []
+        if has_edge_cuts:
+            keepouts = _extract_keepouts_from_edge_cuts(sexp, board_outline)
+
         model = BoardModel(
             board=board_outline,
             components=components,
             nets=nets,
             source_file=str(self.filepath),
             user_defined_outline=has_edge_cuts,
+            keepouts=keepouts,
         )
         return model
 

@@ -289,6 +289,14 @@ class BoardModel:
     nets: list[Net] = field(default_factory=list)
     source_file: str = ""
     user_defined_outline: bool = False
+    # Internal cutouts / mounting-hole zones parsed from Edge.Cuts.
+    # Components must not be placed inside any keepout — the legalizer
+    # treats keepouts as obstacles and the cost function charges a
+    # boundary-style penalty for components overlapping a keepout.
+    # See AUDIT_PHASE0.md "Board outline with internal cutouts" for the
+    # bug this fixes (mounting holes were silently flattened into the
+    # outer outline bbox, letting components be placed inside holes).
+    keepouts: list[BoardOutline] = field(default_factory=list)
 
     # ---- Lookup helpers ----
 
@@ -325,6 +333,29 @@ class BoardModel:
         if not net:
             return []
         return [c for c in self.components if c.ref in net.component_refs]
+
+    # ---- Keepout helpers ----
+
+    def component_in_keepout(self, comp: Component) -> bool:
+        """Return True if the component's bbox overlaps ANY keepout zone.
+
+        Used by the legalizer (treat keepouts as obstacles during overlap
+        resolution) and the cost function (boundary-style penalty for
+        components overlapping a keepout).  Edge connectors are exempt
+        — a connector's body may legitimately overhang a mounting hole
+        near the board edge.
+        """
+        if not self.keepouts:
+            return False
+        if getattr(comp, 'is_edge_connector', False):
+            return False
+        bx1, by1, bx2, by2 = comp.bbox
+        for k in self.keepouts:
+            # AABB overlap test
+            if bx2 <= k.x_min or k.x_max <= bx1 or by2 <= k.y_min or k.y_max <= by1:
+                continue
+            return True
+        return False
 
     # ---- Serialization ----
 
@@ -363,6 +394,7 @@ class BoardModel:
             ],
             "source_file": self.source_file,
             "user_defined_outline": self.user_defined_outline,
+            "keepouts": [asdict(k) for k in self.keepouts],
         }
 
     def to_json(self, path: str) -> None:
@@ -415,12 +447,22 @@ class BoardModel:
             )
             nets.append(net)
 
+        keepouts: list[BoardOutline] = []
+        for kd in data.get("keepouts", []):
+            keepouts.append(BoardOutline(
+                x_min=kd.get("x_min", 0.0),
+                y_min=kd.get("y_min", 0.0),
+                x_max=kd.get("x_max", 0.0),
+                y_max=kd.get("y_max", 0.0),
+            ))
+
         return cls(
             board=board,
             components=components,
             nets=nets,
             source_file=data.get("source_file", ""),
             user_defined_outline=data.get("user_defined_outline", False),
+            keepouts=keepouts,
         )
 
     @classmethod

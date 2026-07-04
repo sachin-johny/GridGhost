@@ -27,6 +27,9 @@ def legalize(
 ) -> BoardModel:
     rules = getattr(model, 'active_rules', None) or []
     cached_decap_map = _build_decoupling_map(model) if rules else {}
+    # Keepouts (mounting holes, slots) parsed from Edge.Cuts —
+    # _enforce_boundary_single pushes components out of these zones.
+    keepouts = getattr(model, 'keepouts', None) or []
 
     grid = SpatialGrid.from_components(list(model.components), model.board)
 
@@ -40,7 +43,7 @@ def legalize(
     grid.build(list(model.components))
 
     # Step 2: Enforce board boundary
-    _enforce_boundary(model, interior_bbox)
+    _enforce_boundary(model, interior_bbox, keepouts=keepouts)
     grid.build(list(model.components))
 
     # Step 2.5: Try Abacus row-based DP legalization first
@@ -60,30 +63,30 @@ def legalize(
 
     # Step 3: Resolve overlaps (only if Abacus didn't fully resolve)
     if not abacus_success:
-        _resolve_overlaps(model, max_iterations, push_strength, grid_mm, verbose, interior_bbox, cached_decap_map, grid)
+        _resolve_overlaps(model, max_iterations, push_strength, grid_mm, verbose, interior_bbox, cached_decap_map, grid, keepouts=keepouts)
 
     # Step 4: Greedy cleanup
     remaining, _ = _compute_overlap_stats(model, grid)
     if remaining > 0:
-        _greedy_resolve(model, grid_mm, verbose, interior_bbox, cached_decap_map, grid)
+        _greedy_resolve(model, grid_mm, verbose, interior_bbox, cached_decap_map, grid, keepouts=keepouts)
 
     # Step 5: Final grid snap and boundary check
     _snap_to_grid(model, grid_mm)
-    _enforce_boundary(model, interior_bbox)
+    _enforce_boundary(model, interior_bbox, keepouts=keepouts)
     grid.build(list(model.components))
 
     # Step 6: Final greedy cleanup
     remaining, _ = _compute_overlap_stats(model, grid)
     if remaining > 0:
-        _greedy_resolve(model, grid_mm, verbose, interior_bbox, cached_decap_map, grid)
+        _greedy_resolve(model, grid_mm, verbose, interior_bbox, cached_decap_map, grid, keepouts=keepouts)
 
     # Step 7: Final legality pass
-    _enforce_boundary(model, interior_bbox)
+    _enforce_boundary(model, interior_bbox, keepouts=keepouts)
     grid.build(list(model.components))
     remaining, _ = _compute_overlap_stats(model, grid)
     if remaining > 0:
-        _greedy_resolve(model, grid_mm, verbose, interior_bbox, cached_decap_map, grid)
-        _enforce_boundary(model, interior_bbox)
+        _greedy_resolve(model, grid_mm, verbose, interior_bbox, cached_decap_map, grid, keepouts=keepouts)
+        _enforce_boundary(model, interior_bbox, keepouts=keepouts)
         grid.build(list(model.components))
 
     # Step 8: Cap nudge
@@ -216,6 +219,7 @@ def _snap_to_grid(model: BoardModel, grid_mm: float) -> None:
 def _enforce_boundary(
     model: BoardModel,
     interior_bbox: tuple[float, float, float, float] | None = None,
+    keepouts: list[BoardOutline] | None = None,
 ) -> None:
     board = model.board
     components = list(model.components)
@@ -226,7 +230,7 @@ def _enforce_boundary(
 
         old_x, old_y = comp.x, comp.y
         old_rot = comp.rotation
-        _enforce_boundary_single(comp, interior_bbox, board)
+        _enforce_boundary_single(comp, interior_bbox, board, keepouts=keepouts)
 
         # Rotation-aware: if still OOB and non-square, try 90°
         if _is_non_square(comp):
@@ -324,7 +328,17 @@ def _enforce_boundary_single(
     comp: Component,
     interior_bbox: tuple[float, float, float, float] | None,
     board: BoardOutline,
+    keepouts: list[BoardOutline] | None = None,
 ) -> None:
+    """Clamp a component inside the board / interior bbox AND push it
+    out of any internal keepout zones (mounting holes, slots).
+
+    Keepout eviction is a one-pass nudge: if the component's center is
+    inside a keepout, push it to the nearest keepout edge.  This is
+    conservative — a component straddling a keepout boundary may still
+    overlap it after the nudge — but the legalizer's overlap-resolution
+    loop will catch any remaining overlap on subsequent iterations.
+    """
     if comp.is_fixed or comp.is_edge_connector:
         return
     half_w = comp.effective_width / 2.0
@@ -341,6 +355,29 @@ def _enforce_boundary_single(
         y_max = board.y_max - half_h
     comp.x = max(x_min, min(comp.x, x_max))
     comp.y = max(y_min, min(comp.y, y_max))
+
+    # Keepout eviction: if the component's center is inside a keepout,
+    # nudge it to the nearest keepout edge (plus the component's half-
+    # extent so the courtyard clears the keepout boundary).
+    if keepouts:
+        for k in keepouts:
+            if k.x_min <= comp.x <= k.x_max and k.y_min <= comp.y <= k.y_max:
+                d_left = comp.x - k.x_min + half_w
+                d_right = k.x_max - comp.x + half_w
+                d_top = comp.y - k.y_min + half_h
+                d_bottom = k.y_max - comp.y + half_h
+                min_d = min(d_left, d_right, d_top, d_bottom)
+                if min_d == d_left:
+                    comp.x = k.x_min - half_w
+                elif min_d == d_right:
+                    comp.x = k.x_max + half_w
+                elif min_d == d_top:
+                    comp.y = k.y_min - half_h
+                else:
+                    comp.y = k.y_max + half_h
+                # Re-clamp to board/interior after the nudge.
+                comp.x = max(x_min, min(comp.x, x_max))
+                comp.y = max(y_min, min(comp.y, y_max))
 
 
 def _count_overlaps_involving(
@@ -469,6 +506,7 @@ def _resolve_overlaps(
     interior_bbox: tuple[float, float, float, float] | None = None,
     cached_decap_map: dict | None = None,
     grid: SpatialGrid | None = None,
+    keepouts: list[BoardOutline] | None = None,
 ) -> None:
     board = model.board
     prev_overlap_count = float("inf")
@@ -543,11 +581,11 @@ def _resolve_overlaps(
             _push_apart_hpwl(
                 c1, c2, components, comp_net_lookup, model,
                 adaptive_strength, grid_mm, board, interior_bbox,
-                comp_map=comp_map,
+                comp_map=comp_map, keepouts=keepouts,
             )
 
-            _enforce_boundary_single(c1, interior_bbox, board)
-            _enforce_boundary_single(c2, interior_bbox, board)
+            _enforce_boundary_single(c1, interior_bbox, board, keepouts=keepouts)
+            _enforce_boundary_single(c2, interior_bbox, board, keepouts=keepouts)
 
             local_after = _count_pair_overlaps_involving(c1, c2, components, grid)
 
@@ -573,8 +611,8 @@ def _resolve_overlaps(
                     adaptive_strength, grid_mm, board, interior_bbox,
                     comp_map=comp_map,
                 )
-                _enforce_boundary_single(c1, interior_bbox, board)
-                _enforce_boundary_single(c2, interior_bbox, board)
+                _enforce_boundary_single(c1, interior_bbox, board, keepouts=keepouts)
+                _enforce_boundary_single(c2, interior_bbox, board, keepouts=keepouts)
 
                 if base_score <= pre_score:
                     resolved_this_pass += 1
@@ -591,8 +629,8 @@ def _resolve_overlaps(
                     comp_map=comp_map,
                 )
 
-                _enforce_boundary_single(c1, interior_bbox, board)
-                _enforce_boundary_single(c2, interior_bbox, board)
+                _enforce_boundary_single(c1, interior_bbox, board, keepouts=keepouts)
+                _enforce_boundary_single(c2, interior_bbox, board, keepouts=keepouts)
 
                 local_after_reduced = _count_pair_overlaps_involving(c1, c2, components, grid)
                 if local_after_reduced <= local_before:
@@ -602,7 +640,7 @@ def _resolve_overlaps(
                     c2.x, c2.y = old_x2, old_y2
                     continue
 
-        _enforce_boundary(model, interior_bbox)
+        _enforce_boundary(model, interior_bbox, keepouts=keepouts)
         actual_overlap_count, _ = _compute_overlap_stats(model, grid)
 
         if actual_overlap_count >= prev_overlap_count:
@@ -637,6 +675,7 @@ def _greedy_resolve(
     interior_bbox: tuple[float, float, float, float] | None = None,
     cached_decap_map: dict | None = None,
     grid: SpatialGrid | None = None,
+    keepouts: list[BoardOutline] | None = None,
 ) -> None:
     board = model.board
     components = list(model.components)
@@ -711,7 +750,7 @@ def _greedy_resolve(
                     for dist in nudge_dists:
                         comp.x = old_x + dx_dir * dist
                         comp.y = old_y + dy_dir * dist
-                        _enforce_boundary_single(comp, interior_bbox, board)
+                        _enforce_boundary_single(comp, interior_bbox, board, keepouts=keepouts)
 
                         new_overlaps = _count_overlaps_involving(comp, components, grid)
                         if new_overlaps < best_overlaps:
@@ -997,6 +1036,7 @@ def _push_apart_hpwl(
     interior_bbox: tuple[float, float, float, float] | None,
     max_iter: int = 5,
     comp_map: dict[str, Component] | None = None,
+    keepouts: list[BoardOutline] | None = None,
 ) -> None:
     """P0 #3: HPWL-aware push-apart via bounded gradient descent.
 
@@ -1061,7 +1101,7 @@ def _push_apart_hpwl(
                 for dist in distances:
                     mover.x = old_x + dx_dir * dist
                     mover.y = old_y + dy_dir * dist
-                    _enforce_boundary_single(mover, interior_bbox, board)
+                    _enforce_boundary_single(mover, interior_bbox, board, keepouts=keepouts)
 
                     if mover.overlaps(other):
                         pair_ov = mover.overlap_area(other)

@@ -329,6 +329,102 @@ def test_zero_courtyard_fallback():
         os.unlink(pcb_path)
 
 
+def test_board_outline_with_internal_cutout():
+    """A board with an internal cutout (mounting hole) on Edge.Cuts must
+    extract BOTH the outer outline AND the cutout as a keepout zone.
+
+    The previous parser took the global AABB of all Edge.Cuts points,
+    which silently flattened the cutout into the outer outline —
+    components could then be placed *inside* the mounting hole region,
+    a real DFM defect class.
+
+    This test constructs a 100x80 board with two 5mm-diameter mounting
+    holes and asserts:
+      1. The outer outline is (approximately) 100x80, not enlarged by
+         the holes.
+      2. The model has a `keepouts` list containing both holes' bboxes.
+      3. A component placed inside a hole is flagged as overlapping a
+         keepout (via BoardModel.component_in_keepout).
+    """
+    # 100x80 outer rect + 5mm-diameter circle (mounting hole) at (20, 20)
+    # gr_circle on Edge.Cuts with center=(20,20), end=(22.5,20) → r=2.5
+    board_with_hole_pcb = """(kicad_pcb
+      (version 20240108)
+      (general (thickness 1.6))
+      (layers (0 "F.Cu" signal) (31 "B.Cu" signal) (32 "B.Adhes" user))
+      (net 0 "")
+      (gr_rect (start 0 0) (end 100 80) (stroke (width 0.1)) (fill none) (layer "Edge.Cuts") (tstamp "00000000-0000-0000-0000-000000000001"))
+      (gr_circle (center 20 20) (end 22.5 20) (stroke (width 0.1)) (fill none) (layer "Edge.Cuts") (tstamp "00000000-0000-0000-0000-000000000002"))
+      (gr_circle (center 80 60) (end 82.5 60) (stroke (width 0.1)) (fill none) (layer "Edge.Cuts") (tstamp "00000000-0000-0000-0000-000000000003"))
+    )"""
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".kicad_pcb", mode="w", delete=False
+    ) as f:
+        f.write(board_with_hole_pcb)
+        pcb_path = f.name
+
+    try:
+        parser = KiCadParser(pcb_path)
+        model = parser.parse()
+
+        # 1. Outer outline is ~100x80, NOT enlarged by the holes.
+        # The parser adds a 2mm margin to the outer outline.
+        board = model.board
+        outer_w = board.x_max - board.x_min
+        outer_h = board.y_max - board.y_min
+        assert 100.0 <= outer_w <= 105.0, \
+            f"Outer width should be ~100mm (with margin), got {outer_w}"
+        assert 80.0 <= outer_h <= 85.0, \
+            f"Outer height should be ~80mm (with margin), got {outer_h}"
+
+        # 2. Model has keepouts for the two mounting holes.
+        keepouts = getattr(model, 'keepouts', None)
+        assert keepouts is not None, \
+            "BoardModel must have a `keepouts` list (was None — field missing?)"
+        assert len(keepouts) == 2, \
+            f"Expected 2 keepouts (one per mounting-hole circle), got {len(keepouts)}"
+
+        # Each keepout should be centered near (20, 20) or (80, 60) with
+        # ~2.5mm radius (5mm diameter).
+        keepout_centers = []
+        for k in keepouts:
+            kcx = (k.x_min + k.x_max) / 2.0
+            kcy = (k.y_min + k.y_max) / 2.0
+            keepout_centers.append((kcx, kcy))
+            k_w = k.x_max - k.x_min
+            k_h = k.y_max - k.y_min
+            # Circle was r=2.5, so diameter 5.0; parser may add a small margin.
+            assert 4.5 <= k_w <= 6.0, \
+                f"Keepout width should be ~5mm (mounting hole diameter), got {k_w}"
+            assert 4.5 <= k_h <= 6.0, \
+                f"Keepout height should be ~5mm (mounting hole diameter), got {k_h}"
+
+        # Sort by x to make the assertion deterministic
+        keepout_centers.sort()
+        assert abs(keepout_centers[0][0] - 20.0) < 1.0 and abs(keepout_centers[0][1] - 20.0) < 1.0, \
+            f"First keepout should be near (20, 20), got {keepout_centers[0]}"
+        assert abs(keepout_centers[1][0] - 80.0) < 1.0 and abs(keepout_centers[1][1] - 60.0) < 1.0, \
+            f"Second keepout should be near (80, 60), got {keepout_centers[1]}"
+
+        # 3. A component placed inside a keepout is flagged as overlapping it.
+        comp_in_hole = Component(
+            ref="X1", x=20.0, y=20.0, width=1.0, height=1.0,
+            courtyard_margin=0.0,
+        )
+        assert model.component_in_keepout(comp_in_hole), \
+            "Component at (20, 20) must be flagged as inside a keepout"
+
+        comp_outside_hole = Component(
+            ref="X2", x=50.0, y=40.0, width=1.0, height=1.0,
+            courtyard_margin=0.0,
+        )
+        assert not model.component_in_keepout(comp_outside_hole), \
+            "Component at (50, 40) must NOT be inside a keepout"
+    finally:
+        os.unlink(pcb_path)
+
+
 # ---------------------------------------------------------------------------
 # Net Clustering Tests
 # ---------------------------------------------------------------------------
@@ -1262,6 +1358,7 @@ def main():
     run_test("KiCad parser", test_kicad_parser)
     run_test("JSON roundtrip", test_json_roundtrip)
     run_test("Zero-courtyard fallback", test_zero_courtyard_fallback)
+    run_test("Board outline with internal cutout", test_board_outline_with_internal_cutout)
 
     print("\nNet Clustering Tests:")
     run_test("Build net hypergraph", test_build_hypergraph)
