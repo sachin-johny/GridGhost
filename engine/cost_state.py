@@ -246,8 +246,13 @@ class CostState:
 
         # Boundary
         board = self.model.board
+        keepouts = getattr(self.model, 'keepouts', None) or []
         for i in range(self._n):
-            self._comp_boundary[i] = self._compute_boundary(self._comps[i].bbox, board)
+            comp = self._comps[i]
+            self._comp_boundary[i] = self._compute_boundary(
+                comp.bbox, board, keepouts=keepouts,
+                is_edge_connector=comp.is_edge_connector,
+            )
 
         # Constraint penalties
         if self._rules:
@@ -389,12 +394,43 @@ class CostState:
     def _compute_boundary(
         bbox: tuple[float, float, float, float],
         board,
+        keepouts: list | None = None,
+        is_edge_connector: bool = False,
     ) -> float:
+        """Boundary penalty for a single component bbox.
+
+        Charges linear overflow distance for the board outline (existing
+        behavior) PLUS the overlap area with any internal keepout zone
+        (mounting holes, slots).  The keepout term closes the SA-loop
+        gap: without it, SA could freely place components on mounting
+        holes during optimization (the legalizer would push them out
+        post-hoc, but SA never learned to avoid the keepout).
+
+        Area (not distance) is used for keepouts so SA sees a smooth
+        gradient: a component partially overlapping a keepout is charged
+        less than one fully inside, so SA can slide out gradually instead
+        of jumping discontinuously.
+
+        Edge connectors are exempt from keepout penalties — their body
+        may legitimately overhang a mounting hole near the board edge.
+        """
         left = max(0.0, board.x_min - bbox[0])
         right = max(0.0, bbox[2] - board.x_max)
         top = max(0.0, board.y_min - bbox[1])
         bottom = max(0.0, bbox[3] - board.y_max)
-        overflow = left + right + top + bottom
+        overflow = left + right + top + bottom  # linear ramp
+
+        # Keepout overlap contribution
+        if keepouts and not is_edge_connector:
+            x_min, y_min, x_max, y_max = bbox
+            for k in keepouts:
+                ox1 = max(x_min, k.x_min)
+                oy1 = max(y_min, k.y_min)
+                ox2 = min(x_max, k.x_max)
+                oy2 = min(y_max, k.y_max)
+                if ox2 > ox1 and oy2 > oy1:
+                    overflow += (ox2 - ox1) * (oy2 - oy1)
+
         return overflow  # linear ramp (quadratic too aggressive for SA)
 
     # ------------------------------------------------------------------
@@ -451,8 +487,13 @@ class CostState:
 
         # Boundary
         board = self.model.board
+        keepouts = getattr(self.model, 'keepouts', None) or []
         for i in moved_indices:
-            self._comp_boundary[i] = self._compute_boundary(self._comps[i].bbox, board)
+            comp = self._comps[i]
+            self._comp_boundary[i] = self._compute_boundary(
+                comp.bbox, board, keepouts=keepouts,
+                is_edge_connector=comp.is_edge_connector,
+            )
 
         # Constraint penalties — recompute the VALUE (depends on positions)
         # but skip the topology rebuild (decap_map / crystal_pairs /

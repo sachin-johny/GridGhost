@@ -177,17 +177,33 @@ def overlap_penalty_and_count(model: BoardModel) -> tuple[float, int]:
 # ---------------------------------------------------------------------------
 
 def total_boundary_penalty(model: BoardModel) -> float:
-    """Compute penalty for components outside the board outline.
+    """Compute penalty for components outside the board outline AND for
+    components overlapping any internal keepout zone (mounting holes, slots).
 
-    Penalty is proportional to how far outside the boundary each component is.
+    Penalty is proportional to how far outside the boundary each component is
+    (linear ramp on overflow distance).  For keepouts, the penalty is the
+    overlap area between the component's bbox and the keepout — this gives SA
+    a smooth gradient: a component partially overlapping a keepout is charged
+    less than one fully inside it, so SA can learn to slide out gradually
+    instead of jumping discontinuously.
+
+    Without the keepout term, SA could freely place components on mounting
+    holes during optimization (the legalizer would push them out post-hoc,
+    but SA never learned to avoid the keepout in the first place).  This
+    closes the SA-loop gap identified in the post-audit recommendations.
     """
     total = 0.0
     board = model.board
+    keepouts = getattr(model, 'keepouts', None) or []
 
     for comp in model.components:
+        # Edge connectors are exempt from keepout penalties — their body
+        # may legitimately overhang a mounting hole near the board edge.
+        if comp.is_edge_connector:
+            continue
         x_min, y_min, x_max, y_max = comp.bbox
 
-        # How far outside each edge
+        # --- Board boundary overflow (existing behavior) ---
         left_overflow = max(0.0, board.x_min - x_min)
         right_overflow = max(0.0, x_max - board.x_max)
         top_overflow = max(0.0, board.y_min - y_min)
@@ -196,6 +212,20 @@ def total_boundary_penalty(model: BoardModel) -> float:
         # Linear penalty (proportional to distance outside)
         overflow = left_overflow + right_overflow + top_overflow + bottom_overflow
         total += overflow
+
+        # --- Keepout overlap (new) ---
+        # Charge the overlap AREA between component bbox and each keepout.
+        # Area (not distance) gives SA a smooth gradient: a component
+        # partially overlapping is charged less than one fully inside,
+        # so SA can slide out gradually instead of jumping.
+        if keepouts:
+            for k in keepouts:
+                ox1 = max(x_min, k.x_min)
+                oy1 = max(y_min, k.y_min)
+                ox2 = min(x_max, k.x_max)
+                oy2 = min(y_max, k.y_max)
+                if ox2 > ox1 and oy2 > oy1:
+                    total += (ox2 - ox1) * (oy2 - oy1)
 
     return total
 

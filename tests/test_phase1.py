@@ -791,6 +791,88 @@ def test_boundary_penalty():
     assert penalty > 0, f"Expected positive boundary penalty, got {penalty}"
 
 
+def test_boundary_penalty_includes_keepouts():
+    """total_boundary_penalty must charge components overlapping a keepout.
+
+    Before this fix, the cost function only charged for components
+    outside the board outline.  Components inside a mounting-hole
+    keepout (parsed from Edge.Cuts internal cutouts) were free to
+    overlap — the legalizer would push them out post-hoc, but the SA
+    never learned to avoid the keepout during optimization.  This
+    closed the SA-loop gap: SA now sees a cost for keepout overlap
+    and avoids placing components there in the first place.
+    """
+    from models.board_model import BoardOutline
+    keepout = BoardOutline(x_min=20, y_min=20, x_max=25, y_max=25)  # 5x5 mounting hole
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=100, y_max=80),
+        components=[
+            # Inside the keepout — must be charged.
+            Component(ref="U1", x=22, y=22, width=2, height=2, courtyard_margin=0.0),
+            # Outside the keepout, inside the board — must NOT be charged.
+            Component(ref="U2", x=50, y=40, width=2, height=2, courtyard_margin=0.0),
+            # Outside the board — must still be charged (existing behavior).
+            Component(ref="U3", x=120, y=40, width=2, height=2, courtyard_margin=0.0),
+        ],
+        keepouts=[keepout],
+    )
+
+    penalty = total_boundary_penalty(model)
+    assert penalty > 0, f"Expected positive penalty for U1 in keepout + U3 OOB, got {penalty}"
+
+    # Now check the keepout-only contribution: remove U3 (OOB) and re-measure.
+    model.components = [model.components[0], model.components[1]]  # U1, U2 only
+    penalty_with_keepout = total_boundary_penalty(model)
+    assert penalty_with_keepout > 0, \
+        f"U1 inside keepout must produce >0 penalty, got {penalty_with_keepout}"
+
+    # And the no-keepout baseline: same model, no keepouts → 0 penalty
+    # (both U1 and U2 are inside the board).
+    model.keepouts = []
+    penalty_no_keepout = total_boundary_penalty(model)
+    assert penalty_no_keepout == 0, \
+        f"Without keepouts, U1 and U2 are both in-bounds → 0 penalty, got {penalty_no_keepout}"
+
+    # Restore keepouts, verify the difference is the keepout contribution.
+    model.keepouts = [keepout]
+    keepout_penalty = total_boundary_penalty(model) - penalty_no_keepout
+    assert keepout_penalty > 0, \
+        f"Keepout contribution to penalty must be >0, got {keepout_penalty}"
+
+
+def test_cost_state_includes_keepouts():
+    """CostState (SA hot path) must also charge for keepout overlap.
+
+    Mirrors test_boundary_penalty_includes_keepouts but for the SA
+    incremental-cost path.  Without this, the cold evaluator would
+    charge for keepouts but SA would happily place components on
+    mounting holes during optimization — the same cold/hot drift
+    pattern as the HPWL bug fixed earlier.
+    """
+    from models.board_model import BoardOutline
+    keepout = BoardOutline(x_min=20, y_min=20, x_max=25, y_max=25)
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=100, y_max=80),
+        components=[
+            Component(ref="U1", x=22, y=22, width=2, height=2, courtyard_margin=0.0),
+            Component(ref="U2", x=50, y=40, width=2, height=2, courtyard_margin=0.0),
+        ],
+        keepouts=[keepout],
+    )
+
+    cs = CostState(model)
+    boundary_with_keepout = cs._boundary_sum()
+
+    # Remove keepouts, re-measure — should be 0 (both comps in-bounds).
+    model.keepouts = []
+    cs2 = CostState(model)
+    boundary_no_keepout = cs2._boundary_sum()
+
+    assert boundary_with_keepout > boundary_no_keepout, \
+        f"CostState boundary penalty with keepout ({boundary_with_keepout}) " \
+        f"must be > without keepout ({boundary_no_keepout})"
+
+
 def test_cost_function():
     model = _make_test_model()
     cost_fn = CostFunction(alpha=1.0, beta=5.0, gamma=3.0)
@@ -1534,6 +1616,8 @@ def main():
     run_test("Total HPWL", test_total_hpwl)
     run_test("Overlap penalty", test_overlap_penalty)
     run_test("Boundary penalty", test_boundary_penalty)
+    run_test("Boundary penalty includes keepouts", test_boundary_penalty_includes_keepouts)
+    run_test("CostState includes keepouts", test_cost_state_includes_keepouts)
     run_test("Cost function evaluation", test_cost_function)
 
     print("\nGrid Placement Tests:")
