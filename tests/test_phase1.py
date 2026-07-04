@@ -341,6 +341,105 @@ def test_hpwl_auto_model():
     assert hpwl_large > 0
 
 
+def test_hpwl_true_model_default():
+    """Default model='auto' should compute TRUE HPWL = (max(x)-min(x)) + (max(y)-min(y)).
+
+    This is the standard VLSI half-perimeter wirelength, and the same formula
+    CostState._compute_net_hpwl uses in the SA hot loop.  The previous default
+    used clique (≤4 pins) / star (>4 pins), which are *different* wirelength
+    proxies and silently disagreed with CostState on multi-pin nets.
+
+    For 4 pins [(0,0), (10,0), (0,10), (10,10)]:
+      - True HPWL  = (10-0) + (10-0) = 20
+      - Clique     = (10+10+20+10+20+10) / 3 = 80/3 ≈ 26.67  (DIFFERENT)
+      - Star       = (10+10+10+10) = 40                     (DIFFERENT)
+
+    Note: for 3 pins, Manhattan clique is always equal to true HPWL
+    (sum of pairwise Manhattan = 2 * HPWL for any 3 points), so the
+    bug only manifests at 4+ pins.  This test uses 4 pins deliberately.
+    """
+    pins = [(0.0, 0.0), (10.0, 0.0), (0.0, 10.0), (10.0, 10.0)]
+    true_hpwl = (10.0 - 0.0) + (10.0 - 0.0)  # = 20.0
+    assert abs(net_wirelength_hpwl(pins) - true_hpwl) < 0.01, \
+        f"Default model should return true HPWL {true_hpwl}, got {net_wirelength_hpwl(pins)}"
+    assert abs(net_wirelength_hpwl(pins, model="auto") - true_hpwl) < 0.01
+    assert abs(net_wirelength_hpwl(pins, model="true") - true_hpwl) < 0.01
+    # Clique and star remain accessible as explicit alternatives, and
+    # for 4 pins they produce DIFFERENT numbers from true HPWL —
+    # which is exactly why the cold/hot-path agreement matters.
+    clique_hpwl = net_wirelength_hpwl(pins, model="clique")
+    assert abs(clique_hpwl - 26.67) < 0.1, f"Clique should still work, got {clique_hpwl}"
+    star_hpwl = net_wirelength_hpwl(pins, model="star")
+    assert abs(star_hpwl - 40.0) < 0.1, f"Star should still work, got {star_hpwl}"
+
+
+def test_hpwl_4_to_5_pin_continuity():
+    """Cost should NOT jump discontinuously when a net grows from 4 to 5 pins.
+
+    The old clique→star switch at >4 pins produced a discontinuity because
+    clique (pairwise sum / (n-1)) and star (sum to centroid) are different
+    quantities with different scales.  With true HPWL as default, the cost
+    is continuous: adding a pin inside the existing bbox doesn't change HPWL.
+    """
+    # 4-pin net on a 10x10 bounding box
+    pins_4 = [(0.0, 0.0), (10.0, 0.0), (0.0, 10.0), (10.0, 10.0)]
+    hpwl_4 = net_wirelength_hpwl(pins_4)
+    assert abs(hpwl_4 - 20.0) < 0.01, f"4-pin true HPWL should be 20, got {hpwl_4}"
+
+    # Add a 5th pin INSIDE the bbox — true HPWL is unchanged
+    pins_5 = pins_4 + [(5.0, 5.0)]
+    hpwl_5 = net_wirelength_hpwl(pins_5)
+    assert abs(hpwl_5 - 20.0) < 0.01, f"5-pin true HPWL should still be 20, got {hpwl_5}"
+
+    # Add a 5th pin OUTSIDE the bbox — true HPWL grows continuously
+    pins_5_out = pins_4 + [(15.0, 5.0)]
+    hpwl_5_out = net_wirelength_hpwl(pins_5_out)
+    assert abs(hpwl_5_out - 25.0) < 0.01, f"5-pin extended HPWL should be 25, got {hpwl_5_out}"
+
+
+def test_total_hpwl_matches_cost_state():
+    """total_hpwl (cold path) must agree with CostState.hpwl (hot SA path).
+
+    Before this fix, total_hpwl used clique/star via net_wirelength_hpwl,
+    while CostState._compute_net_hpwl used true HPWL — they silently
+    disagreed on any board with multi-pin non-power nets.  This test
+    constructs a board with a 5-pin signal net and asserts the two
+    paths produce the same number.
+    """
+    # 5-pin signal net "SIG" connecting U1..U5 in a 10x10 footprint
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=50, y_max=50),
+        components=[
+            Component(
+                ref=f"U{i}",
+                x=xs,
+                y=ys,
+                width=1.0,
+                height=1.0,
+                component_type="ic",
+                pads=[Pad(pad_name="1", x=0.0, y=0.0, net="SIG")],
+                nets=["SIG"],
+            )
+            for i, (xs, ys) in enumerate(
+                [(10, 10), (20, 10), (10, 20), (20, 20), (15, 15)], start=1
+            )
+        ],
+        nets=[
+            Net(name="SIG", pins=[(f"U{i}", "1") for i in range(1, 6)]),
+        ],
+    )
+
+    cold_hpwl = total_hpwl(model)
+    cs = CostState(model)
+    hot_hpwl = cs.hpwl
+
+    assert abs(cold_hpwl - hot_hpwl) < 1e-6, (
+        f"Cold path (total_hpwl) = {cold_hpwl} must match hot path "
+        f"(CostState.hpwl) = {hot_hpwl} on a 5-pin net. "
+        f"This is the silent SA-vs-evaluator drift bug."
+    )
+
+
 def test_total_hpwl():
     model = _make_test_model()
     hpwl = total_hpwl(model)
@@ -1012,6 +1111,9 @@ def main():
     run_test("HPWL 3-pin clique", test_hpwl_3pin_clique)
     run_test("HPWL star model", test_hpwl_star)
     run_test("HPWL auto model selection", test_hpwl_auto_model)
+    run_test("HPWL true model is default", test_hpwl_true_model_default)
+    run_test("HPWL 4-to-5-pin continuity", test_hpwl_4_to_5_pin_continuity)
+    run_test("total_hpwl matches CostState.hpwl", test_total_hpwl_matches_cost_state)
     run_test("Total HPWL", test_total_hpwl)
     run_test("Overlap penalty", test_overlap_penalty)
     run_test("Boundary penalty", test_boundary_penalty)

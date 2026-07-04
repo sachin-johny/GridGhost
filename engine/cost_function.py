@@ -31,8 +31,19 @@ def net_wirelength_hpwl(pins: list[tuple[float, float]], model: str = "auto") ->
 
     Args:
         pins: List of (x, y) absolute pin positions
-        model: "clique" for pairwise (≤4 pins), "star" for star model (>4 pins),
-               "auto" to select automatically
+        model: "true" (default) for true half-perimeter wirelength
+               `(max(x)-min(x)) + (max(y)-min(y))`,
+               "clique" for the pairwise-Manhattan / (n-1) approximation,
+               "star" for the sum-of-distances-to-centroid approximation,
+               "auto" selects "true" (matches CostState._compute_net_hpwl
+               so the cold evaluator and the SA hot loop agree).
+
+               Historically "auto" picked clique for ≤4 pins and star for
+               >4 pins, but those are *different* wirelength proxies and
+               silently disagreed with CostState on multi-pin nets — see
+               test_total_hpwl_matches_cost_state for the regression that
+               caught it.  Clique and star remain accessible via the
+               explicit model param for callers that want them.
 
     Returns:
         HPWL value for this net
@@ -40,18 +51,29 @@ def net_wirelength_hpwl(pins: list[tuple[float, float]], model: str = "auto") ->
     if len(pins) < 2:
         return 0.0
 
+    # Resolve "auto" to "true" — this is the fix for the silent
+    # cold/hot-path disagreement.  CostState._compute_net_hpwl always
+    # uses true HPWL, so the cold path must too.
     if model == "auto":
-        model = "clique" if len(pins) <= 4 else "star"
+        model = "true"
+
+    if model == "true":
+        # Standard VLSI half-perimeter wirelength.  O(n), no pairwise work.
+        xs = [p[0] for p in pins]
+        ys = [p[1] for p in pins]
+        return (max(xs) - min(xs)) + (max(ys) - min(ys))
 
     if model == "clique":
-        # Clique model: sum of pairwise Manhattan distances, normalized
+        # Clique model: sum of pairwise Manhattan distances, normalized.
+        # Kept as an explicit alternative for callers that want it.
         total = 0.0
         for (x1, y1), (x2, y2) in combinations(pins, 2):
             total += abs(x1 - x2) + abs(y1 - y2)
         return total / (len(pins) - 1)
 
     if model == "star":
-        # Star model: distances to center-of-mass auxiliary point
+        # Star model: distances to center-of-mass auxiliary point.
+        # Kept as an explicit alternative for callers that want it.
         center_x = sum(p[0] for p in pins) / len(pins)
         center_y = sum(p[1] for p in pins) / len(pins)
         return sum(abs(p[0] - center_x) + abs(p[1] - center_y) for p in pins)
