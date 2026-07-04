@@ -646,6 +646,17 @@ class KiCadParser:
         # Bounding box from geometry (with margin for spacing)
         width, height, bbox_ox, bbox_oy = _extract_fp_geometry(fp_expr, margin_mm=self._bbox_margin)
 
+        # Hierarchical schematic sheet (KiCad 7+) — the designer's own
+        # functional grouping, sitting in the file for free.  Components
+        # on the same sheet (e.g. "/MCU/", "/POWER/") get a strong prior
+        # edge in the clustering hypergraph so the auto-placer respects
+        # the schematic organisation.  Empty string for flat schematics
+        # or root-sheet components (sheetname="/").  See AUDIT_PHASE0.md §3.1.
+        sheet = ""
+        sheet_expr = find_first(fp_expr, "sheetname")
+        if sheet_expr and len(sheet_expr) >= 2:
+            sheet = str(sheet_expr[1]) if sheet_expr[1] else ""
+
         # Determine if fixed. Keep connectors movable so the auto-placer can
         # move them to the board perimeter during edge-aware placement.
         comp_type = _infer_component_type(ref, lib_id, value)
@@ -667,6 +678,7 @@ class KiCadParser:
             pads=pads,
             is_fixed=is_fixed,
             component_type=comp_type,
+            sheet=sheet,
         )
         components.append(comp)
 

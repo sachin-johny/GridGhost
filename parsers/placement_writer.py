@@ -334,12 +334,19 @@ def write_debug_bboxes(
             f'(stroke (width 0.1) (type solid)) (fill none) (layer "Dwgs.User") '
             f'(tstamp "{rect_uuid}"))'
         )
-        # Label at bottom-left corner
+        # Label at bottom-left corner — include the sheet name (Phase 3.1)
+        # so a human reviewing the placement can immediately see which
+        # schematic sheet each component came from.  Empty sheet → just ref.
+        sheet = getattr(comp, 'sheet', '') or ''
+        if sheet and sheet != '/':
+            label = f"{comp.ref} [{sheet}]"
+        else:
+            label = comp.ref
         lx = format_kicad_coord(bx1)
         ly = format_kicad_coord(by1 - 0.3)
         text_uuid = str(uuid.uuid4())
         segments.append(
-            f'  (gr_text "{comp.ref}" (at {lx} {ly}) '
+            f'  (gr_text "{label}" (at {lx} {ly}) '
             f'(layer "Dwgs.User") (tstamp "{text_uuid}") '
             f'(effects (font (size 0.8 0.8) (thickness 0.12))))'
         )

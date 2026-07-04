@@ -60,6 +60,14 @@ class Component:
     nets: list[str] = field(default_factory=list)
     is_fixed: bool = False
     component_type: str = "generic"
+    # Hierarchical schematic sheet this component came from (KiCad 7+).
+    # Populated from the `sheetname` field in the footprint expression —
+    # e.g. "/MCU/", "/POWER/".  Empty string for flat schematics or
+    # root-sheet components (sheetname="/").  Used by Phase 3.1 sheet-
+    # aware clustering: components sharing a sheet get a strong prior
+    # edge in the clustering hypergraph so the auto-placer respects the
+    # designer's own functional grouping.  See AUDIT_PHASE0.md §3.1.
+    sheet: str = ""
 
     _cos_a: float = field(default=1.0, repr=False, compare=False)
     _sin_a: float = field(default=0.0, repr=False, compare=False)
@@ -381,6 +389,7 @@ class BoardModel:
                     "nets": c.nets,
                     "is_fixed": c.is_fixed,
                     "component_type": c.component_type,
+                    "sheet": c.sheet,
                 }
                 for c in self.components
             ],
@@ -435,6 +444,7 @@ class BoardModel:
                 nets=cd.get("nets", []),
                 is_fixed=cd.get("is_fixed", False),
                 component_type=cd.get("component_type", "generic"),
+                sheet=cd.get("sheet", ""),
             )
             components.append(comp)
 

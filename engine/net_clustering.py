@@ -34,6 +34,15 @@ def build_net_hypergraph(model: BoardModel) -> Graph:
     cluster with the ICs that share their power rail — this is the key
     insight from the user's suggestion: use +3V3, +12V labels to link
     caps to their ICs.
+
+    Phase 3.1 — Sheet-aware edges: components sharing a non-empty, non-
+    root (`/`) `sheet` field (extracted from KiCad 7+ `sheetname`) get
+    a synthetic edge with weight SHEET_EDGE_WEIGHT.  This is the designer's
+    own functional grouping, sitting in the file for free — two components
+    on the same sheet that happen to share only power rails would
+    otherwise end up in different clusters.  Falls back gracefully to
+    pure net-based clustering when no component has a hierarchical sheet.
+    See AUDIT_PHASE0.md §3.1.
     """
     G = Graph()
 
@@ -65,7 +74,63 @@ def build_net_hypergraph(model: BoardModel) -> Graph:
     # and have no signal-net edges).
     _add_power_rail_edges(G, model, comp_type_map)
 
+    # Phase 3.1: Add sheet-aware edges between components on the same
+    # hierarchical schematic sheet.  This is the core of the brief's
+    # "human-like functional grouping" ask.
+    _add_sheet_edges(G, model)
+
     return G
+
+
+# Weight for sheet-aware clustering edges.  Stronger than a single signal-
+# net edge (weight=1) so sheet membership dominates when components share
+# only power rails, but weaker than a 3+ shared-signal connection so
+# genuine high-fanout signal groups still cluster tightly.  Tunable.
+SHEET_EDGE_WEIGHT = 2.0
+
+
+def _add_sheet_edges(G: Graph, model: BoardModel) -> None:
+    """Add synthetic edges between components sharing a non-empty, non-root
+    hierarchical sheet.
+
+    The KiCad `sheetname` field records which schematic sheet each
+    footprint came from — e.g. "/MCU/", "/POWER/", "/Display/".  This
+    is the designer's own functional grouping: components on the same
+    sheet are usually a coherent sub-circuit (a regulator + its caps +
+    its feedback divider, an MCU + its crystal + its decoupling caps)
+    that a human PCB designer would keep together.  Adding a strong
+    prior edge means the clustering naturally respects schematic
+    organisation while still letting genuine cross-sheet net
+    connectivity pull related sheets near each other.
+
+    Components with sheet="" or sheet="/" (root sheet of a flat
+    schematic) are skipped — they carry no grouping information.
+    """
+    # Group movable components by sheet
+    sheet_groups: dict[str, list[str]] = defaultdict(list)
+    for comp in model.components:
+        if comp.is_fixed:
+            continue
+        sheet = getattr(comp, 'sheet', '') or ''
+        # Skip empty and root-sheet ("/") entries — they carry no info.
+        if not sheet or sheet == '/':
+            continue
+        if not G.has_node(comp.ref):
+            continue
+        sheet_groups[sheet].append(comp.ref)
+
+    # Add edges within each sheet group (clique — every pair gets an edge).
+    # Sorted iteration for deterministic edge insertion order.
+    for sheet in sorted(sheet_groups.keys()):
+        refs = sorted(sheet_groups[sheet])
+        if len(refs) < 2:
+            continue
+        for i, r1 in enumerate(refs):
+            for r2 in refs[i + 1:]:
+                if G.has_edge(r1, r2):
+                    G[r1][r2]["weight"] += SHEET_EDGE_WEIGHT
+                else:
+                    G.add_edge(r1, r2, weight=SHEET_EDGE_WEIGHT)
 
 
 def _add_power_rail_edges(

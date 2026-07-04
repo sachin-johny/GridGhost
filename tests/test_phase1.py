@@ -444,6 +444,160 @@ def test_build_hypergraph():
         assert G.has_edge("U1", "C1"), "U1 and C1 should share an edge (VCC)"
 
 
+def test_sheet_field_parsed_and_serialized():
+    """Component must have a `sheet` field that round-trips through JSON.
+
+    The parser extracts `sheetname` from KiCad 7+ footprints — every
+    hierarchical schematic sheet leaves its name on the footprints that
+    came from it.  This is the ground-truth functional grouping signal
+    Phase 3.1 builds on.
+    """
+    comp = Component(ref="U1", x=10, y=10, sheet="/MCU/")
+    assert comp.sheet == "/MCU/", f"Expected /MCU/, got {comp.sheet}"
+
+    # Round-trip through dict (same path as to_json/from_json)
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=50, y_max=50),
+        components=[comp],
+        nets=[],
+    )
+    d = model.to_dict()
+    assert d["components"][0].get("sheet") == "/MCU/", \
+        f"to_dict should preserve sheet, got {d['components'][0].get('sheet')}"
+    model2 = BoardModel.from_dict(d)
+    assert model2.components[0].sheet == "/MCU/", \
+        f"from_dict should restore sheet, got {model2.components[0].sheet}"
+
+    # Default is empty string (flat schematics)
+    comp_default = Component(ref="U2")
+    assert comp_default.sheet == "", "Default sheet should be empty string"
+
+
+def test_sheet_aware_clustering_groups_by_sheet():
+    """build_net_hypergraph must add edges between components sharing
+    a non-empty, non-root (`/`) sheet — even if they share NO signal nets.
+
+    This is the core of Phase 3.1: KiCad's hierarchical sheets are the
+    designer's own functional grouping, sitting in the file for free.
+    Two components on the same sheet that happen to share only power
+    rails (which are excluded from signal-net edges) would otherwise
+    end up in different clusters — sheet-aware edges fix that.
+    """
+    # Two ICs on the same sheet (/MCU/) but with NO shared signal net —
+    # only GND (which is excluded from signal edges).
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=100, y_max=80),
+        components=[
+            Component(
+                ref="U1", x=20, y=20, width=5, height=5, component_type="ic",
+                sheet="/MCU/",
+                pads=[Pad(pad_name="1", x=0, y=0, net="GND"),
+                      Pad(pad_name="2", x=1, y=0, net="SIG_A")],
+                nets=["GND", "SIG_A"],
+            ),
+            Component(
+                ref="U2", x=80, y=60, width=5, height=5, component_type="ic",
+                sheet="/MCU/",
+                pads=[Pad(pad_name="1", x=0, y=0, net="GND"),
+                      Pad(pad_name="2", x=1, y=0, net="SIG_B")],
+                nets=["GND", "SIG_B"],
+            ),
+            # Different sheet — should NOT get a sheet-edge to U1/U2.
+            Component(
+                ref="U3", x=50, y=40, width=5, height=5, component_type="ic",
+                sheet="/POWER/",
+                pads=[Pad(pad_name="1", x=0, y=0, net="GND"),
+                      Pad(pad_name="2", x=1, y=0, net="SIG_C")],
+                nets=["GND", "SIG_C"],
+            ),
+        ],
+        nets=[
+            Net(name="GND", pins=[("U1", "1"), ("U2", "1"), ("U3", "1")]),
+            Net(name="SIG_A", pins=[("U1", "2")]),
+            Net(name="SIG_B", pins=[("U2", "2")]),
+            Net(name="SIG_C", pins=[("U3", "2")]),
+        ],
+    )
+
+    G = build_net_hypergraph(model)
+
+    # U1 and U2 share a sheet — must have an edge despite no shared signal net.
+    assert G.has_edge("U1", "U2"), \
+        "U1 and U2 share sheet /MCU/ — must have a sheet-aware edge"
+    # U3 is on a different sheet — should NOT have a sheet-edge to U1/U2.
+    # (It might still have a fallback power-rail edge via _add_power_rail_edges,
+    # but GND is excluded so there should be no edge at all here.)
+    assert not G.has_edge("U1", "U3"), \
+        "U1 (/MCU/) and U3 (/POWER/) should NOT have an edge — different sheets, no shared signal"
+    assert not G.has_edge("U2", "U3"), \
+        "U2 (/MCU/) and U3 (/POWER/) should NOT have an edge — different sheets, no shared signal"
+
+
+def test_sheet_aware_clustering_falls_back_when_no_sheets():
+    """When no component has a hierarchical sheet (flat schematic, all
+    sheet="" or "/"), clustering must behave exactly as before — pure
+    net-based.  This is the graceful-fallback requirement.
+    """
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=100, y_max=80),
+        components=[
+            Component(
+                ref="U1", x=20, y=20, width=5, height=5, component_type="ic",
+                sheet="",  # flat schematic
+                pads=[Pad(pad_name="1", x=0, y=0, net="GND"),
+                      Pad(pad_name="2", x=1, y=0, net="SIG_A")],
+                nets=["GND", "SIG_A"],
+            ),
+            Component(
+                ref="U2", x=80, y=60, width=5, height=5, component_type="ic",
+                sheet="",  # flat schematic
+                pads=[Pad(pad_name="1", x=0, y=0, net="GND"),
+                      Pad(pad_name="2", x=1, y=0, net="SIG_B")],
+                nets=["GND", "SIG_B"],
+            ),
+        ],
+        nets=[
+            Net(name="GND", pins=[("U1", "1"), ("U2", "1")]),
+            Net(name="SIG_A", pins=[("U1", "2")]),
+            Net(name="SIG_B", pins=[("U2", "2")]),
+        ],
+    )
+
+    G = build_net_hypergraph(model)
+    # No shared signal net, no sheet info — no edge.
+    assert not G.has_edge("U1", "U2"), \
+        "Flat schematic, no shared signal — should have no edge"
+
+
+def test_th_sensor_sheet_extraction():
+    """Real-world check: parsing th_sensor.kicad_pcb must populate
+    Component.sheet for every footprint, with values matching the
+    sheetname fields in the file (/MCU/, /PWR_INPUT/, /PWR_REG/,
+    /DISPLAY/, /TH_SENSOR/).
+    """
+    pcb_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "tests", "test_pcbs", "th_sensor.kicad_pcb",
+    )
+    if not os.path.exists(pcb_path):
+        return  # skip if running from a different working dir
+    parser = KiCadParser(pcb_path)
+    model = parser.parse()
+
+    # Every component should have a non-empty sheet (th_sensor is
+    # a hierarchical design — all footprints come from a sub-sheet).
+    sheets_found = {c.sheet for c in model.components}
+    expected_sheets = {"/MCU/", "/PWR_INPUT/", "/PWR_REG/", "/DISPLAY/", "/TH_SENSOR/"}
+    assert sheets_found & expected_sheets, (
+        f"Expected to find at least some of {expected_sheets} in parsed "
+        f"sheets, got {sheets_found}"
+    )
+    # Most components should have a non-empty sheet.
+    non_empty = sum(1 for c in model.components if c.sheet)
+    assert non_empty >= len(model.components) * 0.5, \
+        f"At least 50% of components should have a sheet, got {non_empty}/{len(model.components)}"
+
+
 def test_clustering():
     model = _make_test_model()
     clusters = cluster_components(model, n_clusters=3)
@@ -1362,6 +1516,10 @@ def main():
 
     print("\nNet Clustering Tests:")
     run_test("Build net hypergraph", test_build_hypergraph)
+    run_test("Sheet field parsed and serialized", test_sheet_field_parsed_and_serialized)
+    run_test("Sheet-aware clustering groups by sheet", test_sheet_aware_clustering_groups_by_sheet)
+    run_test("Sheet-aware clustering falls back when no sheets", test_sheet_aware_clustering_falls_back_when_no_sheets)
+    run_test("th_sensor.kicad_pcb sheet extraction", test_th_sensor_sheet_extraction)
     run_test("Component clustering", test_clustering)
     run_test("Seed position computation", test_seed_positions)
 
