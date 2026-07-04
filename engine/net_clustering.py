@@ -119,8 +119,13 @@ def _add_sheet_edges(G: Graph, model: BoardModel) -> None:
             continue
         sheet_groups[sheet].append(comp.ref)
 
-    # Add edges within each sheet group (clique — every pair gets an edge).
-    # Sorted iteration for deterministic edge insertion order.
+    # Add edges within each sheet group, but only between pairs that don't
+    # already share a signal edge.  Adding a sheet boost on top of an existing
+    # signal edge double-counts the connection and collapses tight sub-circuits
+    # (e.g. an IC + its decoupling caps) into a single Louvain community that
+    # gets placed as a block — observable on th_sensor as 3x HPWL regression
+    # and U2 pushed off-board.  Skipping those pairs preserves the intent
+    # (help weakly-connected sheet-mates cluster) without disrupting tight ones.
     for sheet in sorted(sheet_groups.keys()):
         refs = sorted(sheet_groups[sheet])
         if len(refs) < 2:
@@ -128,9 +133,8 @@ def _add_sheet_edges(G: Graph, model: BoardModel) -> None:
         for i, r1 in enumerate(refs):
             for r2 in refs[i + 1:]:
                 if G.has_edge(r1, r2):
-                    G[r1][r2]["weight"] += SHEET_EDGE_WEIGHT
-                else:
-                    G.add_edge(r1, r2, weight=SHEET_EDGE_WEIGHT)
+                    continue
+                G.add_edge(r1, r2, weight=SHEET_EDGE_WEIGHT)
 
 
 def _add_power_rail_edges(
