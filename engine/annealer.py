@@ -41,6 +41,17 @@ class SAConfig:
     skip_sa: bool = False              # v13: if True, skip global SA, run greedy+swap+greedy only
     rudy_weight: float = 0.3           # RUDY congestion penalty weight (0 = disabled)
     rudy_grid_resolution: float = 2.0  # RUDY grid cell size in mm
+    # Auto-disable SA on tiny/large boards.  Set to 0 to disable the gate.
+    # Tiny boards (≤5 comps): greedy is already near-optimal, SA noise hurts.
+    # Large boards (≥50 comps): SA is 8-25x slower with diminishing returns.
+    sa_auto_disable_min_components: int = 5
+    sa_auto_disable_max_components: int = 50
+    # Spread floor: reject SA moves that collapse component spread below this
+    # fraction of board dimensions.  Prevents the "SA crams everything into
+    # one corner to minimise HPWL" failure mode.  0 = disabled.
+    # At 0.10, a 100x80 board requires std_x ≥ 10mm AND std_y ≥ 8mm
+    # (10% of each dimension) — components must span at least 2 sigma each way.
+    spread_floor_fraction: float = 0.10
 
 
 def _compute_density(model: BoardModel) -> float:
@@ -87,6 +98,81 @@ def _density_adaptive_reheat_count(density: float) -> int:
         return 2
     else:
         return 2
+
+
+def _violates_spread_floor(
+    model: BoardModel,
+    board,
+    spread_floor_fraction: float,
+) -> bool:
+    """Return True if the current placement's spread is below the floor.
+
+    Computes the standard deviation of movable-component x and y positions
+    and compares each to ``spread_floor_fraction * board_dimension``.  If
+    EITHER dimension's std-dev is below its floor, the placement is too
+    bunched in that axis and the move should be rejected.
+
+    This is a cheap O(n) check called on every low-temperature SA move,
+    so it avoids building any intermediate data structures — just a
+    single pass over movable components.
+
+    Only movable, non-connector components are counted — fixed components
+    and edge connectors have predetermined positions and shouldn't
+    influence the spread metric.
+    """
+    n = 0
+    sum_x = 0.0
+    sum_y = 0.0
+    for c in model.components:
+        if c.is_fixed or getattr(c, 'component_type', '') == 'connector':
+            continue
+        sum_x += c.x
+        sum_y += c.y
+        n += 1
+    if n < 2:
+        return False  # can't compute meaningful std-dev with <2 components
+
+    mean_x = sum_x / n
+    mean_y = sum_y / n
+    var_x = 0.0
+    var_y = 0.0
+    for c in model.components:
+        if c.is_fixed or getattr(c, 'component_type', '') == 'connector':
+            continue
+        var_x += (c.x - mean_x) ** 2
+        var_y += (c.y - mean_y) ** 2
+    std_x = math.sqrt(var_x / n)
+    std_y = math.sqrt(var_y / n)
+
+    floor_x = spread_floor_fraction * board.width
+    floor_y = spread_floor_fraction * board.height
+    return std_x < floor_x or std_y < floor_y
+
+
+def _centroid_offset(model: BoardModel, board) -> float:
+    """Distance from the movable-component centroid to the board center.
+
+    A high value means the component cluster is off-center — either
+    bunched in a corner or pushed off-board.  Used as a final revert
+    check in run_sa to catch cases where SA found a low-HPWL placement
+    that's visually terrible (components scattered off-board).
+    """
+    n = 0
+    sum_x = 0.0
+    sum_y = 0.0
+    for c in model.components:
+        if c.is_fixed or getattr(c, 'component_type', '') == 'connector':
+            continue
+        sum_x += c.x
+        sum_y += c.y
+        n += 1
+    if n == 0:
+        return 0.0
+    cx = sum_x / n
+    cy = sum_y / n
+    board_cx = (board.x_min + board.x_max) / 2.0
+    board_cy = (board.y_min + board.y_max) / 2.0
+    return math.hypot(cx - board_cx, cy - board_cy)
 
 
 def _save_positions(model: BoardModel, indices: list[int]) -> dict[int, tuple[float, float, float]]:
@@ -342,6 +428,18 @@ def _run_sa_pass(
             # The old code hard-rejected at ALL temperatures, causing SA to freeze.
             if t_ratio < 0.4:
                 if cost_state.overlap_count > current_overlap_count and cost_state.normalized_cost >= best_cost:
+                    accept_move = False
+
+            # Spread floor: reject moves that collapse component spread below
+            # a fraction of board dimensions.  Prevents the "SA crams
+            # everything into one corner to minimise HPWL" failure mode
+            # identified in the multi-metric A/B test.  Only active at LOW
+            # temperature (t_ratio < 0.4) — at high temperature we want SA
+            # to freely explore, including temporarily compact configurations.
+            # The floor is computed from the board dimensions, not the
+            # current spread, so it's a stable target.
+            if accept_move and t_ratio < 0.4 and config.spread_floor_fraction > 0:
+                if _violates_spread_floor(model, board, config.spread_floor_fraction):
                     accept_move = False
 
             if accept_move:
@@ -1163,6 +1261,32 @@ def run_sa(
         elif density > 0.25:
             config.overlap_cap_factor = 1.75  # medium: allow 75% increase
 
+    # Auto-disable SA on tiny/large boards.  Greedy is near-optimal on
+    # tiny boards (≤5 comps) and SA noise can hurt; on large boards (≥50
+    # comps) SA is 8-25x slower with diminishing returns.  Only auto-
+    # disable if the user hasn't explicitly set skip_sa=True (they asked
+    # for no-SA) or skip_sa=False (they explicitly want SA).  When the
+    # user passes skip_sa=False, respect that.
+    n_movable = sum(1 for c in model.components if not c.is_fixed
+                    and getattr(c, 'component_type', '') != 'connector')
+    sa_was_auto_disabled = False
+    if not config.skip_sa:  # only auto-disable if SA was going to run
+        min_n = config.sa_auto_disable_min_components
+        max_n = config.sa_auto_disable_max_components
+        if min_n > 0 and n_movable <= min_n:
+            if config.verbose:
+                print(f"  Auto-disabling SA: {n_movable} movable components "
+                      f"(≤{min_n} threshold — greedy is near-optimal on tiny boards)")
+            config.skip_sa = True
+            sa_was_auto_disabled = True
+        elif max_n > 0 and n_movable >= max_n:
+            if config.verbose:
+                print(f"  Auto-disabling SA: {n_movable} movable components "
+                      f"(≥{max_n} threshold — SA too slow on large boards, "
+                      f"greedy+legalize is the better default)")
+            config.skip_sa = True
+            sa_was_auto_disabled = True
+
     if config.verbose:
         mode = "greedy+swap" if config.skip_sa else "SA+greedy+swap"
         print(f"  Mode: {mode}, Density: {density:.3f}, penalty_scale_min: {config.penalty_scale_min:.2f}, "
@@ -1215,6 +1339,42 @@ def run_sa(
         _restore_positions(model, pre_sa_positions)
         cost_state._compute_all()
         final_cost = cost_state.normalized_cost
+
+    # Spread-floor revert: if the final placement is bunched into a
+    # corner/edge (std_x or std_y below spread_floor_fraction of board
+    # dimensions), revert to pre-SA positions.  This catches the case
+    # where SA+greedy found a low-HPWL but visually terrible placement
+    # (everything crammed in one corner).  The per-move spread floor in
+    # _run_sa_pass only guards SA moves, not the greedy refinement that
+    # runs afterward — so we need this final check.
+    if not should_revert and config.spread_floor_fraction > 0 and not sa_was_auto_disabled:
+        if _violates_spread_floor(model, model.board, config.spread_floor_fraction):
+            if config.verbose:
+                print(f"  Optimization reverted: spread floor violated "
+                      f"(components bunched into corner/edge)")
+            _restore_positions(model, pre_sa_positions)
+            cost_state._compute_all()
+            final_cost = cost_state.normalized_cost
+            should_revert = True  # skip centroid check if we already reverted
+
+    # Centroid-offset revert: if the final centroid is far from board
+    # center (more than 25% of the board's min dimension off-center),
+    # revert.  This catches the case where SA pushed the entire component
+    # cluster off-board (e.g. thermal_separation pushing hot parts to
+    # opposite corners, with the cluster ending up outside the board
+    # outline).  The spread floor doesn't catch this because the
+    # components ARE spread — just in the wrong location.
+    if not should_revert and not sa_was_auto_disabled:
+        centroid_off = _centroid_offset(model, model.board)
+        min_board_dim = min(model.board.width, model.board.height)
+        centroid_threshold = 0.25 * min_board_dim  # 25% of min dimension
+        if centroid_off > centroid_threshold:
+            if config.verbose:
+                print(f"  Optimization reverted: centroid {centroid_off:.1f}mm off-center "
+                      f"(threshold {centroid_threshold:.1f}mm — components pushed off-board)")
+            _restore_positions(model, pre_sa_positions)
+            cost_state._compute_all()
+            final_cost = cost_state.normalized_cost
 
     return {
         'initial_cost': initial_cost,

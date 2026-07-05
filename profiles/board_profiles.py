@@ -126,12 +126,20 @@ BUILTIN_PROFILES: dict[str, BoardProfile] = {
         delta=6.0,
         rules=[
             ConstraintRule("thermal_grouping", weight=5.0),
-            # Phase 2.4: Complementary thermal separation — keeps hot
-            # parts on DIFFERENT nets ≥5mm apart so two independent
-            # regulators don't stack and create a thermal hotspot.
-            # See AUDIT_FINAL_REPORT.md §2.4.
-            ConstraintRule("thermal_separation", weight=4.0,
-                           params={"min_distance_mm": 5.0}),
+            # Phase 2.4: Complementary thermal separation — keeps hot parts
+            # on DIFFERENT nets apart so two independent regulators don't
+            # stack and create a thermal hotspot.
+            #
+            # RETUNED (post-A/B-test): original weight=4.0 / min_distance=5mm
+            # caused SA to cram components into corners (centroid offset
+            # 5.9mm → 43.1mm, 7 components OOB) because the penalty
+            # dominated HPWL+boundary.  Lowered to weight=1.0 / 3mm so
+            # it's a gentle nudge, not a hard constraint — SA can still
+            # satisfy it when there's room, but won't catastrophically
+            # deform the placement to do so.  See scripts/ab_test_sa.py
+            # for the regression data.
+            ConstraintRule("thermal_separation", weight=1.0,
+                           params={"min_distance_mm": 3.0}),
             ConstraintRule("high_current_path", weight=4.0),
             ConstraintRule("bulk_cap_input", weight=3.0),
         ],

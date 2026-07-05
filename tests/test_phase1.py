@@ -54,7 +54,7 @@ from engine.moves import (
     do_translate, do_swap, do_rotate, do_median,
     revert_move, affected_indices, MoveUndo,
 )
-from engine.annealer import simulate_annealing, SAConfig
+from engine.annealer import simulate_annealing, run_sa, SAConfig
 
 
 # ---------------------------------------------------------------------------
@@ -1423,6 +1423,137 @@ def test_thermal_separation_in_power_supply_profile():
         "thermal_separation should be enabled on power_supply"
 
 
+def test_thermal_separation_retuned_weights():
+    """Post-A/B-test retuning: thermal_separation on power_supply should
+    have weight=1.0 and min_distance=3.0mm (down from 4.0/5.0mm).
+
+    The original weights caused SA to cram components into corners
+    (centroid offset 5.9mm → 43.1mm, 7 components OOB on th_sensor).
+    The retuned weights make it a gentle nudge, not a hard constraint.
+    """
+    ps = get_profile("power_supply")
+    rule = next(r for r in ps.rules if r.name == "thermal_separation")
+    assert rule.weight == 1.0, \
+        f"thermal_separation weight should be 1.0 (retuned), got {rule.weight}"
+    assert rule.params.get("min_distance_mm") == 3.0, \
+        f"min_distance_mm should be 3.0 (retuned), got {rule.params.get('min_distance_mm')}"
+
+
+def test_sa_config_auto_disable_thresholds():
+    """SAConfig should have auto-disable thresholds for tiny/large boards.
+
+    Tiny boards (≤5 comps): greedy is near-optimal, SA noise hurts.
+    Large boards (≥50 comps): SA is 8-25x slower with diminishing returns.
+    """
+    config = SAConfig()
+    assert config.sa_auto_disable_min_components == 5, \
+        f"Default min threshold should be 5, got {config.sa_auto_disable_min_components}"
+    assert config.sa_auto_disable_max_components == 50, \
+        f"Default max threshold should be 50, got {config.sa_auto_disable_max_components}"
+
+
+def test_sa_config_spread_floor():
+    """SAConfig should have a spread_floor_fraction to prevent corner-cramming."""
+    config = SAConfig()
+    assert config.spread_floor_fraction > 0, \
+        f"spread_floor_fraction should be > 0 by default, got {config.spread_floor_fraction}"
+    assert config.spread_floor_fraction == 0.10, \
+        f"Default spread_floor_fraction should be 0.10 (10% of board dim), got {config.spread_floor_fraction}"
+
+
+def test_sa_auto_disables_on_tiny_board():
+    """run_sa should auto-disable SA on boards with ≤5 movable components.
+
+    On tiny boards, greedy is already near-optimal and SA's exploration
+    noise hurts more than it helps.  This test constructs a 4-component
+    board, calls run_sa with skip_sa=False, and verifies SA was auto-
+    disabled (the function should still run, just via greedy path).
+    """
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=80, y_max=60),
+        components=[
+            Component(ref=f"U{i}", x=20+i*15, y=30, width=5, height=5,
+                      component_type="ic",
+                      pads=[Pad(pad_name="1", x=0, y=0, net=f"SIG{i}")],
+                      nets=[f"SIG{i}"])
+            for i in range(4)
+        ],
+        nets=[Net(name=f"SIG{i}", pins=[(f"U{i}", "1")]) for i in range(4)],
+    )
+    config = SAConfig(skip_sa=False, verbose=False)
+    # Should auto-disable SA because 4 ≤ 5
+    result = run_sa(model, config=config, verbose=False)
+    assert config.skip_sa == True, \
+        f"SA should be auto-disabled on 4-component board, but skip_sa={config.skip_sa}"
+    assert 'final_cost' in result, "run_sa should still return a result dict"
+
+
+def test_sa_auto_disable_respects_explicit_skip_sa_true():
+    """If the user explicitly sets skip_sa=True, auto-disable shouldn't
+    override it (it's already disabled — nothing to do).  This test
+    verifies the auto-disable logic doesn't accidentally re-enable SA."""
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=80, y_max=60),
+        components=[
+            Component(ref=f"U{i}", x=20+i*15, y=30, width=5, height=5,
+                      component_type="ic",
+                      pads=[Pad(pad_name="1", x=0, y=0, net=f"SIG{i}")],
+                      nets=[f"SIG{i}"])
+            for i in range(10)  # 10 comps — in the SA-enabled range
+        ],
+        nets=[Net(name=f"SIG{i}", pins=[(f"U{i}", "1")]) for i in range(10)],
+    )
+    config = SAConfig(skip_sa=True, verbose=False)
+    run_sa(model, config=config, verbose=False)
+    assert config.skip_sa == True, \
+        "Explicit skip_sa=True should stay True (auto-disable shouldn't re-enable SA)"
+
+
+def test_violates_spread_floor():
+    """_violates_spread_floor should detect bunched configurations."""
+    from engine.annealer import _violates_spread_floor
+    from models.board_model import BoardOutline
+
+    board = BoardOutline(x_min=0, y_min=0, x_max=100, y_max=80)
+    # Floor at 10%: std_x ≥ 10mm, std_y ≥ 8mm required.
+
+    # Bunched in X (all components at x=50, std_x=0) — should violate.
+    bunched_x = BoardModel(
+        board=board,
+        components=[
+            Component(ref=f"U{i}", x=50, y=10+i*15, width=2, height=2,
+                      component_type="ic")
+            for i in range(5)
+        ],
+    )
+    assert _violates_spread_floor(bunched_x, board, 0.10), \
+        "Components bunched in X (std_x=0) should violate spread floor"
+
+    # Well-spread in both axes — should NOT violate.
+    spread = BoardModel(
+        board=board,
+        components=[
+            Component(ref=f"U{i}", x=10+i*20, y=10+i*15, width=2, height=2,
+                      component_type="ic")
+            for i in range(5)
+        ],
+    )
+    assert not _violates_spread_floor(spread, board, 0.10), \
+        "Well-spread components should NOT violate spread floor"
+
+    # Bunched in Y (all at y=40, std_y=0) — should violate.
+    bunched_y = BoardModel(
+        board=board,
+        components=[
+            Component(ref=f"U{i}", x=10+i*20, y=40, width=2, height=2,
+                      component_type="ic")
+            for i in range(5)
+        ],
+    )
+    assert _violates_spread_floor(bunched_y, board, 0.10), \
+        "Components bunched in Y (std_y=0) should violate spread floor"
+
+
 # ---------------------------------------------------------------------------
 # End-to-End Pipeline Test
 # ---------------------------------------------------------------------------
@@ -2063,6 +2194,12 @@ def main():
     run_test("Thermal separation far apart no penalty", test_thermal_separation_far_apart_no_penalty)
     run_test("Thermal separation ignores same-net pairs", test_thermal_separation_ignores_same_net_pairs)
     run_test("Thermal separation in power_supply profile", test_thermal_separation_in_power_supply_profile)
+    run_test("Thermal separation retuned weights", test_thermal_separation_retuned_weights)
+    run_test("SAConfig auto-disable thresholds", test_sa_config_auto_disable_thresholds)
+    run_test("SAConfig spread floor", test_sa_config_spread_floor)
+    run_test("SA auto-disables on tiny board", test_sa_auto_disables_on_tiny_board)
+    run_test("SA auto-disable respects explicit skip_sa=True", test_sa_auto_disable_respects_explicit_skip_sa_true)
+    run_test("Violates spread floor", test_violates_spread_floor)
 
     print("\nEnd-to-End Pipeline:")
     run_test("Full Phase 1 pipeline", test_full_pipeline)
