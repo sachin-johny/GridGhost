@@ -45,6 +45,7 @@ class ConstraintRule:
         "crystal_mcu": "Crystals must be near their MCU",
         "connector_edge": "Connectors should be near board edges",
         "thermal_grouping": "Group thermally-related components together",
+        "thermal_separation": "Keep hot parts on different nets apart (DFM — prevents thermal hotspots)",
         "high_current_path": "Minimize path length for high-current nets",
         "bulk_cap_input": "Bulk capacitors near power input",
         "antenna_keepout": "Keep components away from antenna area",
@@ -125,6 +126,12 @@ BUILTIN_PROFILES: dict[str, BoardProfile] = {
         delta=6.0,
         rules=[
             ConstraintRule("thermal_grouping", weight=5.0),
+            # Phase 2.4: Complementary thermal separation — keeps hot
+            # parts on DIFFERENT nets ≥5mm apart so two independent
+            # regulators don't stack and create a thermal hotspot.
+            # See AUDIT_FINAL_REPORT.md §2.4.
+            ConstraintRule("thermal_separation", weight=4.0,
+                           params={"min_distance_mm": 5.0}),
             ConstraintRule("high_current_path", weight=4.0),
             ConstraintRule("bulk_cap_input", weight=3.0),
         ],

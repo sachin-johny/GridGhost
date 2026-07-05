@@ -1085,6 +1085,147 @@ def test_routing_congestion_in_profiles():
             f"{profile_name} should NOT have routing_congestion (off by default)"
 
 
+def test_thermal_separation_rule_dispatch():
+    """Phase 2.4: thermal_separation must be a dispatchable ConstraintRule.
+
+    Complementary to the existing thermal_grouping rule.  thermal_grouping
+    keeps hot parts on the SAME net close together; thermal_separation
+    keeps hot parts on DIFFERENT nets apart (so two independent hot spots
+    don't stack and create a thermal runaway).  Default min separation
+    ~5mm, per the brief's DFM guidelines.
+    """
+    from engine.constraint_evaluator import _RULE_HANDLERS, evaluate_constraint_penalties
+    from profiles.board_profiles import ConstraintRule
+    assert "thermal_separation" in _RULE_HANDLERS, \
+        "thermal_separation must be in _RULE_HANDLERS dispatch table"
+
+    # Two regulators on different signal nets, 2mm apart — should be penalised.
+    # Use +5V/+3V3 (power nets, excluded from "sharing" check) for the rail
+    # so the regulators are on DIFFERENT signal nets (VOUT_A vs VOUT_B).
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=100, y_max=80),
+        components=[
+            Component(ref="U1", x=50, y=40, width=5, height=5,
+                      component_type="regulator",
+                      pads=[Pad(pad_name="1", x=0, y=0, net="+5V"),
+                            Pad(pad_name="2", x=1, y=0, net="VOUT_A")],
+                      nets=["+5V", "VOUT_A"]),
+            Component(ref="U2", x=52, y=40, width=5, height=5,
+                      component_type="regulator",
+                      pads=[Pad(pad_name="1", x=0, y=0, net="+3V3"),
+                            Pad(pad_name="2", x=1, y=0, net="VOUT_B")],
+                      nets=["+3V3", "VOUT_B"]),
+            # A non-thermal component nearby — should NOT be penalised.
+            Component(ref="C1", x=51, y=42, width=1, height=0.5,
+                      component_type="capacitor",
+                      pads=[Pad(pad_name="1", x=0, y=0, net="+5V")],
+                      nets=["+5V"]),
+        ],
+        nets=[
+            Net(name="+5V", pins=[("U1", "1"), ("C1", "1")]),
+            Net(name="+3V3", pins=[("U2", "1")]),
+            Net(name="VOUT_A", pins=[("U1", "2")]),
+            Net(name="VOUT_B", pins=[("U2", "2")]),
+        ],
+    )
+
+    rule = ConstraintRule(
+        name="thermal_separation",
+        weight=1.0,
+        params={"min_distance_mm": 5.0},
+    )
+    total, breakdown = evaluate_constraint_penalties(model, [rule])
+    assert "thermal_separation" in breakdown, \
+        f"thermal_separation should appear in breakdown, got {list(breakdown.keys())}"
+    # U1 and U2 are 2mm apart, min is 5mm — excess = 3mm → penalty > 0
+    assert breakdown["thermal_separation"] > 0, \
+        f"Two regulators 2mm apart (min 5mm) should be penalised, got {breakdown['thermal_separation']}"
+
+
+def test_thermal_separation_far_apart_no_penalty():
+    """Phase 2.4: thermal_separation should return 0 when hot parts are
+    far enough apart (≥ min_distance_mm)."""
+    from engine.constraint_evaluator import evaluate_constraint_penalties
+    from profiles.board_profiles import ConstraintRule
+
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=100, y_max=80),
+        components=[
+            Component(ref="U1", x=20, y=20, width=5, height=5,
+                      component_type="regulator",
+                      pads=[Pad(pad_name="1", x=0, y=0, net="VOUT_A")],
+                      nets=["VOUT_A"]),
+            Component(ref="U2", x=80, y=70, width=5, height=5,
+                      component_type="regulator",
+                      pads=[Pad(pad_name="1", x=0, y=0, net="VOUT_B")],
+                      nets=["VOUT_B"]),
+        ],
+        nets=[
+            Net(name="VOUT_A", pins=[("U1", "1")]),
+            Net(name="VOUT_B", pins=[("U2", "1")]),
+        ],
+    )
+
+    rule = ConstraintRule(
+        name="thermal_separation",
+        weight=1.0,
+        params={"min_distance_mm": 5.0},
+    )
+    total, breakdown = evaluate_constraint_penalties(model, [rule])
+    # U1 and U2 are ~76mm apart — well above 5mm threshold → no penalty
+    assert breakdown["thermal_separation"] == 0, \
+        f"Two regulators 76mm apart should have 0 penalty, got {breakdown['thermal_separation']}"
+
+
+def test_thermal_separation_ignores_same_net_pairs():
+    """Phase 2.4: thermal_separation should NOT penalise hot parts on
+    the SAME net — that's thermal_grouping's job.  Two regulators sharing
+    a non-power signal net should be kept CLOSE (thermal_grouping), not
+    FAR (thermal_separation)."""
+    from engine.constraint_evaluator import evaluate_constraint_penalties
+    from profiles.board_profiles import ConstraintRule
+
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=100, y_max=80),
+        components=[
+            Component(ref="U1", x=50, y=40, width=5, height=5,
+                      component_type="regulator",
+                      pads=[Pad(pad_name="1", x=0, y=0, net="SHARED_SIG")],
+                      nets=["SHARED_SIG"]),
+            Component(ref="U2", x=52, y=40, width=5, height=5,
+                      component_type="regulator",
+                      pads=[Pad(pad_name="1", x=0, y=0, net="SHARED_SIG")],
+                      nets=["SHARED_SIG"]),
+        ],
+        nets=[
+            Net(name="SHARED_SIG", pins=[("U1", "1"), ("U2", "1")]),
+        ],
+    )
+
+    rule = ConstraintRule(
+        name="thermal_separation",
+        weight=1.0,
+        params={"min_distance_mm": 5.0},
+    )
+    total, breakdown = evaluate_constraint_penalties(model, [rule])
+    # U1 and U2 share SHARED_SIG — thermal_separation should ignore them
+    # (thermal_grouping handles same-net thermal pairs).
+    assert breakdown["thermal_separation"] == 0, \
+        f"Same-net thermal pair should be ignored by thermal_separation, got {breakdown['thermal_separation']}"
+
+
+def test_thermal_separation_in_power_supply_profile():
+    """Phase 2.4: power_supply profile should opt into thermal_separation
+    (it's the highest-value DFM rule for power boards — two independent
+    regulators stacked together cause thermal runaways)."""
+    ps = get_profile("power_supply")
+    ps_rules = {r.name: r for r in ps.rules}
+    assert "thermal_separation" in ps_rules, \
+        "power_supply should opt into thermal_separation"
+    assert ps_rules["thermal_separation"].enabled, \
+        "thermal_separation should be enabled on power_supply"
+
+
 # ---------------------------------------------------------------------------
 # End-to-End Pipeline Test
 # ---------------------------------------------------------------------------
@@ -1717,6 +1858,10 @@ def main():
     run_test("Profile rules", test_profile_rules)
     run_test("Routing congestion rule dispatch", test_routing_congestion_rule_dispatch)
     run_test("Routing congestion in profiles", test_routing_congestion_in_profiles)
+    run_test("Thermal separation rule dispatch", test_thermal_separation_rule_dispatch)
+    run_test("Thermal separation far apart no penalty", test_thermal_separation_far_apart_no_penalty)
+    run_test("Thermal separation ignores same-net pairs", test_thermal_separation_ignores_same_net_pairs)
+    run_test("Thermal separation in power_supply profile", test_thermal_separation_in_power_supply_profile)
 
     print("\nEnd-to-End Pipeline:")
     run_test("Full Phase 1 pipeline", test_full_pipeline)

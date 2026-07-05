@@ -334,6 +334,83 @@ def penalty_thermal_grouping(
 
 
 # ---------------------------------------------------------------------------
+# Thermal separation rule (Phase 2.4 — DFM)
+# ---------------------------------------------------------------------------
+
+def penalty_thermal_separation(
+    model: BoardModel,
+    rule: ConstraintRule,
+) -> float:
+    """Penalty for hot parts on DIFFERENT nets being too close together.
+
+    Complementary to ``thermal_grouping``: ``thermal_grouping`` keeps hot
+    parts on the SAME net close (they're a functional block — e.g. a
+    regulator + its pass transistor sharing a feedback net).  This rule
+    keeps hot parts on DIFFERENT nets apart, so two independent heat
+    sources don't stack and create a thermal hotspot.
+
+    Real-world DFM context (from the brief): two regulators each
+    dissipating 1W, placed 2mm apart, will heat each other far more than
+    if they were 5-10mm apart — the local ambient temperature around
+    each one rises, reducing efficiency and lifetime.  The ~5mm minimum
+    separation is the same order of distance the existing
+    ``thermal_grouping`` rule uses (20mm for shared-net grouping), just
+    applied in the opposite direction.
+
+    Pairs that share ANY non-power net are skipped — ``thermal_grouping``
+    handles those (they SHOULD be close).  Power nets (GND, VCC, etc.)
+    don't count as "sharing" because every component connects to them.
+
+    Penalty: linear excess beyond ``min_distance_mm`` (default 5.0mm):
+        penalty = Σ max(0, min_distance_mm - dist(c1, c2))
+
+    Params:
+        min_distance_mm: minimum allowed center-to-center distance
+                         between two hot parts on different nets (default 5.0).
+    """
+    min_dist = rule.params.get('min_distance_mm', 5.0)
+    thermal_set = _thermal_types()
+
+    # Collect all thermal components.
+    thermals = [
+        c for c in model.components
+        if getattr(c, 'component_type', '') in thermal_set and not c.is_fixed
+    ]
+    if len(thermals) < 2:
+        return 0.0
+
+    # Build ref → set of non-power net names for each thermal component.
+    # Used to skip pairs that share a non-power net (thermal_grouping
+    # handles those — they SHOULD be close).
+    ref_to_signal_nets: dict[str, set[str]] = {}
+    for c in thermals:
+        nets = set()
+        for net in model.nets:
+            if _is_power_net(net.name):
+                continue
+            if c.ref in net.component_refs:
+                nets.add(net.name)
+        ref_to_signal_nets[c.ref] = nets
+
+    total = 0.0
+    for i in range(len(thermals)):
+        c1 = thermals[i]
+        n1 = ref_to_signal_nets.get(c1.ref, set())
+        for j in range(i + 1, len(thermals)):
+            c2 = thermals[j]
+            n2 = ref_to_signal_nets.get(c2.ref, set())
+            # Skip pairs that share any non-power signal net —
+            # thermal_grouping handles those.
+            if n1 & n2:
+                continue
+            dist = _center_distance(c1, c2)
+            excess = max(0.0, min_dist - dist)
+            total += excess
+
+    return total
+
+
+# ---------------------------------------------------------------------------
 # High-current path rule
 # ---------------------------------------------------------------------------
 
@@ -675,6 +752,7 @@ _RULE_HANDLERS = {
     'crystal_mcu':                penalty_crystal_mcu,
     'connector_edge':             penalty_connector_edge,
     'thermal_grouping':           penalty_thermal_grouping,
+    'thermal_separation':         penalty_thermal_separation,
     'high_current_path':          penalty_high_current_path,
     'bulk_cap_input':             penalty_bulk_cap_input,
     'antenna_keepout':            penalty_antenna_keepout,
