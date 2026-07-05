@@ -598,6 +598,162 @@ def test_th_sensor_sheet_extraction():
         f"At least 50% of components should have a sheet, got {non_empty}/{len(model.components)}"
 
 
+# ---------------------------------------------------------------------------
+# Phase 3.2: Sub-circuit pattern recognition tests
+# ---------------------------------------------------------------------------
+
+def test_subcircuit_crystal_motif_detection():
+    """Phase 3.2: detect crystal + 2 load caps motif.
+
+    A crystal oscillator circuit is one of the most common sub-circuit
+    motifs: a crystal (Y1) connected to an IC via OSC_IN/OSC_OUT nets,
+    with two load capacitors (one on each oscillator net) returning to
+    GND.  The pattern matcher should detect this motif and tag all 3
+    components as members of a 'crystal_oscillator' subcircuit group.
+    """
+    from engine.subcircuit_patterns import detect_subcircuit_patterns
+
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=100, y_max=80),
+        components=[
+            Component(ref="U1", x=50, y=40, width=7, height=7, component_type="ic",
+                      pads=[Pad(pad_name="1", x=0, y=0, net="OSC_IN"),
+                            Pad(pad_name="2", x=1, y=0, net="OSC_OUT")],
+                      nets=["OSC_IN", "OSC_OUT"]),
+            Component(ref="Y1", x=40, y=40, width=3, height=2, component_type="crystal",
+                      pads=[Pad(pad_name="1", x=-1, y=0, net="OSC_IN"),
+                            Pad(pad_name="2", x=1, y=0, net="OSC_OUT")],
+                      nets=["OSC_IN", "OSC_OUT"]),
+            Component(ref="C1", x=35, y=35, width=1, height=0.5, component_type="capacitor",
+                      pads=[Pad(pad_name="1", x=0, y=0, net="OSC_IN"),
+                            Pad(pad_name="2", x=0.5, y=0, net="GND")],
+                      nets=["OSC_IN", "GND"]),
+            Component(ref="C2", x=45, y=35, width=1, height=0.5, component_type="capacitor",
+                      pads=[Pad(pad_name="1", x=0, y=0, net="OSC_OUT"),
+                            Pad(pad_name="2", x=0.5, y=0, net="GND")],
+                      nets=["OSC_OUT", "GND"]),
+        ],
+        nets=[
+            Net(name="OSC_IN", pins=[("U1", "1"), ("Y1", "1"), ("C1", "1")]),
+            Net(name="OSC_OUT", pins=[("U1", "2"), ("Y1", "2"), ("C2", "1")]),
+            Net(name="GND", pins=[("C1", "2"), ("C2", "2")]),
+        ],
+    )
+
+    patterns = detect_subcircuit_patterns(model)
+    crystal_patterns = [p for p in patterns if p.motif_type == 'crystal_oscillator']
+    assert len(crystal_patterns) >= 1, \
+        f"Should detect at least 1 crystal_oscillator motif, got {len(crystal_patterns)}"
+
+    p = crystal_patterns[0]
+    assert p.anchor_ref == "Y1", f"Anchor should be the crystal Y1, got {p.anchor_ref}"
+    member_refs = {p.anchor_ref} | set(p.member_refs)
+    assert {"Y1", "C1", "C2"}.issubset(member_refs), \
+        f"Crystal motif should include Y1, C1, C2, got {member_refs}"
+
+
+def test_subcircuit_regulator_motif_detection():
+    """Phase 3.2: detect regulator + input cap + output cap motif.
+
+    A linear regulator (LDO) sub-circuit: a regulator IC with an input
+    bulk cap on VIN and an output cap on VOUT.  The pattern matcher
+    should detect this motif and tag all components as members of a
+    'regulator' subcircuit group.
+    """
+    from engine.subcircuit_patterns import detect_subcircuit_patterns
+
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=100, y_max=80),
+        components=[
+            Component(ref="U1", x=50, y=40, width=5, height=5, component_type="regulator",
+                      pads=[Pad(pad_name="1", x=0, y=0, net="+5V"),
+                            Pad(pad_name="2", x=1, y=0, net="GND"),
+                            Pad(pad_name="3", x=2, y=0, net="+3V3")],
+                      nets=["+5V", "GND", "+3V3"]),
+            Component(ref="C1", x=45, y=40, width=2, height=1, component_type="capacitor",
+                      pads=[Pad(pad_name="1", x=0, y=0, net="+5V"),
+                            Pad(pad_name="2", x=0.5, y=0, net="GND")],
+                      nets=["+5V", "GND"]),
+            Component(ref="C2", x=55, y=40, width=2, height=1, component_type="capacitor",
+                      pads=[Pad(pad_name="1", x=0, y=0, net="+3V3"),
+                            Pad(pad_name="2", x=0.5, y=0, net="GND")],
+                      nets=["+3V3", "GND"]),
+        ],
+        nets=[
+            Net(name="+5V", pins=[("U1", "1"), ("C1", "1")]),
+            Net(name="+3V3", pins=[("U1", "3"), ("C2", "1")]),
+            Net(name="GND", pins=[("U1", "2"), ("C1", "2"), ("C2", "2")]),
+        ],
+    )
+
+    patterns = detect_subcircuit_patterns(model)
+    reg_patterns = [p for p in patterns if p.motif_type == 'regulator']
+    assert len(reg_patterns) >= 1, \
+        f"Should detect at least 1 regulator motif, got {len(reg_patterns)}"
+
+    p = reg_patterns[0]
+    assert p.anchor_ref == "U1", f"Anchor should be the regulator U1, got {p.anchor_ref}"
+    member_refs = {p.anchor_ref} | set(p.member_refs)
+    assert {"U1", "C1", "C2"}.issubset(member_refs), \
+        f"Regulator motif should include U1, C1, C2, got {member_refs}"
+
+
+def test_subcircuit_patterns_feed_into_clustering():
+    """Phase 3.2: detected subcircuit patterns must add strong edges to
+    the clustering hypergraph so SA keeps motif members together.
+
+    Without this, a crystal + its 2 load caps could scatter across
+    different clusters (the caps only share GND with everything, and
+    GND is excluded from signal edges).  The subcircuit pattern edges
+    ensure they cluster as a rigid sub-group.
+    """
+    from engine.subcircuit_patterns import detect_subcircuit_patterns, SUBCIRCUIT_EDGE_WEIGHT
+
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=100, y_max=80),
+        components=[
+            Component(ref="U1", x=50, y=40, width=7, height=7, component_type="ic",
+                      pads=[Pad(pad_name="1", x=0, y=0, net="OSC_IN"),
+                            Pad(pad_name="2", x=1, y=0, net="OSC_OUT")],
+                      nets=["OSC_IN", "OSC_OUT"]),
+            Component(ref="Y1", x=40, y=40, width=3, height=2, component_type="crystal",
+                      pads=[Pad(pad_name="1", x=-1, y=0, net="OSC_IN"),
+                            Pad(pad_name="2", x=1, y=0, net="OSC_OUT")],
+                      nets=["OSC_IN", "OSC_OUT"]),
+            Component(ref="C1", x=35, y=35, width=1, height=0.5, component_type="capacitor",
+                      pads=[Pad(pad_name="1", x=0, y=0, net="OSC_IN"),
+                            Pad(pad_name="2", x=0.5, y=0, net="GND")],
+                      nets=["OSC_IN", "GND"]),
+            Component(ref="C2", x=45, y=35, width=1, height=0.5, component_type="capacitor",
+                      pads=[Pad(pad_name="1", x=0, y=0, net="OSC_OUT"),
+                            Pad(pad_name="2", x=0.5, y=0, net="GND")],
+                      nets=["OSC_OUT", "GND"]),
+        ],
+        nets=[
+            Net(name="OSC_IN", pins=[("U1", "1"), ("Y1", "1"), ("C1", "1")]),
+            Net(name="OSC_OUT", pins=[("U1", "2"), ("Y1", "2"), ("C2", "1")]),
+            Net(name="GND", pins=[("C1", "2"), ("C2", "2")]),
+        ],
+    )
+
+    # The clustering hypergraph should have edges between Y1, C1, C2
+    # that come from the subcircuit pattern (stronger than signal edges).
+    G = build_net_hypergraph(model)
+
+    # C1 and C2 share only GND (excluded from signal edges), so without
+    # subcircuit edges they'd have NO edge between them.  With subcircuit
+    # pattern detection, they should have an edge.
+    assert G.has_edge("C1", "C2"), \
+        "C1 and C2 (load caps of same crystal) should have a subcircuit-pattern edge"
+
+    # The edge weight should be at least SUBCIRCUIT_EDGE_WEIGHT (stronger
+    # than a signal edge of weight 1.0).
+    if G.has_edge("C1", "C2"):
+        w = G["C1"]["C2"].get("weight", 0)
+        assert w >= SUBCIRCUIT_EDGE_WEIGHT, \
+            f"C1-C2 edge weight {w} should be >= SUBCIRCUIT_EDGE_WEIGHT {SUBCIRCUIT_EDGE_WEIGHT}"
+
+
 def test_clustering():
     model = _make_test_model()
     clusters = cluster_components(model, n_clusters=3)
@@ -1826,6 +1982,9 @@ def main():
     run_test("Sheet-aware clustering groups by sheet", test_sheet_aware_clustering_groups_by_sheet)
     run_test("Sheet-aware clustering falls back when no sheets", test_sheet_aware_clustering_falls_back_when_no_sheets)
     run_test("th_sensor.kicad_pcb sheet extraction", test_th_sensor_sheet_extraction)
+    run_test("Subcircuit crystal motif detection", test_subcircuit_crystal_motif_detection)
+    run_test("Subcircuit regulator motif detection", test_subcircuit_regulator_motif_detection)
+    run_test("Subcircuit patterns feed into clustering", test_subcircuit_patterns_feed_into_clustering)
     run_test("Component clustering", test_clustering)
     run_test("Seed position computation", test_seed_positions)
 

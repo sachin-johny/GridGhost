@@ -79,7 +79,24 @@ def build_net_hypergraph(model: BoardModel) -> Graph:
     # "human-like functional grouping" ask.
     _add_sheet_edges(G, model)
 
+    # Phase 3.2: Add subcircuit-pattern edges (crystal + load caps,
+    # regulator + input/output caps, etc.).  These are RIGID sub-groups
+    # — a human PCB designer would never scatter the members.  Stronger
+    # than sheet edges (2.0) and signal edges (1.0).
+    _add_subcircuit_edges(G, model)
+
     return G
+
+
+def _add_subcircuit_edges(G: Graph, model: BoardModel) -> None:
+    """Add clique edges between components in detected subcircuit motifs.
+
+    Delegates to engine.subcircuit_patterns.add_subcircuit_edges.  Kept
+    as a thin wrapper here so build_net_hypergraph stays self-contained
+    and the import is lazy (avoids circular import with cost_state).
+    """
+    from engine.subcircuit_patterns import add_subcircuit_edges as _add
+    _add(G, model)
 
 
 # Weight for sheet-aware clustering edges.  Stronger than a single signal-
