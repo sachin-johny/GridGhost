@@ -21,6 +21,7 @@ import math
 import os
 import sys
 import tempfile
+import glob
 from pathlib import Path
 
 # Add project root to path
@@ -596,6 +597,46 @@ def test_th_sensor_sheet_extraction():
     non_empty = sum(1 for c in model.components if c.sheet)
     assert non_empty >= len(model.components) * 0.5, \
         f"At least 50% of components should have a sheet, got {non_empty}/{len(model.components)}"
+
+
+def test_rl_pcb_boards_parse_cleanly():
+    """Phase 5: all 9 RL_PCB boards must parse without errors.
+
+    These boards are MIT-licensed real circuits from
+    https://github.com/LukeVassallo/RL_PCB (dataset/base_raw/).
+    They cover a wider range of board types than the original 5-board
+    test_pcbs/ set.  This test confirms the parser handles them all
+    — if any board fails to parse, that's a parser bug or a KiCad
+    format-version drift issue worth investigating.
+    """
+    rl_pcb_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "tests", "external_boards", "rl_pcb",
+    )
+    if not os.path.isdir(rl_pcb_dir):
+        return  # skip if RL_PCB boards not vendored in this checkout
+
+    pcb_files = sorted(glob.glob(os.path.join(rl_pcb_dir, "*.kicad_pcb")))
+    assert len(pcb_files) >= 9, \
+        f"Expected ≥9 RL_PCB boards, found {len(pcb_files)} in {rl_pcb_dir}"
+
+    parse_failures = []
+    for pcb_path in pcb_files:
+        board_name = os.path.basename(pcb_path)
+        try:
+            parser = KiCadParser(pcb_path)
+            model = parser.parse()
+            # Sanity: every board should have ≥1 component and ≥1 net.
+            assert len(model.components) >= 1, \
+                f"{board_name}: 0 components parsed"
+            assert len(model.nets) >= 1, \
+                f"{board_name}: 0 nets parsed"
+        except Exception as e:
+            parse_failures.append((board_name, f"{type(e).__name__}: {e}"))
+
+    assert not parse_failures, \
+        f"{len(parse_failures)} RL_PCB board(s) failed to parse:\n" + \
+        "\n".join(f"  {n}: {e}" for n, e in parse_failures)
 
 
 # ---------------------------------------------------------------------------
@@ -1982,6 +2023,7 @@ def main():
     run_test("Sheet-aware clustering groups by sheet", test_sheet_aware_clustering_groups_by_sheet)
     run_test("Sheet-aware clustering falls back when no sheets", test_sheet_aware_clustering_falls_back_when_no_sheets)
     run_test("th_sensor.kicad_pcb sheet extraction", test_th_sensor_sheet_extraction)
+    run_test("RL_PCB boards parse cleanly", test_rl_pcb_boards_parse_cleanly)
     run_test("Subcircuit crystal motif detection", test_subcircuit_crystal_motif_detection)
     run_test("Subcircuit regulator motif detection", test_subcircuit_regulator_motif_detection)
     run_test("Subcircuit patterns feed into clustering", test_subcircuit_patterns_feed_into_clustering)
