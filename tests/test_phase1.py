@@ -1002,6 +1002,89 @@ def test_profile_rules():
     assert "crystal_mcu" in rule_names
 
 
+def test_routing_congestion_rule_dispatch():
+    """Phase 2.1: routing_congestion must be a dispatchable ConstraintRule
+    that wraps engine.congestion.rudy_congestion_penalty.
+
+    RUDY was already implemented in engine/congestion.py and used as a
+    SA translate-bias + best-state tiebreaker, but it was NOT exposed
+    as a profile-composable ConstraintRule.  The brief asks for it to
+    compose with the 6 board profiles via the existing ConstraintRule
+    pattern — this test verifies the dispatch wiring.
+    """
+    from engine.constraint_evaluator import _RULE_HANDLERS, evaluate_constraint_penalties
+    from profiles.board_profiles import ConstraintRule
+    assert "routing_congestion" in _RULE_HANDLERS, \
+        "routing_congestion must be in _RULE_HANDLERS dispatch table"
+
+    # Build a small congested board: 4 components on a tight 2x2 grid
+    # connected by 4 crossing nets — the classic RUDY hotspot pattern.
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=20, y_max=20),
+        components=[
+            Component(
+                ref=f"U{i+1}", x=x, y=y, width=2, height=2, component_type="ic",
+                pads=[Pad(pad_name="1", x=0, y=0, net=net)],
+                nets=[net],
+            )
+            for i, (x, y, net) in enumerate([
+                (5, 5, "N_DIAG1"),    # U1 bottom-left
+                (15, 5, "N_DIAG2"),   # U2 bottom-right
+                (5, 15, "N_DIAG2"),   # U3 top-left, shares N_DIAG2 with U2
+                (15, 15, "N_DIAG1"),  # U4 top-right, shares N_DIAG1 with U1
+            ])
+        ],
+        nets=[
+            # Two diagonal nets whose bboxes cross in the middle — RUDY hotspot.
+            Net(name="N_DIAG1", pins=[("U1", "1"), ("U4", "1")]),
+            Net(name="N_DIAG2", pins=[("U2", "1"), ("U3", "1")]),
+        ],
+    )
+
+    rule = ConstraintRule(
+        name="routing_congestion",
+        weight=1.0,
+        params={"grid_resolution_mm": 2.0},
+    )
+    total, breakdown = evaluate_constraint_penalties(model, [rule])
+    assert "routing_congestion" in breakdown, \
+        f"routing_congestion should appear in breakdown, got {list(breakdown.keys())}"
+    assert breakdown["routing_congestion"] > 0, \
+        f"Penalty should be > 0 on a congested board, got {breakdown['routing_congestion']}"
+    assert total == rule.weight * breakdown["routing_congestion"], \
+        f"Total should equal weight * penalty, got {total} vs {rule.weight * breakdown['routing_congestion']}"
+
+
+def test_routing_congestion_in_profiles():
+    """Phase 2.1: routing_congestion rule should be enabled (opt-in) on
+    the rf_frontend and mixed_signal profiles — both are congestion-
+    sensitive (RF frontends have routing choke points between LNA/mixer/
+    filter stages; mixed-signal boards have analog/digital partition
+    boundaries that concentrate crossing nets).  Off by default elsewhere
+    so existing profile behaviour is unchanged.
+    """
+    rf = get_profile("rf_frontend")
+    rf_rules = {r.name: r for r in rf.rules}
+    assert "routing_congestion" in rf_rules, \
+        "rf_frontend should opt into routing_congestion"
+    assert rf_rules["routing_congestion"].enabled, \
+        "routing_congestion should be enabled on rf_frontend"
+
+    ms = get_profile("mixed_signal")
+    ms_rules = {r.name: r for r in ms.rules}
+    assert "routing_congestion" in ms_rules, \
+        "mixed_signal should opt into routing_congestion"
+    assert ms_rules["routing_congestion"].enabled, \
+        "routing_congestion should be enabled on mixed_signal"
+
+    # Off by default on the other profiles — no silent behaviour change.
+    for profile_name in ["mcu_peripheral", "power_supply", "generic"]:
+        p = get_profile(profile_name)
+        rule_names = {r.name for r in p.rules}
+        assert "routing_congestion" not in rule_names, \
+            f"{profile_name} should NOT have routing_congestion (off by default)"
+
+
 # ---------------------------------------------------------------------------
 # End-to-End Pipeline Test
 # ---------------------------------------------------------------------------
@@ -1632,6 +1715,8 @@ def main():
     print("\nBoard Profile Tests:")
     run_test("Built-in profiles", test_builtin_profiles)
     run_test("Profile rules", test_profile_rules)
+    run_test("Routing congestion rule dispatch", test_routing_congestion_rule_dispatch)
+    run_test("Routing congestion in profiles", test_routing_congestion_in_profiles)
 
     print("\nEnd-to-End Pipeline:")
     run_test("Full Phase 1 pipeline", test_full_pipeline)

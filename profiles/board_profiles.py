@@ -51,6 +51,7 @@ class ConstraintRule:
         "analog_digital_separation": "Separate analog and digital domains",
         "matched_length": "Matched trace length requirements",
         "ground_plane_clearance": "Keep components clear of ground plane splits",
+        "routing_congestion": "RUDY routing congestion penalty — penalises choke points HPWL misses",
     }
 
     @property
@@ -141,6 +142,12 @@ BUILTIN_PROFILES: dict[str, BoardProfile] = {
             ConstraintRule("antenna_keepout", weight=6.0, params={"clearance_mm": 10.0}),
             ConstraintRule("analog_digital_separation", weight=5.0),
             ConstraintRule("matched_length", weight=3.0),
+            # Phase 2.1: RUDY routing congestion — RF frontends have
+            # routing choke points between LNA/mixer/filter stages that
+            # HPWL alone misses.  See engine/congestion.py for the RUDY
+            # derivation (Spindler & Johannes, DATE 2007).
+            ConstraintRule("routing_congestion", weight=2.0,
+                           params={"grid_resolution_mm": 2.0}),
         ],
     ),
     "mixed_signal": BoardProfile(
@@ -156,6 +163,11 @@ BUILTIN_PROFILES: dict[str, BoardProfile] = {
             ConstraintRule("analog_digital_separation", weight=7.0),
             ConstraintRule("decoupling_proximity", weight=3.0, params={"max_distance_mm": 5.0}),
             ConstraintRule("ground_plane_clearance", weight=4.0),
+            # Phase 2.1: RUDY — mixed-signal partition boundaries
+            # concentrate crossing nets (ADC clock, SPI, etc.), creating
+            # choke points that HPWL misses.
+            ConstraintRule("routing_congestion", weight=1.5,
+                           params={"grid_resolution_mm": 2.0}),
         ],
     ),
     "generic": BoardProfile(

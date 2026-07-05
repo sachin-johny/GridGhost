@@ -626,6 +626,47 @@ def penalty_ground_plane_clearance(
 
 
 # ---------------------------------------------------------------------------
+# Routing congestion rule (RUDY — Rectangular Uniform wire DensitY)
+# ---------------------------------------------------------------------------
+
+def penalty_routing_congestion(
+    model: BoardModel,
+    rule: ConstraintRule,
+) -> float:
+    """RUDY-based routing congestion penalty.
+
+    Wraps ``engine.congestion.rudy_congestion_penalty`` so the existing
+    RUDY implementation (already used as a SA translate-bias and
+    best-state tiebreaker) becomes a profile-composable ConstraintRule.
+
+    For each non-power net, RUDY distributes a unit of wire density
+    uniformly across the grid cells covered by the net's pin bbox.
+    The penalty is ``peak * (peak - target) + overflow`` where target
+    is 1.5x the average congestion — penalises both localised hotspots
+    and widespread overflow.  See ``engine/congestion.py`` for the full
+    derivation and the Spindler & Johannes DATE 2007 reference.
+
+    Brief context (Phase 2.1): HPWL is a distance proxy; it doesn't
+    tell you WHERE wires will pile up.  Two placements with identical
+    HPWL can have very different routability — one spreads nets
+    uniformly, the other funnels 6 nets through a 2mm gap between two
+    ICs.  RUDY catches the choke point that HPWL misses.
+
+    Default off — opt in via a profile's ConstraintRule list.  The
+    annealer's hardcoded RUDY bias (``SAConfig.rudy_weight``) stays as
+    a default-on background spreading force; this rule makes the
+    *acceptance cost* profile-controllable.
+
+    Params:
+        grid_resolution_mm: RUDY grid cell size in mm (default 2.0).
+    """
+    from engine.congestion import rudy_congestion_penalty
+    grid_res = rule.params.get('grid_resolution_mm', 2.0)
+    penalty, _peak, _avg, _overflow = rudy_congestion_penalty(model, grid_res)
+    return penalty
+
+
+# ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
 
@@ -640,6 +681,7 @@ _RULE_HANDLERS = {
     'analog_digital_separation':  penalty_analog_digital_separation,
     'matched_length':             penalty_matched_length,
     'ground_plane_clearance':     penalty_ground_plane_clearance,
+    'routing_congestion':         penalty_routing_congestion,
 }
 
 
