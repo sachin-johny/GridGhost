@@ -34,6 +34,8 @@ _POWER_PREFIXES_TUPLE = (
     'VSS', 'VCC', 'VDD', 'VEE', 'VBAT', 'VBUS',
 )
 _GND_PREFIXES_TUPLE = ('GND', 'AGND', 'DGND', 'PGND', 'SGND', 'VSS')
+# Compile the voltage regex once at module load (was re.match per call).
+_VOLTAGE_RE = re.compile(r'^[+\-]\d[\d.]*V', re.IGNORECASE)
 
 
 def _is_power_net(name: str) -> bool:
@@ -41,7 +43,7 @@ def _is_power_net(name: str) -> bool:
     n = name.lstrip('/').upper()
     if n.startswith(_POWER_PREFIXES_TUPLE):
         return True
-    return bool(re.match(r'^[+\-]\d[\d.]*V', n, re.IGNORECASE))
+    return bool(_VOLTAGE_RE.match(n))
 
 
 def _center_distance(a: Component, b: Component) -> float:
@@ -138,6 +140,7 @@ def penalty_decoupling_proximity(
     model: BoardModel,
     rule: ConstraintRule,
     decap_map: dict[str, list[str]] | None = None,
+    decap_pairs: list[tuple] | None = None,
 ) -> float:
     """Penalty for decoupling caps too far from their IC.
 
@@ -150,8 +153,25 @@ def penalty_decoupling_proximity(
         penalty = Σ  (excess)^2
 
     Returns the *raw* penalty (before rule.weight multiplication).
+
+    Performance: pass ``decap_pairs`` (a list of ``(ic_component,
+    cap_component)`` tuples) to skip the per-call ``model.get_component``
+    lookups.  This is the SA hot path — materialising the pairs once at
+    SA start eliminates ~2.5M dict lookups on a 68-component board.
     """
     max_dist = rule.params.get('max_distance_mm', 5.0)
+
+    # Fast path: pre-materialised Component pairs (SA hot path)
+    if decap_pairs is not None:
+        total = 0.0
+        for ic, cap in decap_pairs:
+            dist = math.hypot(ic.x - cap.x, ic.y - cap.y)
+            excess = dist - max_dist
+            if excess > 0.0:
+                total += excess * excess
+        return total
+
+    # Cold path: build from decap_map (string refs → Component lookups)
     if decap_map is None:
         decap_map = _build_decoupling_map(model)
 
@@ -166,10 +186,6 @@ def penalty_decoupling_proximity(
                 continue
             dist = _center_distance(ic, cap)
             excess = max(0.0, dist - max_dist)
-            # Quadratic ramp: gives SA a much stronger gradient to push
-            # caps toward ICs.  Linear excess makes distant caps (70mm)
-            # produce only a weak signal vs HPWL.  With quadratic,
-            # a cap at 70mm (excess=65) contributes 65^2=4225 vs linear 65.
             total += excess * excess
 
     return total
@@ -743,6 +759,60 @@ def penalty_routing_congestion(
     return penalty
 
 
+def penalty_signal_flow_grouping(
+    model: BoardModel,
+    rule: ConstraintRule,
+    chain_pairs: list[tuple] | None = None,
+) -> float:
+    """Penalty for signal-flow chain members being too far apart.
+
+    For each detected signal-flow chain, penalty is::
+
+        Σ  max(0, dist(adjacent_pair) − max_step_mm)²
+
+    where ``max_step_mm`` defaults to 15 mm.  The penalty is quadratic
+    beyond the threshold so SA sees increasing urgency to keep chain
+    members close.
+
+    Returns the *raw* penalty (before rule.weight multiplication).
+
+    Performance: pass ``chain_pairs`` (a list of ``(ic_comp, cap_comp)
+    or more generally ``(comp_a, comp_b)`` tuples for each adjacent pair
+    in each chain) to skip the per-call pattern detection + component
+    lookups.  Built once at SA start by ``CostState.__init__``.
+    """
+    max_step = rule.params.get('max_step_mm', 15.0)
+
+    # Fast path: pre-materialised adjacent pairs
+    if chain_pairs is not None:
+        total = 0.0
+        for ca, cb in chain_pairs:
+            dist = math.hypot(ca.x - cb.x, ca.y - cb.y)
+            excess = dist - max_step
+            if excess > 0.0:
+                total += excess * excess
+        return total
+
+    # Cold path: detect chains and build pairs
+    from engine.subcircuit_patterns import detect_subcircuit_patterns
+    total = 0.0
+    for p in detect_subcircuit_patterns(model):
+        if p.motif_type != 'signal_flow_chain':
+            continue
+        chain = p.metadata.get('chain', [])
+        if len(chain) < 2:
+            continue
+        for i in range(len(chain) - 1):
+            ca = model.get_component(chain[i])
+            cb = model.get_component(chain[i + 1])
+            if not ca or not cb:
+                continue
+            dist = math.hypot(ca.x - cb.x, ca.y - cb.y)
+            excess = max(0.0, dist - max_step)
+            total += excess * excess
+    return total
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
@@ -760,6 +830,7 @@ _RULE_HANDLERS = {
     'matched_length':             penalty_matched_length,
     'ground_plane_clearance':     penalty_ground_plane_clearance,
     'routing_congestion':         penalty_routing_congestion,
+    'signal_flow_grouping':       penalty_signal_flow_grouping,
 }
 
 
@@ -769,6 +840,8 @@ def evaluate_constraint_penalties(
     decap_map: dict[str, list[str]] | None = None,
     crystal_pairs: list[tuple[str, str]] | None = None,
     connectors: list[Component] | None = None,
+    decap_pairs: list[tuple] | None = None,
+    chain_adjacent_pairs: list[tuple] | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Evaluate all enabled constraint rules.
 
@@ -781,6 +854,15 @@ def evaluate_constraint_penalties(
     crystals pair with which ICs, which components are connectors) since
     SA only moves components — it never changes the net connectivity.
     Skipping the rebuild is a 10-30× SA speedup.
+
+    ``decap_pairs`` is a further optimisation: a pre-materialised list of
+    ``(ic_component, cap_component)`` tuples that lets
+    ``penalty_decoupling_proximity`` skip ``model.get_component`` lookups
+    entirely.  Built once at SA start from ``decap_map``.
+
+    ``chain_adjacent_pairs`` is the signal-flow-chain analog: a list of
+    ``(comp_a, comp_b)`` tuples for each adjacent pair in each detected
+    signal-flow chain, used by ``penalty_signal_flow_grouping``.
     """
     total = 0.0
     breakdown: dict[str, float] = {}
@@ -796,7 +878,9 @@ def evaluate_constraint_penalties(
             continue
 
         if rule.name == 'decoupling_proximity':
-            penalty = handler(model, rule, decap_map=decap_map)
+            penalty = handler(model, rule, decap_map=decap_map, decap_pairs=decap_pairs)
+        elif rule.name == 'signal_flow_grouping':
+            penalty = handler(model, rule, chain_pairs=chain_adjacent_pairs)
         elif rule.name == 'crystal_mcu':
             penalty = handler(model, rule, crystal_pairs=crystal_pairs)
         elif rule.name == 'connector_edge':

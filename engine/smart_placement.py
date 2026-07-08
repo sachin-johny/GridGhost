@@ -72,17 +72,57 @@ def _compute_interior_bbox(
 def _compute_pad_facing_direction(comp: "Component") -> tuple[float, float]:
     """Analyze pad positions to find connector's facing direction in local coords.
 
-    The pad column is the axis with more pad spread. The connector faces
-    perpendicular to the pad column (toward the mating interface).
+    Two connector families with different mating geometry:
+
+    1. **Face-mating** (terminal blocks, pin headers, screw terminals):
+       the mating interface is on the LONG face of the body, PERPENDICULAR
+       to the pad column. For these, the pad column axis = axis with more
+       spread; mating direction is perpendicular to it.
+
+    2. **End-mating** (barrel jacks, USB, RJ45, HDMI, D-Sub): the mating
+       interface is on a SHORT face at the END of the body's long axis,
+       PARALLEL to the pad column. For these, mating direction = body's
+       long axis, on the side opposite the pad centroid (relative to
+       body center).
+
+    We distinguish by footprint/value name keywords. End-mating
+    connectors that don't match the keyword list fall through to the
+    face-mating heuristic — they may orient incorrectly and should be
+    added to ``_END_MATING_MARKERS``.
     """
     if len(comp.pads) < 2:
         return (1.0, 0.0)
+
+    fp = (getattr(comp, 'footprint', '') or '').lower()
+    val = (getattr(comp, 'value', '') or '').lower()
+    name = fp + ' ' + val
+
+    is_end_mating = any(m in name for m in _END_MATING_MARKERS)
 
     xs = [p.x for p in comp.pads]
     ys = [p.y for p in comp.pads]
     spread_x = max(xs) - min(xs)
     spread_y = max(ys) - min(ys)
 
+    if is_end_mating:
+        # Mate at the END of the body's long axis, opposite from pad centroid
+        # (pad centroid vs. body center, both in local coords).
+        # Body long axis: height > width means Y is the long axis.
+        if comp.height >= comp.width:
+            body_cy = getattr(comp, 'bbox_offset_y', 0.0)
+            pad_cy = sum(ys) / len(ys)
+            # Mating face is on the side of the body where pads DON'T cluster.
+            # If pads are above body center (pad_cy < body_cy in local Y,
+            # remembering KiCad Y increases downward), mating is below; vice versa.
+            fy = -1.0 if pad_cy < body_cy else 1.0
+            return (0.0, fy)
+        else:
+            body_cx = getattr(comp, 'bbox_offset_x', 0.0)
+            pad_cx = sum(xs) / len(xs)
+            fx = -1.0 if pad_cx < body_cx else 1.0
+            return (fx, 0.0)
+
+    # Face-mating heuristic — works for terminal blocks, pin headers, etc.
     if spread_x >= spread_y:
         # Pad column along X, face in Y direction
         pad_cy = sum(ys) / len(ys)
@@ -93,6 +133,16 @@ def _compute_pad_facing_direction(comp: "Component") -> tuple[float, float]:
         pad_cx = sum(xs) / len(xs)
         fx = -1.0 if pad_cx > 0 else 1.0
         return (fx, 0.0)
+
+
+# End-mating connector families — the mating interface is at the END of
+# the body's long axis, parallel to the pad column. Add more as needed.
+_END_MATING_MARKERS = (
+    'barreljack', 'barrel_jack', 'dcjack', 'dc_jack',
+    'usb', 'usb_a', 'usb_b', 'usb_c', 'micro_usb', 'miniusb',
+    'rj45', 'ethernet', 'hdmi', 'dsub', 'db9', 'db25', 'vga',
+    'dvi', 'displayport', 'jack_dc',
+)
 
 
 # =============================================================================
@@ -369,6 +419,12 @@ def smart_grid_place(
             model, edge_connectors, margin, ib,
             min_connector_gap=min_connector_gap,
         )
+
+    # Phase 5.5: Attract signal-flow chains toward their endpoint connectors.
+    # Connectors are frozen on the perimeter; this pass pulls the non-connector
+    # chain members (ICs, passives) toward the midpoint of the chain's two
+    # endpoints, shortening the signal path.  Phase 6 resolves any overlaps.
+    _attract_chains_to_connectors(model, ib, pull_fraction=0.40)
 
     # Phase 6: Overlap resolution — push inward, clamp to interior bbox
     _resolve_all_overlaps(model, interior, margin, ib)
@@ -1352,7 +1408,10 @@ def _footprint_family(c: "Component") -> str:
     return m.group(1) if m else 'unknown'
 
 
-def _group_connectors(connectors: List["Component"]) -> List[ConnectorGroup]:
+def _group_connectors(
+    connectors: List["Component"],
+    chain_pairs: set[tuple[str, str]] | None = None,
+) -> List[ConnectorGroup]:
     """Group connectors for perimeter placement.
 
     Strategy:
@@ -1400,6 +1459,40 @@ def _group_connectors(connectors: List["Component"]) -> List[ConnectorGroup]:
         ))
         grouped.update(c.ref for c in power)
 
+    # 1.5. Signal-flow chain pairs — if two connectors are endpoints of a
+    # detected signal-flow chain (J_in → IC → J_out), group them together
+    # so they land on the same edge. This overrides the stem-based split
+    # that would otherwise put "ADC1_in" and "Buffer1_out" on different
+    # edges. Chain pairs must be in the same footprint family.
+    if chain_pairs:
+        conn_refs = {c.ref for c in connectors}
+        chain_grouped: set[str] = set()
+        for ref_a, ref_b in chain_pairs:
+            if ref_a not in conn_refs or ref_b not in conn_refs:
+                continue
+            if ref_a in grouped or ref_b in grouped:
+                continue  # power connectors skip chain grouping
+            if ref_a in chain_grouped or ref_b in chain_grouped:
+                continue  # already in a chain group
+            ca = next((c for c in connectors if c.ref == ref_a), None)
+            cb = next((c for c in connectors if c.ref == ref_b), None)
+            if ca is None or cb is None:
+                continue
+            # Only group if same footprint family (don't mix SMA with PinHeader)
+            if _footprint_family(ca) != _footprint_family(cb):
+                continue
+            family = _footprint_family(ca)
+            family_priorities_local = {"PinHeader": 70, "PinSocket": 68, "USB": 65, "SMA": 60, "Coaxial": 58}
+            pri = family_priorities_local.get(family, 50) + 15  # higher than stem groups
+            groups.append(ConnectorGroup(
+                group_id=f"chain_{ref_a}_{ref_b}",
+                category=f"chain_{family}",
+                connectors=sorted([ca, cb], key=lambda x: x.ref),
+                priority=pri,
+            ))
+            chain_grouped.update({ref_a, ref_b})
+        grouped.update(chain_grouped)
+
     # 2./3. Remaining connectors bucketed by footprint family.
     families: Dict[str, List["Component"]] = defaultdict(list)
     for c in connectors:
@@ -1443,6 +1536,85 @@ def _group_connectors(connectors: List["Component"]) -> List[ConnectorGroup]:
                 ))
 
     return sorted(groups, key=lambda g: g.priority, reverse=True)
+
+def _attract_chains_to_connectors(
+    model: "BoardModel",
+    interior_bbox: tuple[float, float, float, float],
+    pull_fraction: float = 0.40,
+) -> None:
+    """Pull signal-flow chain members toward their endpoint connectors.
+
+    Connectors are frozen on the perimeter (placed by _place_connectors_perimeter).
+    This pass moves the NON-connector chain members (ICs, passives) toward the
+    midpoint of the chain's two endpoint connectors, so the signal flow path
+    shortens without disturbing connector placement.
+
+    Algorithm:
+      1. Detect signal-flow chains (J_in → R → U → U → R → J_out)
+      2. For each chain, find the two endpoint connectors (already placed)
+      3. Compute the midpoint between the two connectors
+      4. Pull each non-connector chain member toward the midpoint by
+         `pull_fraction` (default 40%)
+      5. Clamp to interior_bbox so components don't go under the connectors
+      6. Phase 6 overlap resolution cleans up any overlaps created
+
+    The pull is SOFT (40%, not 100%) to avoid over-compression — SA and the
+    legalizer still have room to refine.  The interior_bbox clamp ensures
+    components stay in the usable area.
+    """
+    from engine.subcircuit_patterns import detect_subcircuit_patterns
+
+    ib_x_min, ib_y_min, ib_x_max, ib_y_max = interior_bbox
+
+    try:
+        patterns = detect_subcircuit_patterns(model)
+    except Exception:
+        return
+
+    for p in patterns:
+        if p.motif_type != 'signal_flow_chain':
+            continue
+        chain = p.metadata.get('chain', [])
+        if len(chain) < 3:
+            continue  # need at least J → U → J
+
+        # Find the two endpoint connectors (first and last in chain are connectors)
+        end_a_ref = chain[0]
+        end_b_ref = chain[-1]
+        end_a = model.get_component(end_a_ref)
+        end_b = model.get_component(end_b_ref)
+        if not end_a or not end_b:
+            continue
+        if getattr(end_a, 'component_type', '') != 'connector':
+            continue
+        if getattr(end_b, 'component_type', '') != 'connector':
+            continue
+
+        # Midpoint between the two connectors
+        mid_x = (end_a.x + end_b.x) / 2.0
+        mid_y = (end_a.y + end_b.y) / 2.0
+
+        # Pull each non-connector chain member toward the midpoint
+        for ref in chain[1:-1]:  # skip first and last (connectors)
+            comp = model.get_component(ref)
+            if not comp:
+                continue
+            if comp.is_fixed or getattr(comp, 'is_edge_connector', False):
+                continue
+            if getattr(comp, 'component_type', '') == 'connector':
+                continue
+
+            # Move 40% toward the midpoint
+            old_x, old_y = comp.x, comp.y
+            new_x = old_x + pull_fraction * (mid_x - old_x)
+            new_y = old_y + pull_fraction * (mid_y - old_y)
+
+            # Clamp to interior bbox (with component half-extent)
+            half_w = comp.effective_width / 2.0
+            half_h = comp.effective_height / 2.0
+            comp.x = max(ib_x_min + half_w, min(new_x, ib_x_max - half_w))
+            comp.y = max(ib_y_min + half_h, min(new_y, ib_y_max - half_h))
+
 
 def _recentre_interior_cluster(
     model: "BoardModel",
@@ -1547,7 +1719,19 @@ def _place_connectors_perimeter(
     for edge_name, space in edge_space.items():
         conn_margin[edge_name] = min(default_conn_margin, max(1.0, space * 0.4))
 
-    groups = _group_connectors(connectors)
+    # Detect signal-flow chains and pass endpoint pairs to _group_connectors
+    # so chain endpoints land on the same edge.
+    from engine.subcircuit_patterns import detect_subcircuit_patterns
+    chain_pairs: set[tuple[str, str]] = set()
+    try:
+        for p in detect_subcircuit_patterns(model):
+            if p.motif_type == 'signal_flow_chain':
+                end_ref = p.metadata.get('end_connector')
+                if end_ref:
+                    chain_pairs.add((p.anchor_ref, end_ref))
+    except Exception:
+        pass  # pattern detection is best-effort; don't fail placement
+    groups = _group_connectors(connectors, chain_pairs=chain_pairs)
     if not groups:
         return
 

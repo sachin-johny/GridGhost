@@ -45,6 +45,13 @@ OVERLAP_COUNT_WEIGHT = 12.0  # extra penalty per overlapping pair
 DENSITY_WEIGHT = 3.0
 DENSITY_GRID = 10
 
+# Net-crossing weight: penalizes pairs of nets whose bounding boxes intersect.
+# This is a routability proxy inspired by Cypress (ISPD 2025 Best Paper) —
+# net crossings correlate better with routing congestion than HPWL alone.
+# Soft weight (not scaled by penalty_scale) — influences SA at all temperatures.
+# Updated on _compute_all (every 3 SA steps via resync).
+NET_CROSSING_WEIGHT = 0.5
+
 
 def density_adaptive_weight(board_density: float, n_components: int = 0,
                             grid_cells: int = DENSITY_GRID * DENSITY_GRID) -> float:
@@ -108,6 +115,51 @@ def _is_power_net(name: str) -> bool:
     return any(n.startswith(p) for p in _POWER_PREFIXES) or bool(_POWER_VOLTAGE_RE.match(n))
 
 
+# Weight multiplier for signal-flow chain internal nets.  3.0 means a
+# chain internal net (e.g. U1→U5 op-amp output) contributes 3× the HPWL
+# of a normal signal net.  This pulls chain members together against the
+# connector-perimeter placement which tries to split endpoints.
+SIGNAL_FLOW_NET_WEIGHT = 3.0
+
+
+def _build_net_weights(model: BoardModel) -> dict[str, float]:
+    """Build per-net weight dict from detected signal-flow chains.
+
+    Nets that connect components within a signal-flow chain get weight
+    SIGNAL_FLOW_NET_WEIGHT (3.0); all other nets get weight 1.0 (default,
+    not stored in the dict to save memory).  The weight is applied to
+    HPWL in both the SA hot path (CostState._compute_net_hpwl) and the
+    cold path (cost_function.total_hpwl).
+
+    Cached on model as ``_net_weights_cache`` so it's built once per
+    placement pipeline invocation, not per SA move.
+    """
+    cache = getattr(model, '_net_weights_cache', None)
+    if cache is not None:
+        return cache
+    weights: dict[str, float] = {}
+    try:
+        from engine.subcircuit_patterns import detect_subcircuit_patterns
+        patterns = detect_subcircuit_patterns(model)
+        # Build a set of all chain member refs for fast lookup.
+        for p in patterns:
+            if p.motif_type != 'signal_flow_chain':
+                continue
+            chain_refs = set(p.all_refs)
+            # Find all non-power signal nets that connect ≥2 chain members.
+            for net in model.nets:
+                if _is_power_net(net.name):
+                    continue
+                net_members = set(net.component_refs)
+                # If this net connects ≥2 chain members, it's a chain internal net.
+                if len(net_members & chain_refs) >= 2:
+                    weights[net.name] = SIGNAL_FLOW_NET_WEIGHT
+    except Exception:
+        pass  # best-effort; if detection fails, all nets stay weight 1.0
+    model._net_weights_cache = weights
+    return weights
+
+
 def _pair_key(i: int, j: int) -> tuple[int, int]:
     return (i, j) if i < j else (j, i)
 
@@ -163,6 +215,8 @@ class CostState:
         # so we still recompute the value every move — but skip the O(nets
         # × components) topology rebuild.
         self._decap_map: dict[str, list[str]] | None = None
+        self._decap_pairs: list[tuple] | None = None  # materialised (ic, cap) Component pairs
+        self._chain_adjacent_pairs: list[tuple] | None = None  # materialised chain pairs
         self._crystal_pairs: list[tuple[str, str]] | None = None
         self._connectors: list | None = None  # list[Component], but annotated as list to avoid import cycle
         # Set of cap refs absorbed into an IC group for density grouping.
@@ -177,6 +231,17 @@ class CostState:
                 model._decap_map_cache = self._decap_map
                 for cap_refs in self._decap_map.values():
                     self._grouped_cap_refs.update(cap_refs)
+                # Materialise (ic_component, cap_component) pairs once —
+                # eliminates ~2.5M model.get_component lookups during SA.
+                self._decap_pairs = []
+                for ic_ref, cap_refs in self._decap_map.items():
+                    ic = model.get_component(ic_ref)
+                    if not ic:
+                        continue
+                    for cap_ref in cap_refs:
+                        cap = model.get_component(cap_ref)
+                        if cap:
+                            self._decap_pairs.append((ic, cap))
             if 'crystal_mcu' in rule_names:
                 self._crystal_pairs = _find_crystal_mcu_pairs(model)
             if 'connector_edge' in rule_names:
@@ -188,6 +253,30 @@ class CostState:
                     if getattr(c, 'component_type', '') == 'connector'
                     and not c.is_fixed
                 ]
+            # Always build chain adjacent pairs (even if signal_flow_grouping
+            # rule is not active) — they're cheap and used by net weights too.
+            self._chain_adjacent_pairs = []
+            try:
+                from engine.subcircuit_patterns import detect_subcircuit_patterns
+                for p in detect_subcircuit_patterns(model):
+                    if p.motif_type != 'signal_flow_chain':
+                        continue
+                    chain = p.metadata.get('chain', [])
+                    if len(chain) < 2:
+                        continue
+                    for i in range(len(chain) - 1):
+                        ca = model.get_component(chain[i])
+                        cb = model.get_component(chain[i + 1])
+                        if ca and cb:
+                            self._chain_adjacent_pairs.append((ca, cb))
+            except Exception:
+                pass
+
+        # Net weights: signal-flow chain internal nets get weight 3.0 to
+        # pull chain members together against the connector-perimeter pull.
+        # Default weight 1.0 for all other nets.  Cached on model so both
+        # CostState (SA hot path) and CostFunction (cold path) share it.
+        self._net_weights: dict[str, float] = _build_net_weights(model)
 
         # Density grid state (only meaningful when _decap_map is set, i.e.
         # the profile opts into density via the decoupling rule).
@@ -196,6 +285,8 @@ class CostState:
         self._density_cell_w: float = 0.0
         self._density_cell_h: float = 0.0
         self._density_penalty: float = 0.0
+        # Net crossing count (routability proxy) — updated on _compute_all.
+        self._net_crossing_count: int = 0
         # Adaptive density weight — scaled by board density AND component
         # count per cell so dense/packed boards (no room to spread) get a
         # gentle nudge while sparse boards get a strong push.
@@ -262,6 +353,8 @@ class CostState:
                     decap_map=self._decap_map,
                     crystal_pairs=self._crystal_pairs,
                     connectors=self._connectors,
+                    decap_pairs=self._decap_pairs,
+                    chain_adjacent_pairs=self._chain_adjacent_pairs,
                 )
             )
         else:
@@ -275,6 +368,11 @@ class CostState:
             self._density_penalty = self._compute_density_penalty()
         else:
             self._density_penalty = 0.0
+
+        # Net crossing count: pairs of non-power nets with intersecting bboxes.
+        # Computed on _compute_all (every 3 SA steps via resync) — approximate
+        # between resyncs but corrected on next full recompute.
+        self._net_crossing_count = self._compute_net_crossings()
 
     # ------------------------------------------------------------------
     # Density grid (Gini coefficient spreading penalty)
@@ -375,7 +473,10 @@ class CostState:
 
         xs = [p[0] for p in pins]
         ys = [p[1] for p in pins]
-        return (max(xs) - min(xs)) + (max(ys) - min(ys))
+        hpwl = (max(xs) - min(xs)) + (max(ys) - min(ys))
+        # Apply signal-flow net weight (1.0 for normal nets, 3.0 for chain internal).
+        weight = self._net_weights.get(net_name, 1.0)
+        return hpwl * weight
 
     @staticmethod
     def _compute_overlap_penalty(
@@ -506,6 +607,8 @@ class CostState:
                     decap_map=self._decap_map,
                     crystal_pairs=self._crystal_pairs,
                     connectors=self._connectors,
+                    decap_pairs=self._decap_pairs,
+                    chain_adjacent_pairs=self._chain_adjacent_pairs,
                 )
             )
 
@@ -631,6 +734,59 @@ class CostState:
     def _boundary_sum(self) -> float:
         return sum(self._comp_boundary)
 
+    def _compute_net_crossings(self) -> int:
+        """Count pairs of non-power nets whose bounding boxes intersect.
+
+        This is a routability proxy: nets whose bboxes overlap are likely
+        to cross each other during routing, causing congestion and vias.
+        Inspired by Cypress (ISPD 2025 Best Paper) which treats net
+        crossing as a first-class objective distinct from HPWL.
+
+        O(nets²) — only called on _compute_all (every 3 SA steps via
+        resync), not on every incremental_update.
+        """
+        # Build per-net bounding boxes from pin positions.
+        net_bboxes: dict[str, tuple[float, float, float, float]] = {}
+        for net_name, indices in self._net_indices.items():
+            if net_name in self._power_nets:
+                continue
+            if not indices:
+                continue
+            xs: list[float] = []
+            ys: list[float] = []
+            net_obj = self.model.get_net(net_name)
+            if not net_obj:
+                continue
+            comp_by_ref = {self._comps[i].ref: self._comps[i] for i in indices}
+            for ref, pad_name in net_obj.pins:
+                comp = comp_by_ref.get(ref)
+                if not comp:
+                    continue
+                for pad in comp.pads:
+                    if pad.pad_name == pad_name:
+                        ax, ay = pad.absolute_pos(comp.x, comp.y, comp.rotation)
+                        xs.append(ax)
+                        ys.append(ay)
+                        break
+                else:
+                    xs.append(comp.x)
+                    ys.append(comp.y)
+            if len(xs) < 2:
+                continue
+            net_bboxes[net_name] = (min(xs), min(ys), max(xs), max(ys))
+
+        # Count intersecting pairs.
+        names = list(net_bboxes.keys())
+        count = 0
+        for i in range(len(names)):
+            bx1, by1, bx2, by2 = net_bboxes[names[i]]
+            for j in range(i + 1, len(names)):
+                ax1, ay1, ax2, ay2 = net_bboxes[names[j]]
+                # Bbox intersection test: NOT (a_left >= b_right OR a_right <= b_left OR ...)
+                if bx1 < ax2 and ax1 < bx2 and by1 < ay2 and ay1 < by2:
+                    count += 1
+        return count
+
     @property
     def total_cost(self) -> float:
         hpwl = self._hpwl_sum()
@@ -640,6 +796,8 @@ class CostState:
         # Density is intentionally NOT scaled by penalty_scale — it's a soft
         # signal that should influence SA at all temperatures.
         density = self._density_weight * self._density_penalty
+        # Net crossing is NOT included in SA cost — too expensive to update
+        # incrementally.  Computed on _compute_all for reporting only.
         return hpwl + overlap + boundary + constraint + density
 
     @property
@@ -651,6 +809,16 @@ class CostState:
                 + BOUNDARY_WEIGHT * self._boundary_sum()
                 + CONSTRAINT_WEIGHT * self._constraint_total
                 + self._density_weight * self._density_penalty)
+
+    @property
+    def net_crossing_count(self) -> int:
+        """Number of net bbox intersection pairs (reporting only).
+
+        Updated on _compute_all (every 3 SA steps via resync).  NOT
+        included in total_cost — too expensive to update incrementally.
+        Use CostFunction.evaluate for the final net-crossing penalty.
+        """
+        return self._net_crossing_count
 
     @property
     def hpwl(self) -> float:

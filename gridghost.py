@@ -201,27 +201,29 @@ def cmd_place(args) -> None:
             print(f"  Pre-placed {n_moved} decoupling cap(s) near their ICs")
 
     # Step 5.5: Post-placement optimization
-    # Default is enhanced greedy+swap (no global SA).
-    # Use --sa to additionally run global SA before greedy.
+    # SA is ON by default; use --no-sa to disable and run greedy+swap only.
+    # SA auto-disables on tiny (≤6 comps) and large (≥50 comps) boards.
     import engine.cost_state as cs
     cs.OVERLAP_WEIGHT = max(profile.beta, 25.0)   # strong — SA should avoid overlaps
     cs.BOUNDARY_WEIGHT = max(profile.gamma, 8.0)   # strong — prevent OOB during SA
     cs.CONSTRAINT_WEIGHT = profile.delta
 
-    sa_config = SAConfig(
-        max_iterations=args.sa_iterations,
-        reheat_count=args.sa_reheat,
-        verbose=True,
-        skip_sa=not args.sa,  # skip global SA by default
-    )
+    # Build SAConfig from config.json (single source of truth), with CLI overrides.
+    # CLI args default to None → fall back to config.json values.
+    sa_overrides = {"verbose": True, "skip_sa": args.no_sa}
+    if args.sa_iterations is not None:
+        sa_overrides["max_iterations"] = args.sa_iterations
+    if args.sa_reheat is not None:
+        sa_overrides["reheat_count"] = args.sa_reheat
+    sa_config = SAConfig.from_config(cfg.annealer, **sa_overrides)
 
-    if args.sa:
-        print("Step 5: Running SA + enhanced greedy optimization...")
+    if args.no_sa:
+        print("Step 5: Running enhanced greedy+swap optimization (--no-sa)...")
     else:
-        print("Step 5: Running enhanced greedy+swap optimization...")
+        print("Step 5: Running SA + enhanced greedy optimization...")
 
     sa_result = run_sa(model, config=sa_config, verbose=True, rules=profile.rules)
-    mode_label = "SA" if args.sa else "Greedy"
+    mode_label = "Greedy" if args.no_sa else "SA"
     print(f"  {mode_label}: cost {sa_result['initial_cost']:.1f} -> {sa_result['final_cost']:.1f} "
           f"(delta={sa_result['improvement']:.1f})")
     print(f"  {mode_label}: HPWL {sa_result['initial_hpwl']:.1f} -> {sa_result['final_hpwl']:.1f}")
@@ -252,7 +254,10 @@ def cmd_place(args) -> None:
     adaptive_max_iter = max(100, min(800, n_total * 5))
 
     # Compute interior bbox for legalizer so it clamps interior components
-    # away from edge connectors
+    # away from edge connectors. Must be computed AFTER placement —
+    # pre-placement ib captures the original tight cluster and would
+    # clamp the legalizer back into it, causing massive overlaps on
+    # dense boards (e.g. test4: 50→9 overlaps).
     interior_comps = [
         c for c in model.components
         if not c.is_fixed and (
@@ -443,9 +448,12 @@ def main():
                          help="Board edge margin in mm (default: from config, else 5.0)")
     p_place.add_argument("--dry-run", action="store_true", help="Don't write PCB output file")
     p_place.add_argument("--interactive", action="store_true", help="Interactive profile weight tuning")
-    p_place.add_argument("--sa", action="store_true", help="Enable global SA optimization after placement (default: greedy+swap only)")
-    p_place.add_argument("--sa-iterations", type=int, default=200, help="Max SA temperature steps (default: 200)")
-    p_place.add_argument("--sa-reheat", type=int, default=2, help="Number of SA reheat rounds (default: 2)")
+    p_place.add_argument("--no-sa", action="store_true",
+                         help="Disable global SA optimization (default: SA enabled; auto-disables on tiny/large boards)")
+    p_place.add_argument("--sa-iterations", type=int, default=None,
+                         help="Max SA temperature steps (default: from config.json)")
+    p_place.add_argument("--sa-reheat", type=int, default=None,
+                         help="Number of SA reheat rounds (default: from config.json)")
     p_place.add_argument("--debug-bbox", action="store_true", help="Draw component bounding boxes on Dwgs.User layer for visual debugging")
 
     # profiles

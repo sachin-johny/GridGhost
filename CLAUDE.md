@@ -124,14 +124,14 @@ Cost weights and rule priorities pre-configured per board type:
 
 ```bash
 python gridghost.py place <input.kicad_pcb> [options]
-  -a, --algorithm     # force-directed (default) | grid
-  -p, --profile       # Board profile (default: generic)
-  -m, --margin        # Board edge margin mm (default: 5.0)
+  -a, --algorithm     # grid (default) | force-directed
+  -p, --profile       # Board profile (default: auto — mcu_peripheral if ICs detected, else generic)
+  -m, --margin        # Board edge margin mm (default: from config, else 5.0)
   --dry-run           # Don't write PCB file
   --interactive       # Interactive profile weight tuning
-  --no-sa             # Disable SA optimization after placement
-  --sa-iterations N   # Max SA temperature steps (default: 200)
-  --sa-reheat N       # Number of SA reheat rounds (default: 2)
+  --no-sa             # Disable SA (SA is ON by default; auto-disables on ≤6 or ≥50 comps)
+  --sa-iterations N   # Max SA temperature steps (default: from config.json = 300)
+  --sa-reheat N       # Number of SA reheat rounds (default: from config.json = 3)
 
 python gridghost.py extract <input.kicad_pcb> [-o output.json]
 python gridghost.py profiles

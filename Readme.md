@@ -11,18 +11,21 @@
 - **Net-aware hypergraph clustering** — groups components by connectivity with power-rail edges that link decoupling caps to their ICs, ensuring every IC cluster has at least one decoupling capacitor nearby
 - **Smart interior-first placement** — places interior components (ICs + passives) via cluster-based grid layout, then positions edge connectors around the interior perimeter with pad-based rotation so they face outward correctly
 - **Force-directed placement** — alternative algorithm using attractive (HPWL gradient) and repulsive (inverse-distance) forces with cooling schedule for convergence
-- **Simulated annealing (v8 strategy)** — adaptive cooling with penalty scaling (hot SA discounts overlaps for exploration, cold SA enforces them), reheating rounds, and greedy refinement with hard overlap rejection
+- **Simulated annealing (enabled by default)** — adaptive cooling with penalty scaling (hot SA discounts overlaps for exploration, cold SA enforces them), reheating rounds, and greedy refinement with hard overlap rejection. SA auto-disables on tiny (≤6 comps) and large (≥50 comps) boards where greedy is near-optimal or SA is too slow. Use `--no-sa` to force greedy-only.
+- **Cap-IC atomic group movement** — decoupling caps move as a unit with their assigned IC through the **entire pipeline** (SA moves, greedy refinement, legalizer snap/clamp/overlap-resolution, abacus row DP, post-legalize slide/swap). Caps stay adjacent to their IC (close but NOT overlapping) without being left behind.
+- **End-mating connector orientation** — barrel jacks, USB, RJ45, HDMI, D-Sub and other end-mating connectors are correctly oriented so the mating face points outward. Face-mating connectors (terminal blocks, pin headers, SMA) use the perpendicular-to-pad-column heuristic.
 - **Density-aware spreading** — ePlace-style Gini coefficient on a 10×10 cell-occupancy grid adds a soft spreading force so HPWL doesn't collapse everything into a center-of-mass cluster. Weight is adaptive — scaled down for dense/packed boards (no room to spread) and up for sparse boards. A fill-first spread move operator in the interior SA jumps components from overcrowded cells to empty cells within the outline, with SA's Metropolis acceptance filtering HPWL-disastrous jumps
+- **Spread floor guard** — rejects SA moves that collapse component spread below 10% of board dimensions, preventing the "SA crams everything into one corner to minimise HPWL" failure mode
 - **Dedicated overlap resolver** — after greedy refinement, force-resolves any remaining overlaps by pushing component pairs apart, accepting HPWL increases to guarantee zero overlaps before legalization
-- **Incremental cost computation** — O(k) per SA move using sorted sweep-line index and per-net HPWL caching, with snapshot/restore for move rejection
+- **Incremental cost computation** — O(k) per SA move using sorted sweep-line index and per-net HPWL caching, with snapshot/restore for move rejection. Pre-materialised cap-IC pairs eliminate per-move `get_component` lookups.
 - **10 constraint rules** — decoupling proximity, crystal-MCU, connector-edge, thermal grouping, high-current path, bulk cap input, antenna keepout, analog/digital separation, matched length, and ground-plane clearance
-- **6 board profiles** — pre-configured cost weights and constraint rules for MCU/peripheral, power supply, RF frontend, mixed-signal, generic, and small/dense boards
+- **6 board profiles + auto** — pre-configured cost weights and constraint rules for MCU/peripheral, power supply, RF frontend, mixed-signal, generic, and small/dense boards. `auto` profile selects `mcu_peripheral` if ICs are detected, otherwise `generic`.
 - **Rotation-aware bounding boxes** — component dimensions and courtyards update correctly with 90/180/270 rotations; KiCad clockwise rotation convention is respected
 - **Pad rotation propagation** — when a footprint is rotated, the rotation delta is applied to each pad's `(at ...)` expression so copper layers match the courtyard orientation
 - **Edge connector awareness** — horizontal/surface-mount connectors are placed on the board perimeter and excluded from out-of-bounds counts; vertical/THT connectors are treated as interior components
 - **Interior bbox recomputation** — after SA condenses the interior cluster, components are re-centred on the board and the interior bbox is expanded so connectors have room on each edge
 - **Debug visualization** — `--debug-bbox` draws component bounding boxes, board outline, and interior bbox rectangles on the `Dwgs.User` layer for visual inspection in KiCad
-- **Configurable via JSON** — all tuning parameters (legalization grid, SA iterations, force-directed coefficients, clustering bounds, etc.) are exposed in `config.json` with sensible defaults
+- **Configurable via JSON** — all tuning parameters (legalization grid, SA iterations, reheat count, spread floor, auto-disable thresholds, force-directed coefficients, clustering bounds, etc.) are loaded from `config.json` as the single source of truth. CLI flags override config values when provided.
 
 ## Pipeline
 
@@ -74,27 +77,52 @@ python gridghost.py profiles
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-a`, `--algorithm` | `grid` | Placement algorithm: `grid` or `force-directed` |
-| `-p`, `--profile` | `mcu_peripheral` | Board profile: `mcu_peripheral`, `power_supply`, `rf_frontend`, `mixed_signal`, `generic`, `small_board` |
+| `-p`, `--profile` | `auto` | Board profile: `auto`, `mcu_peripheral`, `power_supply`, `rf_frontend`, `mixed_signal`, `generic`, `small_board` |
 | `-m`, `--margin` | from config (5.0) | Board edge margin in mm |
-| `--no-sa` | off | Disable SA optimization after placement |
-| `--sa-iterations` | 200 | Max SA temperature steps |
-| `--sa-reheat` | 2 | Number of SA reheat rounds |
+| `--no-sa` | off | Disable SA optimization (SA is **on by default**; auto-disables on tiny ≤6 or large ≥50 component boards) |
+| `--sa-iterations` | from config (300) | Max SA temperature steps |
+| `--sa-reheat` | from config (3) | Number of SA reheat rounds |
 | `--dry-run` | off | Don't write PCB output file |
 | `--interactive` | off | Interactive profile weight tuning |
 | `--debug-bbox` | off | Draw bounding boxes on Dwgs.User layer |
 | `--config` | `config.json` | Path to configuration file |
 
+### Configuration
+
+All tunable parameters are loaded from `config.json` (the single source of truth). CLI flags override config values when provided. The `annealer` section controls SA behavior:
+
+```json
+{
+    "annealer": {
+        "max_iterations": 300,
+        "reheat_count": 3,
+        "reheat_ratio": 0.40,
+        "penalty_scale_min": 0.50,
+        "greedy_nudge_distances": [0.05, 0.1, 0.2, 0.5, 1.0, 2.0],
+        "sa_auto_disable_min_components": 6,
+        "sa_auto_disable_max_components": 50,
+        "spread_floor_fraction": 0.10,
+        ...
+    }
+}
+```
+
+Edit `config.json` to tune SA for your board class — no code changes needed.
+
 ### Examples
 
 ```bash
-# Quick placement with defaults (grid algorithm, MCU profile)
+# Auto-place with defaults (SA enabled, auto profile selection)
 python gridghost.py place board.kicad_pcb
 
 # Force-directed algorithm, power supply profile
 python gridghost.py place board.kicad_pcb -a force-directed -p power_supply
 
-# Grid algorithm, no SA (fast, less optimized)
-python gridghost.py place board.kicad_pcb -a grid --no-sa
+# Disable SA for fast greedy-only placement
+python gridghost.py place board.kicad_pcb --no-sa
+
+# Override SA iterations (config.json value is 300)
+python gridghost.py place board.kicad_pcb --sa-iterations 500
 
 # Dry run with debug bounding boxes for visual inspection
 python gridghost.py place board.kicad_pcb --dry-run --debug-bbox
@@ -172,8 +200,19 @@ The default `grid` algorithm uses a multi-phase approach that produces better re
 5. **Repulsion pass** — push overlapping components apart with spacing proportional to component size
 6. **Interior SA** — simulated annealing on interior components only (connectors excluded to prevent pulling toward original KiCad positions). Includes ePlace-style Gini density penalty and a fill-first spread move operator that jumps components from overcrowded cells to empty cells within the board outline
 7. **Re-centre** — shift the interior cluster so its centroid is at the center of the usable board area
-8. **Connector perimeter placement** — compute the interior bbox, expand it so connectors fit on each edge, then place connectors on the perimeter with pad-based rotation (analyzing pad geometry to determine the correct facing direction)
+8. **Connector perimeter placement** — compute the interior bbox, expand it so connectors fit on each edge, then place connectors on the perimeter with pad-based rotation. End-mating connectors (barrel jacks, USB, RJ45, etc.) use body-long-axis mating direction; face-mating connectors (terminal blocks, pin headers) use perpendicular-to-pad-column heuristic.
 9. **Overlap resolution** — resolve all remaining overlaps between connectors and interior components
+
+## Cap-IC Atomic Group Movement
+
+Decoupling capacitors are assigned to ICs based on shared power nets (VCC, VDD, VBAT, etc.). Once assigned, a cap moves as a unit with its IC through **every stage of the pipeline**:
+
+- **SA move operators** (translate, swap, rotate, median) — caps follow the IC's delta; on IC rotation, caps rotate around the IC's center
+- **Greedy refinement** — nudges and rotations move the IC + caps as a group
+- **Legalizer** — grid snap, boundary clamp, overlap resolution, and abacus row DP all propagate IC deltas to caps via the `propagate_ic_delta` hook
+- **Post-legalize** — cell sliding and pair swaps propagate deltas too
+
+Caps are placed **adjacent** to their IC (close but NOT overlapping) — the `_nudge_caps_to_ics` pass finds overlap-free slots in an 8-direction fan around the IC at 0.5–10mm spacing. The `_cleanup_cap_ic_overlaps` pass resolves any remaining cap-IC overlaps as a final step.
 
 ## Project Structure
 

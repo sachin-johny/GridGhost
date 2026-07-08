@@ -11,6 +11,10 @@ import random
 from dataclasses import dataclass
 
 from models.board_model import BoardModel
+from engine.group_moves import (
+    get_decap_map, get_ref_idx_map, get_group_indices,
+    get_ic_caps_for_index, get_group_followers, apply_delta_with_clamp, IC_TYPES,
+)
 
 
 @dataclass
@@ -79,41 +83,13 @@ def do_translate(
 
     old_states = [old]
 
-    ic_types = {'ic', 'mcu', 'regulator'}
-    if getattr(comp, 'component_type', '') in ic_types:
-        # Reuse the decoupling map published by CostState on the model
-        # (avoids rebuilding it on every translate call).
-        decap_map = getattr(model, '_decap_map_cache', None)
-        if decap_map is None:
-            try:
-                from engine.constraint_evaluator import _build_decoupling_map
-                decap_map = _build_decoupling_map(model)
-                model._decap_map_cache = decap_map
-            except Exception:
-                decap_map = {}
-
-        cap_refs = decap_map.get(comp.ref, []) if decap_map else []
-        if cap_refs:
-            ref_to_idx = getattr(model, '_comp_ref_idx_map', None)
-            if ref_to_idx is None:
-                ref_to_idx = {c.ref: i for i, c in enumerate(model.components)}
-                model._comp_ref_idx_map = ref_to_idx
-
-            board = model.board
-            for cap_ref in cap_refs:
-                cap_idx = ref_to_idx.get(cap_ref)
-                if cap_idx is None:
-                    continue
-                cap = model.components[cap_idx]
-                if cap.is_fixed or cap.is_edge_connector:
-                    continue
-                old_states.append((cap_idx, cap.x, cap.y, cap.rotation))
-                half_w = cap.effective_width / 2.0
-                half_h = cap.effective_height / 2.0
-                cap.x = max(board.x_min + half_w,
-                            min(cap.x + dx, board.x_max - half_w))
-                cap.y = max(board.y_min + half_h,
-                            min(cap.y + dy, board.y_max - half_h))
+    # If this is an IC, move its assigned caps by the same delta.
+    follower_indices = get_group_followers(model, idx)
+    for cap_idx in follower_indices:
+        cap = model.components[cap_idx]
+        old_states.append((cap_idx, cap.x, cap.y, cap.rotation))
+    if follower_indices:
+        apply_delta_with_clamp(model, follower_indices, dx, dy)
 
     return MoveUndo(move_type='translate', old_states=old_states)
 
@@ -122,7 +98,12 @@ def do_swap(
     model: BoardModel,
     moveable_indices: list[int],
 ) -> MoveUndo:
-    """Swap positions of two random moveable components."""
+    """Swap positions of two random moveable components.
+
+    Group-aware: when either swapped component is an IC with assigned
+    caps, its caps are translated by the same delta as the IC so the
+    cap-IC group survives the swap.
+    """
     if len(moveable_indices) < 2:
         return MoveUndo(move_type='translate', old_states=[])
 
@@ -140,25 +121,79 @@ def do_swap(
     old1 = (idx1, c1.x, c1.y, c1.rotation)
     old2 = (idx2, c2.x, c2.y, c2.rotation)
 
+    # Compute swap deltas: c1 moves to c2's position (delta = c2 - c1)
+    # and vice versa. If either is an IC, its caps follow by the same delta.
+    delta1 = (c2.x - c1.x, c2.y - c1.y)
+    delta2 = (c1.x - c2.x, c1.y - c2.y)
+
     c1.x, c2.x = c2.x, c1.x
     c1.y, c2.y = c2.y, c1.y
 
-    return MoveUndo(move_type='swap', old_states=[old1, old2])
+    # Build old_states as a dict to dedupe — if a cap is ALSO one of the
+    # swapped pair (e.g. swapping an IC with its own cap), the swap-pair
+    # entry wins (it was captured first) and we skip the cap-follower entry.
+    old_states_map: dict[int, tuple[int, float, float, float]] = {
+        idx1: old1,
+        idx2: old2,
+    }
+
+    # Caps follow their IC's swap delta.
+    for ic_idx, delta in ((idx1, delta1), (idx2, delta2)):
+        follower_indices = get_group_followers(model, ic_idx)
+        # Skip caps that are part of the swap pair itself — already recorded.
+        follower_indices = [ci for ci in follower_indices if ci not in old_states_map]
+        for cap_idx in follower_indices:
+            cap = model.components[cap_idx]
+            old_states_map[cap_idx] = (cap_idx, cap.x, cap.y, cap.rotation)
+        if follower_indices:
+            apply_delta_with_clamp(model, follower_indices, delta[0], delta[1])
+
+    return MoveUndo(move_type='swap', old_states=list(old_states_map.values()))
 
 
 def do_rotate(
     model: BoardModel,
     moveable_indices: list[int],
 ) -> MoveUndo:
-    """Rotate a random component by 90, 180, or 270 degrees."""
+    """Rotate a random component by 90, 180, or 270 degrees.
+
+    Group-aware: when the rotated component is an IC, its assigned caps
+    are translated so they keep their pre-rotation offset relative to
+    the IC's center. Caps don't rotate themselves (their orientation is
+    independent of the IC's), but their (x,y) position rotates around
+    the IC's center to preserve the relative geometry of the group.
+    """
     idx = random.choice(moveable_indices)
     comp = model.components[idx]
     old = (idx, comp.x, comp.y, comp.rotation)
 
     rot = random.choice([90.0, 180.0, 270.0])
-    comp.set_rotation((comp.rotation + rot) % 360.0)
+    new_rotation = (comp.rotation + rot) % 360.0
 
-    return MoveUndo(move_type='rotate', old_states=[old])
+    follower_indices = get_group_followers(model, idx)
+    old_states = [old]
+
+    # If this is an IC with caps, capture pre-rotation cap states and
+    # rotate cap positions around the IC's center.
+    if follower_indices:
+        ic_cx, ic_cy = comp.x, comp.y
+        rad = math.radians(rot)
+        cos_r = math.cos(rad)
+        sin_r = -math.sin(rad)  # KiCad CW-positive convention
+        for cap_idx in follower_indices:
+            cap = model.components[cap_idx]
+            old_states.append((cap_idx, cap.x, cap.y, cap.rotation))
+            # Rotate cap offset around IC center
+            ox = cap.x - ic_cx
+            oy = cap.y - ic_cy
+            new_ox = ox * cos_r - oy * sin_r
+            new_oy = ox * sin_r + oy * cos_r
+            cap.x = ic_cx + new_ox
+            cap.y = ic_cy + new_oy
+
+    comp.set_rotation(new_rotation)
+
+    return MoveUndo(move_type='rotate', old_states=old_states)
 
 
 def do_median(
@@ -190,7 +225,15 @@ def do_median(
         dy = random.uniform(-1.0, 1.0)
         comp.x += dx
         comp.y += dy
-        return MoveUndo(move_type='median', old_states=[old])
+        # Group-aware: caps follow
+        old_states = [old]
+        follower_indices = get_group_followers(model, idx)
+        for cap_idx in follower_indices:
+            cap = model.components[cap_idx]
+            old_states.append((cap_idx, cap.x, cap.y, cap.rotation))
+        if follower_indices:
+            apply_delta_with_clamp(model, follower_indices, dx, dy)
+        return MoveUndo(move_type='median', old_states=old_states)
 
     # Build ref→component index once (cached on model for performance).
     # BoardModel.get_component maintains this index lazily and rebuilds
@@ -225,7 +268,15 @@ def do_median(
         dy = random.uniform(-1.0, 1.0)
         comp.x += dx
         comp.y += dy
-        return MoveUndo(move_type='median', old_states=[old])
+        # Group-aware: caps follow
+        old_states = [old]
+        follower_indices = get_group_followers(model, idx)
+        for cap_idx in follower_indices:
+            cap = model.components[cap_idx]
+            old_states.append((cap_idx, cap.x, cap.y, cap.rotation))
+        if follower_indices:
+            apply_delta_with_clamp(model, follower_indices, dx, dy)
+        return MoveUndo(move_type='median', old_states=old_states)
 
     centroid_x = cx_sum / count
     centroid_y = cy_sum / count
@@ -242,7 +293,16 @@ def do_median(
     comp.x += dx
     comp.y += dy
 
-    return MoveUndo(move_type='median', old_states=[old])
+    # Group-aware: caps follow the IC's median move.
+    old_states = [old]
+    follower_indices = get_group_followers(model, idx)
+    for cap_idx in follower_indices:
+        cap = model.components[cap_idx]
+        old_states.append((cap_idx, cap.x, cap.y, cap.rotation))
+    if follower_indices:
+        apply_delta_with_clamp(model, follower_indices, dx, dy)
+
+    return MoveUndo(move_type='median', old_states=old_states)
 
 
 def revert_move(model: BoardModel, undo: MoveUndo):

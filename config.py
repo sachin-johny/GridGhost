@@ -30,7 +30,7 @@ class AnnealerConfig:
     reheat_count: int = 3              # v11: overridden by density-adaptive logic (1-3)
     reheat_ratio: float = 0.40
     calibration_samples: int = 500     # v11: more samples for robust T0
-    initial_accept_rate: float = 0.90  # v11: target accept at start
+    initial_accept_rate: float = 0.92  # v11: target accept at start
     penalty_scale_min: float = 0.50    # v11: overridden by density-adaptive logic (0.50-0.95)
     min_temperature: float = 1e-8
     freeze_threshold: float = 0.005
@@ -38,6 +38,11 @@ class AnnealerConfig:
     greedy_rotations: tuple[float, ...] = (90.0, 180.0, 270.0)
     greedy_improve_threshold: float = 0.5  # v11: accept smaller improvements
     overlap_cap_factor: float = 2.0    # v11: reject moves exceeding this * initial overlaps
+    rudy_weight: float = 0.3           # RUDY congestion penalty weight (0 = disabled)
+    rudy_grid_resolution: float = 2.0  # RUDY grid cell size in mm
+    sa_auto_disable_min_components: int = 6   # auto-disable SA on tiny boards
+    sa_auto_disable_max_components: int = 50  # auto-disable SA on large boards
+    spread_floor_fraction: float = 0.10       # reject moves that collapse spread
 
 
 @dataclass

@@ -10,12 +10,11 @@
         "severe_push_factor": 0.5
     },
     "annealer": {
-        "max_iterations": 200,
-        "reheat_count": 2,
+        "max_iterations": 300,
+        "reheat_count": 3,
         "reheat_ratio": 0.40,
-        "reheat_decay": 0.7,
         "calibration_samples": 500,
-        "initial_accept_rate": 0.90,
+        "initial_accept_rate": 0.92,
         "penalty_scale_min": 0.50,
         "min_temperature": 1e-8,
         "freeze_threshold": 0.005,
@@ -23,9 +22,11 @@
         "greedy_rotations": [90.0, 180.0, 270.0],
         "greedy_improve_threshold": 0.5,
         "overlap_cap_factor": 2.0,
-        "cooling_fast": 0.95,
-        "cooling_balanced": 0.97,
-        "cooling_thorough": 0.99
+        "rudy_weight": 0.3,
+        "rudy_grid_resolution": 2.0,
+        "sa_auto_disable_min_components": 6,
+        "sa_auto_disable_max_components": 50,
+        "spread_floor_fraction": 0.10
     },
     "cost": {
         "overlap_weight": 10.0,

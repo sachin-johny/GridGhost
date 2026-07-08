@@ -8,7 +8,8 @@ hypergraph so SA keeps motif members together.
 Motifs recognized:
   - crystal_oscillator: crystal + 2 load caps (one on each oscillator net)
   - regulator: regulator IC + input cap + output cap (LDO/buck/boost)
-  - (future: opamp_feedback, connector_esd_termination)
+  - signal_flow_chain: connector → passives → IC → IC → passives → connector
+    (the "ADC in → op-amp → buffer → ADC out" pattern)
 
 The "which side things go on" aspect (canonical relative arrangement) is
 deferred to a follow-up — this commit focuses on detection + clustering
@@ -32,6 +33,13 @@ from engine.cost_state import _is_power_net
 # edges (2.0) and signal edges (1.0) — these are RIGID sub-groups where
 # a human PCB designer would NEVER scatter the members.  Tunable.
 SUBCIRCUIT_EDGE_WEIGHT = 3.0
+
+# Weight for signal-flow chain edges.  Stronger than subcircuit (3.0)
+# because chains span MORE components (J→R→U→U→R→J = 7 members) and
+# need extra pull to keep the whole signal path together against the
+# connector-perimeter placement which tries to split endpoints across
+# different edges.
+SIGNAL_FLOW_EDGE_WEIGHT = 4.0
 
 
 @dataclass
@@ -277,6 +285,127 @@ def _center_distance(a: Component, b: Component) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Signal-flow chain detector (Phase 3.3)
+# ---------------------------------------------------------------------------
+
+IC_TYPES = frozenset({'ic', 'mcu', 'regulator'})
+PASSIVE_TYPES = frozenset({'resistor', 'capacitor', 'inductor', 'diode', 'generic'})
+# Max BFS depth (hops through components).  A typical chain is
+# J→R→U→R→U→R→J = 6 hops.  Allow 8 for longer paths.
+_MAX_CHAIN_DEPTH = 8
+# Min ICs in a chain.  1 accepts J→U→J (simple pass-through).
+# 2 requires J→U→U→J (multi-stage, like ADC→op-amp→buffer→out).
+_MIN_CHAIN_ICS = 1
+
+
+def _detect_signal_flow_chains(
+    model: BoardModel,
+    ref_nets: dict[str, set[str]],
+    net_refs: dict[str, set[str]],
+    ref_comp: dict[str, Component],
+    used_refs: set[str],
+) -> list[SubcircuitPattern]:
+    """Detect connector-to-connector signal-flow chains.
+
+    A signal-flow chain is a path through signal nets from one connector
+    to another, passing through at least one IC.  Example::
+
+        J5 (ADC1_in) → R2 → U1 → R17 → U5 → R29 → J9 (Buffer1_out)
+
+    This is the "ADC connector → IC → IC → output connector" pattern that
+    human PCB designers place as a unit.  Detection uses BFS from each
+    connector through non-power signal nets, recording the shortest path
+    to each other connector.
+
+    Chains can share ICs (e.g. a quad op-amp serves multiple channels) —
+    only connectors are marked as used to prevent duplicate chains.
+    """
+    patterns: list[SubcircuitPattern] = []
+    connectors = [
+        c for c in model.components
+        if getattr(c, 'component_type', '') == 'connector'
+        and c.ref not in used_refs
+        and not c.is_fixed
+    ]
+
+    for start_conn in connectors:
+        # Skip if this connector was already used as a chain endpoint.
+        if start_conn.ref in used_refs:
+            continue
+
+        # BFS from start_conn through signal nets.
+        # State: (current_ref, path_list, depth)
+        # Track visited per-BFS to avoid cycles.
+        visited = {start_conn.ref}
+        queue: list[tuple[str, list[str], int]] = [(start_conn.ref, [start_conn.ref], 0)]
+        # Record shortest path to each connector found.
+        found_endpoints: dict[str, list[str]] = {}
+
+        while queue:
+            curr_ref, path, depth = queue.pop(0)
+            if depth >= _MAX_CHAIN_DEPTH:
+                continue
+
+            # Get signal nets for current component (non-power).
+            curr_nets = ref_nets.get(curr_ref, set())
+            for net_name in curr_nets:
+                refs_on_net = net_refs.get(net_name, set())
+                for next_ref in refs_on_net:
+                    if next_ref in visited:
+                        continue
+                    next_comp = ref_comp.get(next_ref)
+                    if next_comp is None:
+                        continue
+
+                    next_type = getattr(next_comp, 'component_type', '')
+
+                    # Found another connector — record the path.
+                    if next_type == 'connector' and next_ref != start_conn.ref:
+                        if next_ref not in found_endpoints:
+                            found_endpoints[next_ref] = path + [next_ref]
+                        continue  # don't BFS past a connector
+
+                    # Continue through ICs and passives.
+                    if next_type in IC_TYPES or next_type in PASSIVE_TYPES:
+                        visited.add(next_ref)
+                        queue.append((next_ref, path + [next_ref], depth + 1))
+
+        # Filter: keep chains with ≥ _MIN_CHAIN_ICS ICs, prefer more ICs.
+        best_chain: tuple[str, list[str], int] | None = None  # (end_ref, path, ic_count)
+        for end_ref, chain_path in found_endpoints.items():
+            if end_ref in used_refs:
+                continue
+            ic_count = sum(
+                1 for r in chain_path
+                if getattr(ref_comp.get(r), 'component_type', '') in IC_TYPES
+            )
+            if ic_count < _MIN_CHAIN_ICS:
+                continue
+            # Prefer chains with more ICs (main signal flow > tap connections).
+            if best_chain is None or ic_count > best_chain[2]:
+                best_chain = (end_ref, chain_path, ic_count)
+
+        if best_chain is not None:
+            end_ref, chain_path, ic_count = best_chain
+            patterns.append(SubcircuitPattern(
+                motif_type='signal_flow_chain',
+                anchor_ref=start_conn.ref,
+                member_refs=chain_path[1:],
+                metadata={
+                    'chain': chain_path,
+                    'end_connector': end_ref,
+                    'ic_count': ic_count,
+                    'hop_count': len(chain_path) - 1,
+                },
+            ))
+            # Mark both endpoints so we don't get duplicate reverse chains.
+            used_refs.add(start_conn.ref)
+            used_refs.add(end_ref)
+
+    return patterns
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -286,7 +415,8 @@ def detect_subcircuit_patterns(model: BoardModel) -> list[SubcircuitPattern]:
     Returns a list of SubcircuitPattern objects.  Each component is
     used in at most one motif (greedy — first match wins).  Order of
     detection: crystal_oscillator first (most specific signature),
-    then regulator (more generic, could overlap).
+    then regulator (more generic, could overlap), then signal_flow_chain
+    (connector-to-connector paths through ICs).
 
     Cheap by design: O(nets × components) per motif type, no graph
     isomorphism.  Designed to run once per placement pipeline invocation,
@@ -302,20 +432,26 @@ def detect_subcircuit_patterns(model: BoardModel) -> list[SubcircuitPattern]:
     # Detect in order of specificity — crystal_oscillator has the most
     # constraining signature (exactly 2 signal nets, exactly 1 cap per net),
     # so it's least likely to false-positive.  Regulator is more generic.
+    # Signal_flow_chain runs last and only marks connectors as used.
     patterns.extend(_detect_crystal_oscillators(model, ref_nets, net_refs, ref_comp, used_refs))
     patterns.extend(_detect_regulators(model, ref_nets, net_refs, ref_comp, used_refs))
+    patterns.extend(_detect_signal_flow_chains(model, ref_nets, net_refs, ref_comp, used_refs))
 
     return patterns
 
 
 def add_subcircuit_edges(G, model: BoardModel) -> None:
-    """Add clique edges (weight SUBCIRCUIT_EDGE_WEIGHT) between every pair
-    of components in each detected subcircuit pattern.
+    """Add clique edges between every pair of components in each detected
+    subcircuit pattern.
 
     Called by build_net_hypergraph after sheet edges are added.  These
     edges are STRONGER than sheet edges (2.0) and signal edges (1.0) —
     subcircuit members are rigid sub-groups that should never scatter
     across clusters.
+
+    Signal-flow chains use SIGNAL_FLOW_EDGE_WEIGHT (4.0) — stronger than
+    subcircuit motifs (3.0) because chains span more components and need
+    extra pull to keep the whole signal path together.
     """
     patterns = detect_subcircuit_patterns(model)
     for pattern in patterns:
@@ -325,11 +461,13 @@ def add_subcircuit_edges(G, model: BoardModel) -> None:
         movable_refs = [r for r in refs if G.has_node(r)]
         if len(movable_refs) < 2:
             continue
+        # Weight depends on motif type.
+        weight = SIGNAL_FLOW_EDGE_WEIGHT if pattern.motif_type == 'signal_flow_chain' else SUBCIRCUIT_EDGE_WEIGHT
         # Sorted for deterministic edge insertion order.
         movable_refs.sort()
         for i, r1 in enumerate(movable_refs):
             for r2 in movable_refs[i + 1:]:
                 if G.has_edge(r1, r2):
-                    G[r1][r2]["weight"] += SUBCIRCUIT_EDGE_WEIGHT
+                    G[r1][r2]["weight"] += weight
                 else:
-                    G.add_edge(r1, r2, weight=SUBCIRCUIT_EDGE_WEIGHT)
+                    G.add_edge(r1, r2, weight=weight)

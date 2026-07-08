@@ -23,6 +23,51 @@ from engine.cost_state import _is_power_net
 
 
 # ---------------------------------------------------------------------------
+# Net Crossing (routability proxy)
+# ---------------------------------------------------------------------------
+
+def _compute_net_crossings(model: BoardModel) -> int:
+    """Count pairs of non-power nets whose bounding boxes intersect.
+
+    This is a routability proxy: nets whose bboxes overlap are likely
+    to cross each other during routing, causing congestion and vias.
+    Inspired by Cypress (ISPD 2025 Best Paper).
+    """
+    net_bboxes: dict[str, tuple[float, float, float, float]] = {}
+    comp_map = {c.ref: c for c in model.components}
+    for net in model.nets:
+        if _is_power_net(net.name):
+            continue
+        pins = []
+        for ref, pad_name in net.pins:
+            comp = comp_map.get(ref)
+            if not comp:
+                continue
+            for pad in comp.pads:
+                if pad.pad_name == pad_name:
+                    ax, ay = pad.absolute_pos(comp.x, comp.y, comp.rotation)
+                    pins.append((ax, ay))
+                    break
+            else:
+                pins.append((comp.x, comp.y))
+        if len(pins) < 2:
+            continue
+        xs = [p[0] for p in pins]
+        ys = [p[1] for p in pins]
+        net_bboxes[net.name] = (min(xs), min(ys), max(xs), max(ys))
+
+    names = list(net_bboxes.keys())
+    count = 0
+    for i in range(len(names)):
+        bx1, by1, bx2, by2 = net_bboxes[names[i]]
+        for j in range(i + 1, len(names)):
+            ax1, ay1, ax2, ay2 = net_bboxes[names[j]]
+            if bx1 < ax2 and ax1 < bx2 and by1 < ay2 and ay1 < by2:
+                count += 1
+    return count
+
+
+# ---------------------------------------------------------------------------
 # HPWL Wirelength
 # ---------------------------------------------------------------------------
 
@@ -86,7 +131,15 @@ def total_hpwl(model: BoardModel) -> float:
 
     Uses component positions to compute absolute pad positions,
     then calculates HPWL per net with the appropriate model.
+
+    Signal-flow chain internal nets are weighted 3.0 (via
+    ``_build_net_weights``) to pull chain members together.  Power/ground
+    nets are excluded.
     """
+    # Build/load net weights (cached on model).
+    from engine.cost_state import _build_net_weights
+    net_weights = _build_net_weights(model)
+
     total = 0.0
     comp_map = {c.ref: c for c in model.components}
 
@@ -110,7 +163,9 @@ def total_hpwl(model: BoardModel) -> float:
                 # Pad not found — use component center as approximation
                 pins.append((comp.x, comp.y))
 
-        total += net_wirelength_hpwl(pins)
+        hpwl = net_wirelength_hpwl(pins)
+        weight = net_weights.get(net.name, 1.0)
+        total += hpwl * weight
 
     return total
 
@@ -374,6 +429,12 @@ class CostFunction:
             dw = DENSITY_WEIGHT
         total += dw * density
 
+        # Net crossing penalty (routability proxy, à la Cypress ISPD 2025).
+        # Computed on the cold path only — NOT in SA's incremental cost.
+        from engine.cost_state import NET_CROSSING_WEIGHT, _build_net_weights, _is_power_net
+        net_crossings = _compute_net_crossings(model)
+        total += NET_CROSSING_WEIGHT * net_crossings
+
         result = {
             "total": total,
             "hpwl": hpwl,
@@ -383,6 +444,7 @@ class CostFunction:
             "density": density,
             "overlap_count": overlap_count,
             "oob_count": count_out_of_bounds(model),
+            "net_crossings": net_crossings,
         }
         # Merge per-rule breakdown so display code can show details
         for rule_name, rule_penalty in constraint_breakdown.items():

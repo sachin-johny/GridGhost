@@ -39,6 +39,7 @@ from legalization.legalizer import (
     _is_non_square,
     _count_oob,
 )
+from engine.group_moves import propagate_ic_delta
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +195,7 @@ def cell_slide(
                     comp.set_rotation(old_rot)
 
             # Apply best if improvement found
+            comp_pre_x, comp_pre_y = comp.x, comp.y
             comp.x, comp.y = best_x, best_y
             if comp.rotation != best_rot:
                 comp.set_rotation(best_rot)
@@ -202,6 +204,10 @@ def cell_slide(
                 hpwl_gain = orig_hpwl - best_hpwl
                 total_hpwl_delta += hpwl_gain
                 moves_made += 1
+                # Group-aware: if comp is an IC, propagate delta to caps.
+                bounds = (interior_bbox[0], interior_bbox[1], interior_bbox[2], interior_bbox[3]) if interior_bbox else None
+                propagate_ic_delta(model, comp, comp_pre_x, comp_pre_y, comp.x, comp.y,
+                                  bounds=bounds, decap_map=cached_decap_map)
             else:
                 # No improvement - revert
                 comp.x, comp.y = old_x, old_y
@@ -373,6 +379,12 @@ def pair_swap_refine(
                 hpwl_now = (_compute_local_hpwl(c1, comp_net_lookup, model)
                             + _compute_local_hpwl(c2, comp_net_lookup, model))
                 total_hpwl_delta += orig_combined - hpwl_now
+                # Group-aware: propagate swap deltas to caps for any IC swapped.
+                bounds = (interior_bbox[0], interior_bbox[1], interior_bbox[2], interior_bbox[3]) if interior_bbox else None
+                propagate_ic_delta(model, c1, orig_x1, orig_y1, c1.x, c1.y,
+                                  bounds=bounds, decap_map=cached_decap_map)
+                propagate_ic_delta(model, c2, orig_x2, orig_y2, c2.x, c2.y,
+                                  bounds=bounds, decap_map=cached_decap_map)
                 continue
 
             # Revert position swap
@@ -403,6 +415,12 @@ def pair_swap_refine(
                     hpwl_now = (_compute_local_hpwl(c1, comp_net_lookup, model)
                                 + _compute_local_hpwl(c2, comp_net_lookup, model))
                     total_hpwl_delta += orig_combined - hpwl_now
+                    # Group-aware: propagate swap deltas to caps for any IC swapped.
+                    bounds = (interior_bbox[0], interior_bbox[1], interior_bbox[2], interior_bbox[3]) if interior_bbox else None
+                    propagate_ic_delta(model, c1, orig_x1, orig_y1, c1.x, c1.y,
+                                      bounds=bounds, decap_map=cached_decap_map)
+                    propagate_ic_delta(model, c2, orig_x2, orig_y2, c2.x, c2.y,
+                                      bounds=bounds, decap_map=cached_decap_map)
                     continue
 
                 # Revert rotation swap

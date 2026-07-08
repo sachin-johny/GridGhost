@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from models.board_model import BoardModel, Component, BoardOutline
+from engine.group_moves import propagate_ic_delta
 
 
 def abacus_legalize(
@@ -28,6 +29,12 @@ def abacus_legalize(
         return True
 
     orig_positions = {id(c): (c.x, c.y, c.rotation) for c in movable}
+    ic_types = {"ic", "mcu", "regulator"}
+    # Track IC pre-abacus positions so we can propagate deltas to caps.
+    ic_pre_positions: dict[str, tuple[float, float]] = {
+        c.ref: (c.x, c.y) for c in movable
+        if getattr(c, "component_type", "") in ic_types
+    }
 
     rows = _assign_rows(movable, grid_mm, board, interior_bbox, model=model,
                         cached_decap_map=cached_decap_map)
@@ -57,6 +64,22 @@ def abacus_legalize(
     final_overlaps = _count_overlaps(movable, components)
     if verbose:
         print(f"  Abacus: {final_overlaps} overlaps remaining after row DP")
+
+    # Group-aware: propagate IC displacement deltas to caps so they follow.
+    # Abacus moves components within rows (Y) and along X via cluster DP;
+    # caps that were pre-assigned to the IC's row (in _assign_rows) move
+    # independently in X. This pass nudges caps by the same (dx, dy) as
+    # their IC, clamped to interior_bbox. _nudge_caps_to_ics (Step 8 in
+    # legalize) will repair any residual desync from clamping.
+    bounds = (interior_bbox[0], interior_bbox[1], interior_bbox[2], interior_bbox[3]) if interior_bbox else None
+    for comp in movable:
+        if getattr(comp, "component_type", "") not in ic_types:
+            continue
+        pre = ic_pre_positions.get(comp.ref)
+        if pre is None:
+            continue
+        propagate_ic_delta(model, comp, pre[0], pre[1], comp.x, comp.y, bounds=bounds,
+                          decap_map=cached_decap_map if cached_decap_map else None)
 
     return final_overlaps == 0
 

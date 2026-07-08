@@ -13,6 +13,7 @@ from typing import Optional
 
 from models.board_model import BoardModel, Component, BoardOutline, Net, Pad
 from engine.constraint_evaluator import evaluate_constraint_penalties, _build_decoupling_map
+from engine.group_moves import propagate_ic_delta
 from legalization.spatial_grid import SpatialGrid, compute_overlap_stats_fast, count_overlaps_involving_fast, count_pair_overlaps_involving_fast
 
 
@@ -123,12 +124,17 @@ def _is_non_square(comp: Component) -> bool:
 def _snap_to_grid(model: BoardModel, grid_mm: float) -> None:
     components = list(model.components)
     snapped_positions = []
+    # Track IC pre-snap positions so we can propagate deltas to caps.
+    ic_pre_positions: dict[str, tuple[float, float]] = {}
+    ic_types = {"ic", "mcu", "regulator"}
 
     for comp in components:
         if comp.is_fixed or comp.is_edge_connector:
             continue
 
         old_x, old_y = comp.x, comp.y
+        if getattr(comp, "component_type", "") in ic_types:
+            ic_pre_positions[comp.ref] = (old_x, old_y)
         new_x = round(old_x / grid_mm) * grid_mm
         new_y = round(old_y / grid_mm) * grid_mm
         comp.rotation = round(comp.rotation / 90.0) * 90.0
@@ -215,6 +221,17 @@ def _snap_to_grid(model: BoardModel, grid_mm: float) -> None:
 
         snapped_positions.append((comp, old_x, old_y))
 
+    # Group-aware: propagate IC snap deltas to caps so they follow.
+    for comp in components:
+        if getattr(comp, "component_type", "") not in ic_types:
+            continue
+        if comp.is_fixed or comp.is_edge_connector:
+            continue
+        pre = ic_pre_positions.get(comp.ref)
+        if pre is None:
+            continue
+        propagate_ic_delta(model, comp, pre[0], pre[1], comp.x, comp.y)
+
 
 def _enforce_boundary(
     model: BoardModel,
@@ -223,12 +240,17 @@ def _enforce_boundary(
 ) -> None:
     board = model.board
     components = list(model.components)
+    ic_types = {"ic", "mcu", "regulator"}
+    # Track IC pre-clamp positions so we can propagate deltas to caps.
+    ic_pre_positions: dict[str, tuple[float, float]] = {}
 
     for comp in model.components:
         if comp.is_fixed or comp.is_edge_connector:
             continue
 
         old_x, old_y = comp.x, comp.y
+        if getattr(comp, "component_type", "") in ic_types:
+            ic_pre_positions[comp.ref] = (old_x, old_y)
         old_rot = comp.rotation
         _enforce_boundary_single(comp, interior_bbox, board, keepouts=keepouts)
 
@@ -322,6 +344,18 @@ def _enforce_boundary(
 
                 comp.x = best_x
                 comp.y = best_y
+
+    # Group-aware: propagate IC clamp deltas to caps so they follow.
+    bounds = (interior_bbox[0], interior_bbox[1], interior_bbox[2], interior_bbox[3]) if interior_bbox else None
+    for comp in model.components:
+        if getattr(comp, "component_type", "") not in ic_types:
+            continue
+        if comp.is_fixed or comp.is_edge_connector:
+            continue
+        pre = ic_pre_positions.get(comp.ref)
+        if pre is None:
+            continue
+        propagate_ic_delta(model, comp, pre[0], pre[1], comp.x, comp.y, bounds=bounds)
 
 
 def _enforce_boundary_single(
@@ -527,6 +561,8 @@ def _resolve_overlaps(
 
         if grid is not None:
             grid.build(components)
+            # id→idx map for _push_apart_hpwl's SpatialGrid fast path.
+            comp_to_idx = {id(c): i for i, c in enumerate(components)}
             seen: set[tuple[int, int]] = set()
             for i in range(len(components)):
                 c1 = components[i]
@@ -582,6 +618,7 @@ def _resolve_overlaps(
                 c1, c2, components, comp_net_lookup, model,
                 adaptive_strength, grid_mm, board, interior_bbox,
                 comp_map=comp_map, keepouts=keepouts,
+                grid=grid, comp_to_idx=comp_to_idx,
             )
 
             _enforce_boundary_single(c1, interior_bbox, board, keepouts=keepouts)
@@ -610,6 +647,7 @@ def _resolve_overlaps(
                     c1, c2, components, comp_net_lookup, model,
                     adaptive_strength, grid_mm, board, interior_bbox,
                     comp_map=comp_map,
+                    grid=grid, comp_to_idx=comp_to_idx,
                 )
                 _enforce_boundary_single(c1, interior_bbox, board, keepouts=keepouts)
                 _enforce_boundary_single(c2, interior_bbox, board, keepouts=keepouts)
@@ -627,6 +665,7 @@ def _resolve_overlaps(
                     c1, c2, components, comp_net_lookup, model,
                     adaptive_strength * 0.5, grid_mm, board, interior_bbox,
                     comp_map=comp_map,
+                    grid=grid, comp_to_idx=comp_to_idx,
                 )
 
                 _enforce_boundary_single(c1, interior_bbox, board, keepouts=keepouts)
@@ -822,14 +861,20 @@ def _greedy_resolve(
                 if try_rot != old_rot:
                     comp.set_rotation(old_rot)
 
+            comp_old_x, comp_old_y = comp.x, comp.y
             comp.x, comp.y = best_x, best_y
             if comp.rotation != best_rot:
                 comp.set_rotation(best_rot)
 
             if best_overlaps < old_overlaps:
                 improved = True
+                # Group-aware: if comp is an IC, propagate delta to caps.
+                propagate_ic_delta(model, comp, comp_old_x, comp_old_y, comp.x, comp.y,
+                                  bounds=(interior_bbox[0], interior_bbox[1], interior_bbox[2], interior_bbox[3]) if interior_bbox else None)
             elif best_overlaps == old_overlaps and best_local_hpwl < orig_local_hpwl:
                 improved = True
+                propagate_ic_delta(model, comp, comp_old_x, comp_old_y, comp.x, comp.y,
+                                  bounds=(interior_bbox[0], interior_bbox[1], interior_bbox[2], interior_bbox[3]) if interior_bbox else None)
             else:
                 comp.x, comp.y = old_x, old_y
                 if comp.rotation != old_rot:
@@ -1037,6 +1082,8 @@ def _push_apart_hpwl(
     max_iter: int = 5,
     comp_map: dict[str, Component] | None = None,
     keepouts: list[BoardOutline] | None = None,
+    grid: "SpatialGrid | None" = None,
+    comp_to_idx: dict[int, int] | None = None,
 ) -> None:
     """P0 #3: HPWL-aware push-apart via bounded gradient descent.
 
@@ -1067,6 +1114,20 @@ def _push_apart_hpwl(
     distances = [d * max(strength, 0.5) for d in base_dists]
 
     def _third_party_overlaps(mover: Component) -> int:
+        # Fast path: use SpatialGrid to get only nearby candidates.
+        if grid is not None and comp_to_idx is not None:
+            idx = comp_to_idx.get(id(mover))
+            if idx is not None:
+                cands = grid.query_overlaps(idx, components)
+                count = 0
+                for j in cands:
+                    other = components[j]
+                    if other is c1 or other is c2:
+                        continue
+                    if mover.overlaps(other):
+                        count += 1
+                return count
+        # Fallback: full table scan
         count = 0
         for other in components:
             if other is mover or other is c1 or other is c2:
@@ -1097,11 +1158,28 @@ def _push_apart_hpwl(
             hpwl_cache = _build_mover_hpwl_cache(
                 mover, comp_net_lookup, comp_map or {})
 
+            # Pre-compute boundary slack for skip-if-in-bounds optimisation.
+            # If mover is far enough from all boundaries that no trial
+            # displacement can push it OOB, skip the per-candidate clamp.
+            max_disp = max(distances) if distances else 0.0
+            if interior_bbox:
+                _bx_min = interior_bbox[0]; _bx_max = interior_bbox[2]
+                _by_min = interior_bbox[1]; _by_max = interior_bbox[3]
+            else:
+                _bx_min = board.x_min; _bx_max = board.x_max
+                _by_min = board.y_min; _by_max = board.y_max
+            _mhw = mover.effective_width / 2.0
+            _mhh = mover.effective_height / 2.0
+            slack_x = min(old_x - _bx_min - _mhw, _bx_max - _mhw - old_x)
+            slack_y = min(old_y - _by_min - _mhh, _by_max - _mhh - old_y)
+            can_skip_clamp = (not keepouts and slack_x > max_disp and slack_y > max_disp)
+
             for dx_dir, dy_dir in directions:
                 for dist in distances:
                     mover.x = old_x + dx_dir * dist
                     mover.y = old_y + dy_dir * dist
-                    _enforce_boundary_single(mover, interior_bbox, board, keepouts=keepouts)
+                    if not can_skip_clamp:
+                        _enforce_boundary_single(mover, interior_bbox, board, keepouts=keepouts)
 
                     if mover.overlaps(other):
                         pair_ov = mover.overlap_area(other)
@@ -1122,8 +1200,12 @@ def _push_apart_hpwl(
 
         _, which, new_x, new_y = best
         mover = c1 if which == 1 else c2
+        mover_old_x, mover_old_y = mover.x, mover.y
         mover.x = new_x
         mover.y = new_y
+        # Group-aware: if mover is an IC, propagate delta to its caps.
+        propagate_ic_delta(model, mover, mover_old_x, mover_old_y, new_x, new_y,
+                          bounds=(interior_bbox[0], interior_bbox[1], interior_bbox[2], interior_bbox[3]) if interior_bbox else None)
 
 
 
@@ -1176,8 +1258,8 @@ def _nudge_caps_to_ics(
         """Return (clamped_x, clamped_y, dist) if trial pos is overlap-free, else None.
 
         Mutates cap.x/cap.y temporarily for the overlap check, always restores.
-        Excludes the IC from the overlap check (cap touching its own IC is fine
-        for decoupling purposes).
+        Includes the IC in the overlap check — caps must be ADJACENT to their
+        IC (close but not overlapping), not sitting on top of it.
         """
         half_w = cap.effective_width / 2.0
         half_h = cap.effective_height / 2.0
@@ -1201,7 +1283,7 @@ def _nudge_caps_to_ics(
             has_overlap = any(
                 cap.overlaps(other)
                 for other in components
-                if other is not cap and not other.is_fixed and other is not ic
+                if other is not cap and not other.is_fixed
             )
             if has_overlap:
                 return None
@@ -1496,7 +1578,10 @@ def _cleanup_cap_ic_overlaps(
                 cap_half_w = cap.effective_width / 2.0
                 cap_half_h = cap.effective_height / 2.0
 
-                for spacing_mult in [1.0, 1.5, 2.0, 3.0, 5.0]:
+                # Try spacings from tight (0.5mm gap) to wide (10mm gap).
+                # Tight is preferred (cap close to IC); wide is the fallback
+                # when near slots are all occupied by other components.
+                for spacing_mult in [1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0]:
                     gap = 0.5 * spacing_mult
                     right_cx = ic_bbox[2] + gap + cap_half_w
                     left_cx = ic_bbox[0] - gap - cap_half_w

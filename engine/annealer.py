@@ -21,6 +21,7 @@ from engine.moves import (
     revert_move, affected_indices, MoveUndo,
 )
 from engine.congestion import rudy_congestion_penalty, rudy_gradient_for_comp
+from engine.group_moves import get_group_indices, apply_delta_with_clamp
 
 
 @dataclass
@@ -42,9 +43,11 @@ class SAConfig:
     rudy_weight: float = 0.3           # RUDY congestion penalty weight (0 = disabled)
     rudy_grid_resolution: float = 2.0  # RUDY grid cell size in mm
     # Auto-disable SA on tiny/large boards.  Set to 0 to disable the gate.
-    # Tiny boards (≤5 comps): greedy is already near-optimal, SA noise hurts.
+    # Tiny boards (≤6 comps): greedy is already near-optimal, SA noise hurts.
+    #   The bistable_oscillator (6 comps) showed +8% HPWL regression with SA —
+    #   raising from 5 to 6 auto-disables SA on that board class.
     # Large boards (≥50 comps): SA is 8-25x slower with diminishing returns.
-    sa_auto_disable_min_components: int = 5
+    sa_auto_disable_min_components: int = 6
     sa_auto_disable_max_components: int = 50
     # Spread floor: reject SA moves that collapse component spread below this
     # fraction of board dimensions.  Prevents the "SA crams everything into
@@ -52,6 +55,32 @@ class SAConfig:
     # At 0.10, a 100x80 board requires std_x ≥ 10mm AND std_y ≥ 8mm
     # (10% of each dimension) — components must span at least 2 sigma each way.
     spread_floor_fraction: float = 0.10
+
+    @classmethod
+    def from_config(cls, annealer_cfg, **overrides) -> "SAConfig":
+        """Build an SAConfig from an AnnealerConfig (loaded from config.json).
+
+        This makes config.json the single source of truth for SA tuning.
+        CLI overrides (max_iterations, reheat_count, etc.) take precedence
+        via ``overrides``.
+
+        Example::
+
+            cfg = load_config()
+            sa_config = SAConfig.from_config(cfg.annealer,
+                                              max_iterations=args.sa_iterations,
+                                              reheat_count=args.sa_reheat,
+                                              verbose=True,
+                                              skip_sa=args.no_sa)
+        """
+        import dataclasses
+        field_names = {f.name for f in dataclasses.fields(cls)}
+        kwargs = {}
+        for f in dataclasses.fields(annealer_cfg):
+            if f.name in field_names:
+                kwargs[f.name] = getattr(annealer_cfg, f.name)
+        kwargs.update(overrides)
+        return cls(**kwargs)
 
 
 def _compute_density(model: BoardModel) -> float:
@@ -587,6 +616,9 @@ def _greedy_refine(
 
         for idx in indices_to_process:
             comp = model.components[idx]
+            # Determine the cap-IC group for this component (just {idx} if not an IC).
+            group = get_group_indices(model, idx)
+            has_caps = len(group) > 1
             # Try nudges
             for dx_dir, dy_dir in directions:
                 for dist in nudge_distances:
@@ -594,37 +626,74 @@ def _greedy_refine(
                     base_cost = cost_state.normalized_cost
                     prev_overlap_count = cost_state.overlap_count
 
-                    comp.x += dx_dir * dist
-                    comp.y += dy_dir * dist
+                    if has_caps:
+                        # Move the whole group by the same delta (with board clamp).
+                        apply_delta_with_clamp(model, group, dx_dir * dist, dy_dir * dist)
+                    else:
+                        # No caps — direct move (preserves original greedy behavior).
+                        comp.x += dx_dir * dist
+                        comp.y += dy_dir * dist
 
-                    new_cost = cost_state.incremental_update({idx})
+                    new_cost = cost_state.incremental_update(group)
 
                     # Hard overlap rejection: greedy must not create new overlaps
                     if cost_state.overlap_count > prev_overlap_count:
-                        comp.x = old_x
-                        comp.y = old_y
-                        cost_state.incremental_update({idx})
+                        if has_caps:
+                            for gi in group:
+                                gc = model.components[gi]
+                                gc.x = old_x if gi == idx else gc.x - dx_dir * dist
+                                gc.y = old_y if gi == idx else gc.y - dy_dir * dist
+                        else:
+                            comp.x = old_x
+                            comp.y = old_y
+                        cost_state.incremental_update(group)
                         continue
 
                     if new_cost < base_cost - improve_threshold:
                         improved = True
                     else:
-                        comp.x = old_x
-                        comp.y = old_y
-                        cost_state.incremental_update({idx})
+                        if has_caps:
+                            for gi in group:
+                                gc = model.components[gi]
+                                gc.x = old_x if gi == idx else gc.x - dx_dir * dist
+                                gc.y = old_y if gi == idx else gc.y - dy_dir * dist
+                        else:
+                            comp.x = old_x
+                            comp.y = old_y
+                        cost_state.incremental_update(group)
 
-            # Try rotations
+            # Try rotations (IC only — caps don't rotate with the IC semantically,
+            # but their positions rotate around the IC's center to preserve group geometry).
             base_rot = comp.rotation
             for rot in config.greedy_rotations:
                 base_cost = cost_state.normalized_cost
                 prev_overlap_count = cost_state.overlap_count
+                if has_caps:
+                    # Capture pre-rotation cap positions and rotate them around IC center.
+                    cap_indices = [gi for gi in group if gi != idx]
+                    cap_pre_pos = {gi: (model.components[gi].x, model.components[gi].y)
+                                   for gi in cap_indices}
+                    ic_cx, ic_cy = comp.x, comp.y
+                    rad = math.radians(rot)
+                    cos_r = math.cos(rad)
+                    sin_r = -math.sin(rad)  # KiCad CW-positive
+                    for gi in cap_indices:
+                        gc = model.components[gi]
+                        ox = gc.x - ic_cx
+                        oy = gc.y - ic_cy
+                        gc.x = ic_cx + (ox * cos_r - oy * sin_r)
+                        gc.y = ic_cy + (ox * sin_r + oy * cos_r)
                 comp.set_rotation((base_rot + rot) % 360.0)
-                new_cost = cost_state.incremental_update({idx})
+                new_cost = cost_state.incremental_update(group)
 
                 # Hard overlap rejection for rotations too
                 if cost_state.overlap_count > prev_overlap_count:
                     comp.set_rotation(base_rot)
-                    cost_state.incremental_update({idx})
+                    if has_caps:
+                        for gi in cap_indices:
+                            gc = model.components[gi]
+                            gc.x, gc.y = cap_pre_pos[gi]
+                    cost_state.incremental_update(group)
                     continue
 
                 if new_cost < base_cost - improve_threshold:
@@ -632,7 +701,11 @@ def _greedy_refine(
                     base_rot = comp.rotation
                 else:
                     comp.set_rotation(base_rot)
-                    cost_state.incremental_update({idx})
+                    if has_caps:
+                        for gi in cap_indices:
+                            gc = model.components[gi]
+                            gc.x, gc.y = cap_pre_pos[gi]
+                    cost_state.incremental_update(group)
 
         cur_cost = cost_state.normalized_cost
         if cur_cost < best_sweep_cost:
@@ -1347,7 +1420,14 @@ def run_sa(
     # (everything crammed in one corner).  The per-move spread floor in
     # _run_sa_pass only guards SA moves, not the greedy refinement that
     # runs afterward — so we need this final check.
-    if not should_revert and config.spread_floor_fraction > 0 and not sa_was_auto_disabled:
+    #
+    # IMPORTANT: this revert must only fire when SA actually ran.  When
+    # skip_sa=True (user opted out of SA) or SA was auto-disabled, the
+    # greedy+swap+greedy path is deterministic and the spread floor is
+    # not a SA-specific pathology guard — firing here would silently
+    # revert good greedy output.  See test_sa_no_spread_floor_revert_when_skip_sa.
+    sa_actually_ran = (not config.skip_sa) and (not sa_was_auto_disabled)
+    if not should_revert and config.spread_floor_fraction > 0 and sa_actually_ran:
         if _violates_spread_floor(model, model.board, config.spread_floor_fraction):
             if config.verbose:
                 print(f"  Optimization reverted: spread floor violated "
@@ -1364,7 +1444,8 @@ def run_sa(
     # opposite corners, with the cluster ending up outside the board
     # outline).  The spread floor doesn't catch this because the
     # components ARE spread — just in the wrong location.
-    if not should_revert and not sa_was_auto_disabled:
+    # Same sa_actually_ran guard as the spread-floor revert above.
+    if not should_revert and sa_actually_ran:
         centroid_off = _centroid_offset(model, model.board)
         min_board_dim = min(model.board.width, model.board.height)
         centroid_threshold = 0.25 * min_board_dim  # 25% of min dimension
