@@ -1349,13 +1349,13 @@ def run_sa(
         if min_n > 0 and n_movable <= min_n:
             if config.verbose:
                 print(f"  Auto-disabling SA: {n_movable} movable components "
-                      f"(≤{min_n} threshold — greedy is near-optimal on tiny boards)")
+                      f"(<={min_n} threshold — greedy is near-optimal on tiny boards)")
             config.skip_sa = True
             sa_was_auto_disabled = True
         elif max_n > 0 and n_movable >= max_n:
             if config.verbose:
                 print(f"  Auto-disabling SA: {n_movable} movable components "
-                      f"(≥{max_n} threshold — SA too slow on large boards, "
+                      f"(>={max_n} threshold — SA too slow on large boards, "
                       f"greedy+legalize is the better default)")
             config.skip_sa = True
             sa_was_auto_disabled = True

@@ -25,6 +25,17 @@ def legalize(
     verbose: bool = False,
     interior_bbox: tuple[float, float, float, float] | None = None,
     use_abacus: bool = False,
+    # --- Adaptive params (plan.md §2-4) ---
+    max_bbox_expansions: int = 2,
+    push_apart_hard_cap: int = 1000,
+    spread_pass_enabled: bool = True,
+    bbox_expansion_factor: float = 0.05,
+    bbox_expansion_density_threshold: float = 0.75,
+    gradient_plateau_threshold: float = -0.5,
+    gradient_history_window: int = 20,
+    gradient_split: int = 10,
+    density_push_min: float = 0.5,
+    density_push_max: float = 1.5,
 ) -> BoardModel:
     rules = getattr(model, 'active_rules', None) or []
     cached_decap_map = _build_decoupling_map(model) if rules else {}
@@ -62,9 +73,76 @@ def legalize(
             else:
                 print("  Abacus left overlaps - falling through to push-apart + greedy")
 
-    # Step 3: Resolve overlaps (only if Abacus didn't fully resolve)
+    # Step 3: Resolve overlaps (only if Abacus didn't fully resolve).
+    # Adaptive loop: push-apart → if plateau, expand bbox → repeat up to
+    # max_bbox_expansions. Final fallthrough is greedy cleanup.
     if not abacus_success:
-        _resolve_overlaps(model, max_iterations, push_strength, grid_mm, verbose, interior_bbox, cached_decap_map, grid, keepouts=keepouts)
+        working_bbox = interior_bbox
+        expansion_round = 0
+        while True:
+            status = _resolve_overlaps(
+                model, max_iterations, push_strength, grid_mm, verbose,
+                working_bbox, cached_decap_map, grid, keepouts=keepouts,
+                hard_cap=push_apart_hard_cap,
+                plateau_threshold=gradient_plateau_threshold,
+                history_window=gradient_history_window,
+                history_split=gradient_split,
+                density_push_min=density_push_min,
+                density_push_max=density_push_max,
+            )
+
+            # Stop if converged or stalled (stalled → greedy cleanup later).
+            if status in ("converged", "stalled", "hard_cap", "max_iter"):
+                break
+
+            # status == 'plateau' — try expanding the bbox.
+            if expansion_round >= max_bbox_expansions:
+                if verbose:
+                    print(f"  bbox expansion cap reached ({max_bbox_expansions}), "
+                          f"accepting residual overlaps")
+                break
+
+            new_bbox = _maybe_expand_bbox(
+                model, working_bbox, model.board,
+                factor=bbox_expansion_factor,
+                density_threshold=bbox_expansion_density_threshold,
+                verbose=verbose,
+            )
+            if new_bbox is None:
+                if verbose:
+                    print("  No bbox expansion possible — accepting residual overlaps")
+                break
+
+            working_bbox = new_bbox
+            expansion_round += 1
+            # Re-enforce boundary with the expanded bbox so components
+            # can spread into the new region before the next push-apart.
+            _enforce_boundary(model, working_bbox, keepouts=keepouts)
+            grid.build(list(model.components))
+
+        # Persist the (possibly expanded) working bbox back to the caller's
+        # interior_bbox reference for downstream steps (boundary enforcement,
+        # cap nudge, post-legalize).
+        if working_bbox is not None:
+            interior_bbox = working_bbox
+
+    # Step 3.5: Anti-centroid spread pass (plan.md §4).
+    # IMPORTANT: only run the spread pass when the placement is already
+    # overlap-free. If push-apart left residual overlaps, the spread pass
+    # would push components into each other and the greedy cleanup can't
+    # always recover (especially for large IC↔IC overlaps where greedy
+    # can't push apart without crossing boundaries). When the placement
+    # is clean, the spread pass has room to operate without creating
+    # unresolvable overlaps.
+    if spread_pass_enabled:
+        pre_spread_overlaps, _ = _compute_overlap_stats(model, grid)
+        if pre_spread_overlaps == 0:
+            _spread_pass(model, interior_bbox, model.board, verbose=verbose)
+            _enforce_boundary(model, interior_bbox, keepouts=keepouts)
+            grid.build(list(model.components))
+        elif verbose:
+            print(f"  Skipping spread pass: {pre_spread_overlaps} overlaps "
+                  f"remain after push-apart (spread would worsen)")
 
     # Step 4: Greedy cleanup
     remaining, _ = _compute_overlap_stats(model, grid)
@@ -98,6 +176,24 @@ def legalize(
     from legalization.post_legalize import post_legalization_refine
     post_legalization_refine(model, grid_mm, interior_bbox, verbose, cached_decap_map)
 
+    # Step 9.5: Safety net — post_legalization_refine can re-introduce
+    # overlaps (its cell_slide and pair_swap operators are HPWL-driven,
+    # not overlap-aware). If it did, re-run greedy + boundary to clean
+    # them up. This catches the "WARNING: post-legalization refine
+    # introduced N overlaps" case that previously left overlaps in the
+    # final output.
+    grid.build(list(model.components))
+    refine_overlaps, _ = _compute_overlap_stats(model, grid)
+    if refine_overlaps > 0:
+        if verbose:
+            print(f"  Post-refine cleanup: {refine_overlaps} overlaps re-introduced, "
+                  f"running greedy + boundary")
+        _greedy_resolve(model, grid_mm, verbose, interior_bbox, cached_decap_map, grid, keepouts=keepouts)
+        _enforce_boundary(model, interior_bbox, keepouts=keepouts)
+        _snap_to_grid(model, grid_mm)
+        _enforce_boundary(model, interior_bbox, keepouts=keepouts)
+        grid.build(list(model.components))
+
     # Step 10: Cap-IC overlap cleanup.
     # _nudge_caps_to_ics above intentionally allows caps to overlap their own
     # IC (Phase 2 places the cap at IC center because the IC is excluded from
@@ -108,6 +204,37 @@ def legalize(
     # the overlap afterward.
     if rules:
         _cleanup_cap_ic_overlaps(model, cached_decap_map, interior_bbox, verbose)
+
+    # Step 10.1: Any-cap-IC overlap cleanup.
+    # Catches caps that overlap an IC they're NOT assigned to decouple
+    # (e.g. a +5V bulk cap drifted onto an FPGA during SA but shares no
+    # power rail, so it's not in the decap_map that Step 10 uses).
+    _cleanup_any_cap_ic_overlaps(model, interior_bbox, verbose)
+
+    # Step 10.5: Final safety net — if any overlaps remain (cap-IC cleanup
+    # couldn't find a slot, or post-refine cleanup couldn't resolve a large
+    # IC↔IC overlap), run one more greedy pass + boundary enforce. This is
+    # the last line of defense before returning the model to the user.
+    grid.build(list(model.components))
+    final_overlaps, _ = _compute_overlap_stats(model, grid)
+    if final_overlaps > 0:
+        if verbose:
+            print(f"  Final cleanup: {final_overlaps} overlaps remain, running final greedy")
+        _greedy_resolve(model, grid_mm, verbose, interior_bbox, cached_decap_map, grid, keepouts=keepouts)
+        _enforce_boundary(model, interior_bbox, keepouts=keepouts)
+        grid.build(list(model.components))
+
+    # Step 10.6: IC↔IC overlap emergency resolution.
+    # If two large ICs still overlap after all greedy passes, they're
+    # stuck in a corner where neither can be pushed away. Find the
+    # largest open space in the interior bbox and teleport one of them
+    # there. This is a last resort — it ignores HPWL — but a legal
+    # placement with bad HPWL is strictly better than an illegal one.
+    grid.build(list(model.components))
+    final_overlaps, _ = _compute_overlap_stats(model, grid)
+    if final_overlaps > 0:
+        _resolve_ic_ic_overlaps(model, interior_bbox, grid, verbose=verbose)
+        grid.build(list(model.components))
 
     if verbose:
         overlaps_after, _ = _compute_overlap_stats(model, grid)
@@ -541,7 +668,39 @@ def _resolve_overlaps(
     cached_decap_map: dict | None = None,
     grid: SpatialGrid | None = None,
     keepouts: list[BoardOutline] | None = None,
-) -> None:
+    *,
+    hard_cap: int | None = None,
+    plateau_threshold: float = -0.5,
+    history_window: int = 20,
+    history_split: int = 10,
+    density_push_min: float = 0.5,
+    density_push_max: float = 1.5,
+) -> str:
+    """Adaptive overlap resolution via HPWL-aware push-apart.
+
+    Augments the legacy fixed-iteration push-apart with three signals
+    (plan.md §2):
+
+      * **Gradient plateau detection** — track a rolling history of overlap
+        counts; when ``mean(last_n) - mean(prev_n) >= plateau_threshold``
+        and overlaps remain, stop early so the caller can expand the bbox
+        (or accept residual overlaps).
+      * **Hard-cap continuation** — when the gradient is still improving
+        (``< plateau_threshold``), iterations continue past
+        ``max_iterations`` up to ``hard_cap`` (default ``max(1000,
+        max_iterations)``).
+      * **Density-scaled push strength** — each pair's push strength is
+        scaled by ``density_push_min..density_push_max`` based on the
+        number of overlaps involving that pair, so heavy clusters get
+        pushed harder than isolated pairs.
+
+    Returns a status string so the caller can decide what to do next:
+      ``'converged'``   — overlaps reached 0
+      ``'plateau'``     — gradient plateaued with overlaps remaining
+      ``'stalled'``     — stall_iterations >= 20 (legacy signal)
+      ``'max_iter'``    — soft cap reached, gradient not improving
+      ``'hard_cap'``    — hard cap reached
+    """
     board = model.board
     prev_overlap_count = float("inf")
     stall_iterations = 0
@@ -554,7 +713,37 @@ def _resolve_overlaps(
     # inside every _compute_local_hpwl call.
     comp_map = {c.ref: c for c in model.components}
 
-    for iteration in range(max_iterations):
+    if hard_cap is None:
+        hard_cap = max(max_iterations, 1000)
+    # Defensive: never let hard_cap dip below max_iterations, or the loop
+    # would terminate before the soft cap is reached.
+    hard_cap = max(hard_cap, max_iterations)
+
+    history: list[int] = []
+    status: str = "max_iter"
+
+    iteration = 0
+    while iteration < hard_cap:
+        # Soft-cap check: once we've reached max_iterations, only continue
+        # if the gradient is still improving (below plateau_threshold).
+        if iteration >= max_iterations:
+            should_continue = False
+            if len(history) >= history_window:
+                split = min(history_split, len(history) // 2)
+                if split >= 1 and len(history) >= 2 * split:
+                    last_n = history[-split:]
+                    prev_n = history[-2 * split:-split]
+                    grad = sum(last_n) / len(last_n) - sum(prev_n) / len(prev_n)
+                    if grad < plateau_threshold:
+                        should_continue = True
+            if not should_continue:
+                status = "max_iter"
+                if verbose:
+                    remaining, _ = _compute_overlap_stats(model, grid)
+                    print(f"  Overlap resolution: max iterations ({max_iterations}) reached, "
+                          f"{remaining} overlaps remaining")
+                break
+
         overlap_pairs = []
         components = list(model.components)
         components.sort(key=lambda c: (c.x, c.y))
@@ -600,6 +789,7 @@ def _resolve_overlaps(
         if overlap_count == 0:
             if verbose:
                 print(f"  Overlap resolution converged in {iteration + 1} iterations")
+            status = "converged"
             break
 
         overlap_pairs.sort(key=lambda x: x[0])
@@ -614,9 +804,18 @@ def _resolve_overlaps(
 
             local_before = _count_pair_overlaps_involving(c1, c2, components, grid)
 
+            # Density-scaled push strength (plan.md §2): components in
+            # high-overlap zones get a stronger push; isolated pairs get
+            # a gentler nudge. local_before counts overlaps involving
+            # c1 or c2 (excluding their mutual overlap).
+            density_scale = density_push_min + (
+                density_push_max - density_push_min
+            ) * min(1.0, max(0, local_before) / 5.0)
+            pair_strength = adaptive_strength * density_scale
+
             _push_apart_hpwl(
                 c1, c2, components, comp_net_lookup, model,
-                adaptive_strength, grid_mm, board, interior_bbox,
+                pair_strength, grid_mm, board, interior_bbox,
                 comp_map=comp_map, keepouts=keepouts,
                 grid=grid, comp_to_idx=comp_to_idx,
             )
@@ -645,7 +844,7 @@ def _resolve_overlaps(
 
                 _push_apart_hpwl(
                     c1, c2, components, comp_net_lookup, model,
-                    adaptive_strength, grid_mm, board, interior_bbox,
+                    pair_strength, grid_mm, board, interior_bbox,
                     comp_map=comp_map,
                     grid=grid, comp_to_idx=comp_to_idx,
                 )
@@ -663,7 +862,7 @@ def _resolve_overlaps(
 
                 _push_apart_hpwl(
                     c1, c2, components, comp_net_lookup, model,
-                    adaptive_strength * 0.5, grid_mm, board, interior_bbox,
+                    pair_strength * 0.5, grid_mm, board, interior_bbox,
                     comp_map=comp_map,
                     grid=grid, comp_to_idx=comp_to_idx,
                 )
@@ -682,6 +881,11 @@ def _resolve_overlaps(
         _enforce_boundary(model, interior_bbox, keepouts=keepouts)
         actual_overlap_count, _ = _compute_overlap_stats(model, grid)
 
+        # Track overlap history for gradient computation (plan.md §2).
+        history.append(actual_overlap_count)
+        if len(history) > history_window:
+            history.pop(0)
+
         if actual_overlap_count >= prev_overlap_count:
             stall_iterations += 1
             if stall_iterations >= 8:
@@ -695,18 +899,42 @@ def _resolve_overlaps(
         if actual_overlap_count == 0:
             if verbose:
                 print(f"  Overlap resolution converged in {iteration + 1} iterations")
+            status = "converged"
             break
+
+        # Gradient-based plateau detection (plan.md §2). When the recent
+        # overlap-count slope flattens (>= plateau_threshold) and overlaps
+        # remain, signal the caller to expand the bbox (or accept residuals).
+        if len(history) >= history_window:
+            split = min(history_split, len(history) // 2)
+            if split >= 1 and len(history) >= 2 * split:
+                last_n = history[-split:]
+                prev_n = history[-2 * split:-split]
+                grad = sum(last_n) / len(last_n) - sum(prev_n) / len(prev_n)
+                if grad >= plateau_threshold:
+                    if verbose:
+                        print(f"  Push-apart plateau at iteration {iteration + 1} "
+                              f"(gradient={grad:.2f}, {actual_overlap_count} overlaps remaining)")
+                    status = "plateau"
+                    break
 
         if stall_iterations >= 20:
             if verbose:
                 print(f"  Push-apart stalled at iteration {iteration + 1} "
                       f"({actual_overlap_count} overlaps remaining, switching to greedy)")
+            status = "stalled"
             break
+
+        iteration += 1
     else:
+        # while loop completed without break → hit hard_cap.
+        status = "hard_cap"
         if verbose:
             remaining, _ = _compute_overlap_stats(model, grid)
-            print(f"  Overlap resolution: max iterations ({max_iterations}) reached, "
+            print(f"  Overlap resolution: hard cap ({hard_cap}) reached, "
                   f"{remaining} overlaps remaining")
+
+    return status
 
 
 def _greedy_resolve(
@@ -1630,6 +1858,308 @@ def _cleanup_cap_ic_overlaps(
               + (f", {unresolved} still overlapping (no free adjacent slot)" if unresolved else ""))
 
 
+def _cleanup_any_cap_ic_overlaps(
+    model: BoardModel,
+    interior_bbox: tuple[float, float, float, float] | None = None,
+    verbose: bool = False,
+) -> None:
+    """Move any capacitor that overlaps ANY IC to a free adjacent slot.
+
+    Unlike ``_cleanup_cap_ic_overlaps`` (which only handles caps assigned
+    to an IC via the decoupling_proximity rule), this pass catches caps
+    that overlap an IC they're NOT decoupling — e.g. a +5V bulk cap that
+    drifted on top of an FPGA during SA, but shares no power rail with
+    it so it's not in the decap map.
+
+    The algorithm is the same 8-direction slot search as
+    ``_cleanup_cap_ic_overlaps``, but the "IC" is whichever IC the cap
+    currently overlaps (not necessarily its assigned IC).
+    """
+    board = model.board
+    components = list(model.components)
+    ic_types = {"ic", "mcu", "regulator"}
+    caps = [c for c in components
+            if getattr(c, "component_type", "") == "capacitor"
+            and not c.is_fixed and not c.is_edge_connector]
+    ics = [c for c in components if getattr(c, "component_type", "") in ic_types]
+
+    if not caps or not ics:
+        return
+
+    def _bbox_center_for_origin(cap, target_cx, target_cy, rotation):
+        rad = math.radians(rotation)
+        cos_r = math.cos(rad)
+        sin_r = math.sin(rad)
+        new_x = target_cx - cap.bbox_offset_x * cos_r + cap.bbox_offset_y * sin_r
+        new_y = target_cy - cap.bbox_offset_x * sin_r - cap.bbox_offset_y * cos_r
+        return new_x, new_y
+
+    def _slot_overlap_free(cap, trial_x, trial_y) -> bool:
+        half_w = cap.effective_width / 2.0
+        half_h = cap.effective_height / 2.0
+        if interior_bbox:
+            x_min = interior_bbox[0] + half_w
+            x_max = interior_bbox[2] - half_w
+            y_min = interior_bbox[1] + half_h
+            y_max = interior_bbox[3] - half_h
+        else:
+            x_min = board.x_min + half_w
+            x_max = board.x_max - half_w
+            y_min = board.y_min + half_h
+            y_max = board.y_max - half_h
+        if not (x_min <= trial_x <= x_max and y_min <= trial_y <= y_max):
+            return False
+        saved_x, saved_y = cap.x, cap.y
+        cap.x = trial_x
+        cap.y = trial_y
+        try:
+            for other in components:
+                if other is cap or other.is_fixed:
+                    continue
+                if cap.overlaps(other):
+                    return False
+            return True
+        finally:
+            cap.x = saved_x
+            cap.y = saved_y
+
+    moved = 0
+    unresolved = 0
+    for cap in caps:
+        # Find any IC this cap overlaps.
+        overlapping_ic = None
+        for ic in ics:
+            if cap.overlaps(ic):
+                overlapping_ic = ic
+                break
+        if overlapping_ic is None:
+            continue
+
+        ic = overlapping_ic
+        ic_bbox = ic.bbox
+        ic_bbox_cx = (ic_bbox[0] + ic_bbox[2]) / 2.0
+        ic_bbox_cy = (ic_bbox[1] + ic_bbox[3]) / 2.0
+
+        cap_start_x, cap_start_y = cap.x, cap.y
+        cap_start_rot = cap.rotation
+        rotations = [cap_start_rot]
+        if _is_non_square(cap):
+            rotations.append((cap_start_rot + 90) % 360)
+
+        best: tuple[float, float, float, float] | None = None
+
+        for try_rot in rotations:
+            if try_rot != cap_start_rot:
+                cap.set_rotation(try_rot)
+
+            cap_half_w = cap.effective_width / 2.0
+            cap_half_h = cap.effective_height / 2.0
+
+            for spacing_mult in [1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0]:
+                gap = 0.5 * spacing_mult
+                right_cx = ic_bbox[2] + gap + cap_half_w
+                left_cx = ic_bbox[0] - gap - cap_half_w
+                below_cy = ic_bbox[3] + gap + cap_half_h
+                above_cy = ic_bbox[1] - gap - cap_half_h
+
+                candidates_origin = [
+                    _bbox_center_for_origin(cap, right_cx, ic_bbox_cy, try_rot),
+                    _bbox_center_for_origin(cap, left_cx, ic_bbox_cy, try_rot),
+                    _bbox_center_for_origin(cap, ic_bbox_cx, below_cy, try_rot),
+                    _bbox_center_for_origin(cap, ic_bbox_cx, above_cy, try_rot),
+                    _bbox_center_for_origin(cap, right_cx, below_cy, try_rot),
+                    _bbox_center_for_origin(cap, left_cx, below_cy, try_rot),
+                    _bbox_center_for_origin(cap, right_cx, above_cy, try_rot),
+                    _bbox_center_for_origin(cap, left_cx, above_cy, try_rot),
+                ]
+
+                for cand_x, cand_y in candidates_origin:
+                    if not _slot_overlap_free(cap, cand_x, cand_y):
+                        continue
+                    dist = math.hypot(ic.x - cand_x, ic.y - cand_y)
+                    if (best is None or dist < best[3]
+                            or (dist == best[3]
+                                and try_rot == cap_start_rot
+                                and best[2] != cap_start_rot)):
+                        best = (cand_x, cand_y, try_rot, dist)
+                    break
+                if best is not None:
+                    break
+
+            cap.x, cap.y = cap_start_x, cap_start_y
+            if try_rot != cap_start_rot:
+                cap.set_rotation(cap_start_rot)
+
+        if best is not None:
+            cap.x = best[0]
+            cap.y = best[1]
+            if cap.rotation != best[2]:
+                cap.set_rotation(best[2])
+            moved += 1
+        else:
+            unresolved += 1
+
+    if verbose and (moved or unresolved):
+        print(f"  Any-cap-IC overlap cleanup: moved {moved} caps off non-assigned ICs"
+              + (f", {unresolved} still overlapping (no free adjacent slot)" if unresolved else ""))
+
+
+def _resolve_ic_ic_overlaps(
+    model: BoardModel,
+    interior_bbox: tuple[float, float, float, float] | None,
+    grid: SpatialGrid,
+    *,
+    verbose: bool = False,
+) -> None:
+    """Emergency IC↔IC overlap resolution.
+
+    When two large ICs overlap after all greedy passes, they're usually
+    stuck against a boundary or corner where neither can be pushed
+    apart. This function:
+
+      1. Finds all IC↔IC overlap pairs.
+      2. For each pair, identifies the IC with fewer net-neighbors
+         nearby (the "movable" one — moving it disrupts fewer nets).
+      3. Searches the interior bbox on a coarse grid for the largest
+         open space that can fit the movable IC.
+      4. Teleports the movable IC there.
+
+    This is a last-resort pass — it ignores HPWL — but a legal
+    placement with bad HPWL is strictly better than an illegal one.
+    """
+    board = model.board
+    ic_types = {"ic", "mcu", "regulator"}
+    ics = [c for c in model.components
+           if getattr(c, "component_type", "") in ic_types
+           and not c.is_fixed and not c.is_edge_connector]
+
+    if len(ics) < 2:
+        return
+
+    if interior_bbox is not None:
+        rx_min, ry_min, rx_max, ry_max = interior_bbox
+    else:
+        rx_min, ry_min, rx_max, ry_max = (
+            board.x_min, board.y_min, board.x_max, board.y_max,
+        )
+
+    components = list(model.components)
+
+    def _count_overlaps_for(comp: Component) -> int:
+        """Count overlaps involving comp."""
+        n = 0
+        for other in components:
+            if other is comp or other.is_fixed:
+                continue
+            if comp.overlaps(other):
+                n += 1
+        return n
+
+    def _slot_overlap_free(comp: Component, trial_x: float, trial_y: float,
+                           exclude: set[int] | None = None) -> bool:
+        """Return True if comp at (trial_x, trial_y) overlaps nothing."""
+        half_w = comp.effective_width / 2.0
+        half_h = comp.effective_height / 2.0
+        x_min = rx_min + half_w
+        x_max = rx_max - half_w
+        y_min = ry_min + half_h
+        y_max = ry_max - half_h
+        if not (x_min <= trial_x <= x_max and y_min <= trial_y <= y_max):
+            return False
+        saved_x, saved_y = comp.x, comp.y
+        comp.x = trial_x
+        comp.y = trial_y
+        try:
+            for other in components:
+                if other is comp or other.is_fixed:
+                    continue
+                if exclude is not None and id(other) in exclude:
+                    continue
+                if comp.overlaps(other):
+                    return False
+            return True
+        finally:
+            comp.x = saved_x
+            comp.y = saved_y
+
+    moved = 0
+    for i, ic1 in enumerate(ics):
+        for ic2 in ics[i+1:]:
+            if not ic1.overlaps(ic2):
+                continue
+
+            # Pick the smaller IC to move (less disruption, easier to fit).
+            area1 = ic1.effective_width * ic1.effective_height
+            area2 = ic2.effective_width * ic2.effective_height
+            mover = ic1 if area1 <= area2 else ic2
+            stayer = ic2 if mover is ic1 else ic1
+
+            # Also propagate the mover's caps (cap-IC atomic group).
+            # Build the set of components that should move together.
+            mover_group = {mover}
+            # Use the decap map to find caps assigned to this IC.
+            rules = getattr(model, 'active_rules', None) or []
+            if rules:
+                try:
+                    decap_map = _build_decoupling_map(model)
+                    for cap_ref in decap_map.get(mover.ref, []):
+                        cap = model.get_component(cap_ref)
+                        if cap and not cap.is_fixed:
+                            mover_group.add(cap)
+                except Exception:
+                    pass
+
+            # Search for a free slot on a coarse grid.
+            # Step size = mover's largest dimension + 2mm gap.
+            step = max(mover.effective_width, mover.effective_height) + 2.0
+            half_w = mover.effective_width / 2.0
+            half_h = mover.effective_height / 2.0
+
+            best_slot: tuple[float, float] | None = None
+            best_dist = float("inf")
+
+            # Original mover centroid (for distance tie-breaker).
+            orig_x, orig_y = mover.x, mover.y
+
+            # Scan the interior bbox on a coarse grid.
+            x = rx_min + half_w
+            while x <= rx_max - half_w:
+                y = ry_min + half_h
+                while y <= ry_max - half_h:
+                    if _slot_overlap_free(mover, x, y,
+                                          exclude={id(c) for c in mover_group}):
+                        dist = math.hypot(x - orig_x, y - orig_y)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_slot = (x, y)
+                    y += step
+                x += step
+
+            if best_slot is not None:
+                # Move the entire group by the delta.
+                dx = best_slot[0] - mover.x
+                dy = best_slot[1] - mover.y
+                for comp in mover_group:
+                    new_x = comp.x + dx
+                    new_y = comp.y + dy
+                    # Clamp to interior bbox.
+                    cw = comp.effective_width / 2.0
+                    ch = comp.effective_height / 2.0
+                    new_x = max(rx_min + cw, min(new_x, rx_max - cw))
+                    new_y = max(ry_min + ch, min(new_y, ry_max - ch))
+                    comp.x = new_x
+                    comp.y = new_y
+                moved += 1
+                if verbose:
+                    print(f"  IC↔IC emergency: moved {mover.ref} "
+                          f"({mover.effective_width:.1f}x{mover.effective_height:.1f}mm) "
+                          f"by ({dx:.1f},{dy:.1f})mm to resolve overlap with {stayer.ref}")
+            else:
+                if verbose:
+                    print(f"  IC↔IC emergency: could not find free slot for "
+                          f"{mover.ref} (overlaps {stayer.ref}) — overlap remains")
+
+
 def _count_overlaps(model: BoardModel) -> int:
     count, _ = _compute_overlap_stats(model)
     return count
@@ -1650,3 +2180,256 @@ def _count_oob(model: BoardModel) -> int:
 def _compute_total_overlap_area(model: BoardModel) -> float:
     _, total_area = _compute_overlap_stats(model)
     return total_area
+
+
+# =============================================================================
+# Adaptive bbox expansion + anti-centroid spread (plan.md §3-4)
+# =============================================================================
+
+def _maybe_expand_bbox(
+    model: BoardModel,
+    interior_bbox: tuple[float, float, float, float] | None,
+    board: BoardOutline,
+    *,
+    factor: float = 0.05,
+    density_threshold: float = 0.75,
+    margin: float = 1.0,
+    verbose: bool = False,
+) -> tuple[float, float, float, float] | None:
+    """Grow the working interior bbox when push-apart has stalled.
+
+    Plan.md §3: when push-apart plateaus with overlaps remaining and the
+    interior components occupy less than ``density_threshold`` of the
+    board area, expand the interior bbox by ``factor`` (default +5%)
+    toward the board outline, clamped so the bbox never crosses the
+    outline minus ``margin``.
+
+    Returns the new bbox tuple if expansion was performed, or ``None``
+    if expansion was not warranted (already dense, or no room to grow).
+    """
+    if interior_bbox is None:
+        return None
+
+    bx_min, by_min, bx_max, by_max = interior_bbox
+    bbox_w = max(0.0, bx_max - bx_min)
+    bbox_h = max(0.0, by_max - by_min)
+    bbox_area = bbox_w * bbox_h
+    board_area = max(1.0, board.width * board.height)
+
+    # Density = used component area / bbox area (how packed the current
+    # bbox is). We then check whether the bbox itself is small relative
+    # to the board (i.e. there's room to grow without crossing the
+    # board outline).
+    used_area = 0.0
+    for c in model.components:
+        if c.is_fixed or c.is_edge_connector:
+            continue
+        used_area += c.effective_width * c.effective_height
+
+    bbox_density = used_area / max(1.0, bbox_area)
+    board_density = bbox_area / board_area
+
+    if verbose:
+        print(f"  bbox expand check: bbox_density={bbox_density:.2f} "
+              f"bbox/board={board_density:.2f} (threshold={density_threshold})")
+
+    # Only expand if the current bbox is small relative to the board
+    # (i.e. there's headroom toward the outline) AND the bbox is
+    # actually packed (otherwise we'd just spread empty space).
+    if board_density >= density_threshold:
+        return None
+    if bbox_density < 0.30:
+        # Not actually packed — expansion won't help.
+        return None
+
+    # Compute expansion delta = factor * board dimension, clamped so we
+    # never cross (board outline - margin).
+    expand_x = factor * board.width
+    expand_y = factor * board.height
+
+    new_x_min = max(board.x_min + margin, bx_min - expand_x)
+    new_y_min = max(board.y_min + margin, by_min - expand_y)
+    new_x_max = min(board.x_max - margin, bx_max + expand_x)
+    new_y_max = min(board.y_max - margin, by_max + expand_y)
+
+    # No movement → no expansion.
+    if (new_x_min >= bx_min - 1e-6 and new_y_min >= by_min - 1e-6
+            and new_x_max <= bx_max + 1e-6 and new_y_max <= by_max + 1e-6):
+        if verbose:
+            print("  bbox expand: no room to grow (already at board outline)")
+        return None
+
+    new_bbox = (new_x_min, new_y_min, new_x_max, new_y_max)
+    if verbose:
+        print(f"  bbox expand: ({bx_min:.1f},{by_min:.1f},{bx_max:.1f},{by_max:.1f}) "
+              f"-> ({new_x_min:.1f},{new_y_min:.1f},{new_x_max:.1f},{new_y_max:.1f})")
+    return new_bbox
+
+
+def _spread_pass(
+    model: BoardModel,
+    interior_bbox: tuple[float, float, float, float] | None,
+    board: BoardOutline,
+    *,
+    verbose: bool = False,
+    max_step_fraction: float = 0.10,
+) -> None:
+    """Anti-centroid spread pass (plan.md §4).
+
+    After push-apart converges, components often remain clustered in
+    the board's center because push-apart only resolves *overlaps* —
+    it has no incentive to use underutilized board regions. This pass:
+
+      1. Computes component density per quadrant (4 quadrants + center).
+         When the interior bbox is offset from the board center, we use
+         the interior bbox's quadrants (since components are clamped to
+         the bbox, using board quadrants would attempt moves the clamp
+         would block, creating overlaps without spread).
+      2. Identifies the densest and sparsest quadrants.
+      3. Applies a gentle force vector to each movable component in the
+         densest quadrant, pulling it toward the sparsest quadrant's
+         centroid. The force is scaled by the density gap so a near-
+         uniform distribution isn't disturbed.
+
+    The pass is a single iteration — no recursion. Components are
+    clamped to the interior bbox (or board outline if no bbox) so they
+    can't escape the legal region. This intentionally does NOT enforce
+    non-overlap; the legalizer's greedy resolver runs afterward to
+    clean up any overlaps the spread creates.
+    """
+    movable = [
+        c for c in model.components
+        if not c.is_fixed and not c.is_edge_connector
+    ]
+    if len(movable) < 4:
+        return  # not enough components to bother
+
+    # Clamp region (interior bbox if given, else board with margin).
+    if interior_bbox is not None:
+        rx_min, ry_min, rx_max, ry_max = interior_bbox
+    else:
+        rx_min, ry_min, rx_max, ry_max = (
+            board.x_min, board.y_min, board.x_max, board.y_max,
+        )
+
+    cx = (rx_min + rx_max) / 2.0
+    cy = (ry_min + ry_max) / 2.0
+    half_w = (rx_max - rx_min) / 2.0
+    half_h = (ry_max - ry_min) / 2.0
+
+    # 5 regions: TL, TR, BL, BR, Center.
+    regions = {
+        "TL": {"count": 0, "sx": 0.0, "sy": 0.0},
+        "TR": {"count": 0, "sx": 0.0, "sy": 0.0},
+        "BL": {"count": 0, "sx": 0.0, "sy": 0.0},
+        "BR": {"count": 0, "sx": 0.0, "sy": 0.0},
+        "C":  {"count": 0, "sx": 0.0, "sy": 0.0},
+    }
+    for c in movable:
+        # Center band: within 10% of region half-dim from region center.
+        if (abs(c.x - cx) < 0.10 * half_w) and (abs(c.y - cy) < 0.10 * half_h):
+            key = "C"
+        elif c.x < cx and c.y < cy:
+            key = "BL"
+        elif c.x < cx and c.y >= cy:
+            key = "TL"
+        elif c.x >= cx and c.y < cy:
+            key = "BR"
+        else:
+            key = "TR"
+        regions[key]["count"] += 1
+        regions[key]["sx"] += c.x
+        regions[key]["sy"] += c.y
+
+    # Compute density (count / total movable) per region.
+    total = float(len(movable))
+    for r in regions.values():
+        r["density"] = r["count"] / total
+        if r["count"] > 0:
+            r["centroid"] = (r["sx"] / r["count"], r["sy"] / r["count"])
+        else:
+            r["centroid"] = (cx, cy)
+
+    # Find densest non-empty and sparsest regions.
+    sorted_regions = sorted(regions.items(), key=lambda kv: kv[1]["density"])
+    sparsest_name, sparsest = sorted_regions[0]
+    densest_name, densest = sorted_regions[-1]
+
+    # If distribution is already near-uniform, do nothing.
+    density_gap = densest["density"] - sparsest["density"]
+    if density_gap < 0.10:
+        if verbose:
+            print(f"  spread pass: distribution near-uniform "
+                  f"(gap={density_gap:.2f}), skipping")
+        return
+
+    # If sparsest region is empty, target the sparsest quadrant's
+    # geometric centroid (rather than (0,0) which would pull toward a
+    # corner).
+    if sparsest["count"] == 0:
+        region_geometric = {
+            "TL": (rx_min + (rx_max - rx_min) * 0.25, ry_min + (ry_max - ry_min) * 0.75),
+            "TR": (rx_min + (rx_max - rx_min) * 0.75, ry_min + (ry_max - ry_min) * 0.75),
+            "BL": (rx_min + (rx_max - rx_min) * 0.25, ry_min + (ry_max - ry_min) * 0.25),
+            "BR": (rx_min + (rx_max - rx_min) * 0.75, ry_min + (ry_max - ry_min) * 0.25),
+            "C":  (cx, cy),
+        }
+        target_x, target_y = region_geometric[sparsest_name]
+    else:
+        target_x, target_y = sparsest["centroid"]
+
+    # Apply gentle pull to components in the densest region.
+    # Step size is capped at max_step_fraction of the region dimension so
+    # we don't yank components across the region.
+    max_step = max_step_fraction * max(rx_max - rx_min, ry_max - ry_min)
+    step = max_step * density_gap  # scale by how imbalanced the region is
+    step = max(0.5, min(max_step, step))
+
+    moved = 0
+    for c in movable:
+        # Determine which region this component is in.
+        if (abs(c.x - cx) < 0.10 * half_w
+                and abs(c.y - cy) < 0.10 * half_h):
+            in_region = "C"
+        elif c.x < cx and c.y < cy:
+            in_region = "BL"
+        elif c.x < cx and c.y >= cy:
+            in_region = "TL"
+        elif c.x >= cx and c.y < cy:
+            in_region = "BR"
+        else:
+            in_region = "TR"
+
+        if in_region != densest_name:
+            continue
+
+        # Pull toward sparsest region's centroid.
+        dx = target_x - c.x
+        dy = target_y - c.y
+        dist = math.hypot(dx, dy)
+        if dist < 1e-3:
+            continue
+        ux, uy = dx / dist, dy / dist
+
+        # Cap the move so we don't overshoot into the sparsest region.
+        move = min(step, dist * 0.5)
+
+        new_x = c.x + ux * move
+        new_y = c.y + uy * move
+
+        # Clamp to legal region.
+        half_w_c = c.effective_width / 2.0
+        half_h_c = c.effective_height / 2.0
+        new_x = max(rx_min + half_w_c, min(new_x, rx_max - half_w_c))
+        new_y = max(ry_min + half_h_c, min(new_y, ry_max - half_h_c))
+
+        if abs(new_x - c.x) > 1e-3 or abs(new_y - c.y) > 1e-3:
+            c.x = new_x
+            c.y = new_y
+            moved += 1
+
+    if verbose and moved:
+        print(f"  spread pass: moved {moved} components from {densest_name} "
+              f"(density={densest['density']:.2f}) toward {sparsest_name} "
+              f"(density={sparsest['density']:.2f}, step={step:.2f}mm)")
+

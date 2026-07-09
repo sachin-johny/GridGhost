@@ -270,7 +270,17 @@ def cmd_place(args) -> None:
     legalize(model, grid_mm=lcfg.grid_mm, max_iterations=adaptive_max_iter,
              push_strength=lcfg.push_strength, verbose=True,
              use_abacus=True,
-             interior_bbox=interior_bbox)
+             interior_bbox=interior_bbox,
+             max_bbox_expansions=lcfg.max_bbox_expansions,
+             push_apart_hard_cap=lcfg.push_apart_hard_cap,
+             spread_pass_enabled=lcfg.spread_pass_enabled,
+             bbox_expansion_factor=lcfg.bbox_expansion_factor,
+             bbox_expansion_density_threshold=lcfg.bbox_expansion_density_threshold,
+             gradient_plateau_threshold=lcfg.gradient_plateau_threshold,
+             gradient_history_window=lcfg.gradient_history_window,
+             gradient_split=lcfg.gradient_split,
+             density_push_min=lcfg.density_push_min,
+             density_push_max=lcfg.density_push_max)
     print_board_summary(model, "After Legalization")
 
     # Step 7.5: Post-legalization overlap resolution
@@ -334,6 +344,28 @@ def cmd_place(args) -> None:
         from legalization.post_legalize import post_legalization_refine
         post_legalization_refine(
             model, lcfg.grid_mm, interior_bbox, True, final_decap_map)
+
+        # Safety net: post_legalization_refine can re-introduce overlaps
+        # (its cell_slide and pair_swap are HPWL-driven, not overlap-aware).
+        # If it did, run one more greedy + any-cap-IC + IC-IC cleanup pass.
+        from legalization.legalizer import (
+            _greedy_resolve as _cli_greedy_resolve,
+            _cleanup_any_cap_ic_overlaps, _resolve_ic_ic_overlaps,
+            _enforce_boundary, _compute_overlap_stats,
+        )
+        from legalization.spatial_grid import SpatialGrid
+        _grid = SpatialGrid.from_components(list(model.components), model.board)
+        _grid.build(list(model.components))
+        _post_refine_overlaps, _ = _compute_overlap_stats(model, _grid)
+        if _post_refine_overlaps > 0:
+            print(f"  Post-refine safety net: {_post_refine_overlaps} overlaps "
+                  f"re-introduced by HPWL recovery, running final cleanup")
+            _cli_greedy_resolve(model, lcfg.grid_mm, True, interior_bbox)
+            _enforce_boundary(model, interior_bbox)
+            _cleanup_any_cap_ic_overlaps(model, interior_bbox, verbose=True)
+            _grid.build(list(model.components))
+            _resolve_ic_ic_overlaps(model, interior_bbox, _grid, verbose=True)
+            _enforce_boundary(model, interior_bbox)
 
     # Step 8: Final cost evaluation
     costs_after = cost_fn.evaluate(model)

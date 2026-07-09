@@ -56,7 +56,17 @@ def place_board(pcb_path: str, profile_name: str = "auto", use_sa: bool = True, 
 
     legalize(model, grid_mm=cfg.legalization.grid_mm, max_iterations=800,
              push_strength=cfg.legalization.push_strength, verbose=False,
-             use_abacus=True, interior_bbox=ib)
+             use_abacus=True, interior_bbox=ib,
+             max_bbox_expansions=cfg.legalization.max_bbox_expansions,
+             push_apart_hard_cap=cfg.legalization.push_apart_hard_cap,
+             spread_pass_enabled=cfg.legalization.spread_pass_enabled,
+             bbox_expansion_factor=cfg.legalization.bbox_expansion_factor,
+             bbox_expansion_density_threshold=cfg.legalization.bbox_expansion_density_threshold,
+             gradient_plateau_threshold=cfg.legalization.gradient_plateau_threshold,
+             gradient_history_window=cfg.legalization.gradient_history_window,
+             gradient_split=cfg.legalization.gradient_split,
+             density_push_min=cfg.legalization.density_push_min,
+             density_push_max=cfg.legalization.density_push_max)
 
     return model, profile
 
