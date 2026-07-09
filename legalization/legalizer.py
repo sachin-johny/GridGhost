@@ -224,16 +224,17 @@ def legalize(
         _enforce_boundary(model, interior_bbox, keepouts=keepouts)
         grid.build(list(model.components))
 
-    # Step 10.6: IC↔IC overlap emergency resolution.
-    # If two large ICs still overlap after all greedy passes, they're
-    # stuck in a corner where neither can be pushed away. Find the
-    # largest open space in the interior bbox and teleport one of them
-    # there. This is a last resort — it ignores HPWL — but a legal
-    # placement with bad HPWL is strictly better than an illegal one.
+    # Step 10.6: Large-overlap emergency resolution.
+    # If two large components (IC↔IC, or large cap↔IC) still overlap
+    # after all greedy passes, they're stuck in a corner where neither
+    # can be pushed away. Find the largest open space in the interior
+    # bbox and teleport the smaller one there. This is a last resort —
+    # it ignores HPWL — but a legal placement with bad HPWL is strictly
+    # better than an illegal one.
     grid.build(list(model.components))
     final_overlaps, _ = _compute_overlap_stats(model, grid)
     if final_overlaps > 0:
-        _resolve_ic_ic_overlaps(model, interior_bbox, grid, verbose=verbose)
+        _resolve_large_overlaps(model, interior_bbox, grid, verbose=verbose)
         grid.build(list(model.components))
 
     if verbose:
@@ -2004,37 +2005,30 @@ def _cleanup_any_cap_ic_overlaps(
               + (f", {unresolved} still overlapping (no free adjacent slot)" if unresolved else ""))
 
 
-def _resolve_ic_ic_overlaps(
+def _resolve_large_overlaps(
     model: BoardModel,
     interior_bbox: tuple[float, float, float, float] | None,
     grid: SpatialGrid,
     *,
     verbose: bool = False,
+    min_overlap_area: float = 5.0,
 ) -> None:
-    """Emergency IC↔IC overlap resolution.
+    """Emergency resolver for large stuck overlaps.
 
-    When two large ICs overlap after all greedy passes, they're usually
-    stuck against a boundary or corner where neither can be pushed
-    apart. This function:
+    Handles three cases that greedy push-apart can't resolve:
+      1. IC↔IC overlaps (both components large, no room to push apart)
+      2. Large cap↔IC overlaps (cap drifted onto a non-assigned IC
+         during SA, too big for the 8-direction slot search)
+      3. Cap↔cap clusters (multiple caps piled at the same spot)
 
-      1. Finds all IC↔IC overlap pairs.
-      2. For each pair, identifies the IC with fewer net-neighbors
-         nearby (the "movable" one — moving it disrupts fewer nets).
-      3. Searches the interior bbox on a coarse grid for the largest
-         open space that can fit the movable IC.
-      4. Teleports the movable IC there.
-
-    This is a last-resort pass — it ignores HPWL — but a legal
-    placement with bad HPWL is strictly better than an illegal one.
+    For each overlap pair with area >= min_overlap_area, picks the
+    smaller component, searches the interior bbox on a coarse grid for
+    the largest open slot that fits it, and teleports it there.
+    Ignores HPWL — a legal placement with bad HPWL is strictly better
+    than an illegal one.
     """
     board = model.board
     ic_types = {"ic", "mcu", "regulator"}
-    ics = [c for c in model.components
-           if getattr(c, "component_type", "") in ic_types
-           and not c.is_fixed and not c.is_edge_connector]
-
-    if len(ics) < 2:
-        return
 
     if interior_bbox is not None:
         rx_min, ry_min, rx_max, ry_max = interior_bbox
@@ -2044,16 +2038,6 @@ def _resolve_ic_ic_overlaps(
         )
 
     components = list(model.components)
-
-    def _count_overlaps_for(comp: Component) -> int:
-        """Count overlaps involving comp."""
-        n = 0
-        for other in components:
-            if other is comp or other.is_fixed:
-                continue
-            if comp.overlaps(other):
-                n += 1
-        return n
 
     def _slot_overlap_free(comp: Component, trial_x: float, trial_y: float,
                            exclude: set[int] | None = None) -> bool:
@@ -2082,83 +2066,141 @@ def _resolve_ic_ic_overlaps(
             comp.x = saved_x
             comp.y = saved_y
 
-    moved = 0
-    for i, ic1 in enumerate(ics):
-        for ic2 in ics[i+1:]:
-            if not ic1.overlaps(ic2):
+    # Build decap map for cap-IC group movement
+    rules = getattr(model, 'active_rules', None) or []
+    decap_map: dict[str, list[str]] = {}
+    if rules:
+        try:
+            decap_map = _build_decoupling_map(model)
+        except Exception:
+            pass
+
+    # Find all overlap pairs with area >= min_overlap_area
+    overlap_pairs = []
+    for i, a in enumerate(components):
+        if a.is_fixed or a.is_edge_connector:
+            continue
+        for b in components[i+1:]:
+            if b.is_fixed or b.is_edge_connector:
                 continue
+            if not a.overlaps(b):
+                continue
+            area = a.overlap_area(b)
+            if area >= min_overlap_area:
+                overlap_pairs.append((area, a, b))
 
-            # Pick the smaller IC to move (less disruption, easier to fit).
-            area1 = ic1.effective_width * ic1.effective_height
-            area2 = ic2.effective_width * ic2.effective_height
-            mover = ic1 if area1 <= area2 else ic2
-            stayer = ic2 if mover is ic1 else ic1
+    overlap_pairs.sort(key=lambda x: -x[0])  # largest first
 
-            # Also propagate the mover's caps (cap-IC atomic group).
-            # Build the set of components that should move together.
-            mover_group = {mover}
-            # Use the decap map to find caps assigned to this IC.
-            rules = getattr(model, 'active_rules', None) or []
-            if rules:
-                try:
-                    decap_map = _build_decoupling_map(model)
-                    for cap_ref in decap_map.get(mover.ref, []):
-                        cap = model.get_component(cap_ref)
-                        if cap and not cap.is_fixed:
-                            mover_group.add(cap)
-                except Exception:
-                    pass
+    moved = 0
+    unresolved = 0
+    for area, a, b in overlap_pairs:
+        if not a.overlaps(b):
+            continue  # may have been resolved by a previous move
 
-            # Search for a free slot on a coarse grid.
-            # Step size = mover's largest dimension + 2mm gap.
-            step = max(mover.effective_width, mover.effective_height) + 2.0
-            half_w = mover.effective_width / 2.0
-            half_h = mover.effective_height / 2.0
+        # Pick the smaller component to move
+        area_a = a.effective_width * a.effective_height
+        area_b = b.effective_width * b.effective_height
+        mover = a if area_a <= area_b else b
+        stayer = b if mover is a else a
 
-            best_slot: tuple[float, float] | None = None
-            best_dist = float("inf")
+        # Build the mover's group (itself + its decoupling caps if it's an IC)
+        mover_group = {mover}
+        if getattr(mover, 'component_type', '') in ic_types and decap_map:
+            for cap_ref in decap_map.get(mover.ref, []):
+                cap = model.get_component(cap_ref)
+                if cap and not cap.is_fixed:
+                    mover_group.add(cap)
 
-            # Original mover centroid (for distance tie-breaker).
-            orig_x, orig_y = mover.x, mover.y
+        # Search for a free slot on a coarse grid.
+        # Try multiple step sizes — start coarse (fast), refine if no slot found.
+        half_w = mover.effective_width / 2.0
+        half_h = mover.effective_height / 2.0
 
-            # Scan the interior bbox on a coarse grid.
+        best_slot: tuple[float, float] | None = None
+        best_dist = float("inf")
+        orig_x, orig_y = mover.x, mover.y
+
+        exclude_ids = {id(c) for c in mover_group}
+
+        # Try step sizes: coarse (mover_size + 2mm) → medium (+1mm) → fine (+0.5mm)
+        for step_mult in [2.0, 1.0, 0.5]:
+            step = max(mover.effective_width, mover.effective_height) * step_mult + 0.5
+            if step < 1.0:
+                step = 1.0
             x = rx_min + half_w
             while x <= rx_max - half_w:
                 y = ry_min + half_h
                 while y <= ry_max - half_h:
-                    if _slot_overlap_free(mover, x, y,
-                                          exclude={id(c) for c in mover_group}):
+                    if _slot_overlap_free(mover, x, y, exclude=exclude_ids):
                         dist = math.hypot(x - orig_x, y - orig_y)
                         if dist < best_dist:
                             best_dist = dist
                             best_slot = (x, y)
                     y += step
                 x += step
-
             if best_slot is not None:
-                # Move the entire group by the delta.
-                dx = best_slot[0] - mover.x
-                dy = best_slot[1] - mover.y
-                for comp in mover_group:
-                    new_x = comp.x + dx
-                    new_y = comp.y + dy
-                    # Clamp to interior bbox.
-                    cw = comp.effective_width / 2.0
-                    ch = comp.effective_height / 2.0
-                    new_x = max(rx_min + cw, min(new_x, rx_max - cw))
-                    new_y = max(ry_min + ch, min(new_y, ry_max - ch))
-                    comp.x = new_x
-                    comp.y = new_y
-                moved += 1
-                if verbose:
-                    print(f"  IC↔IC emergency: moved {mover.ref} "
-                          f"({mover.effective_width:.1f}x{mover.effective_height:.1f}mm) "
-                          f"by ({dx:.1f},{dy:.1f})mm to resolve overlap with {stayer.ref}")
-            else:
-                if verbose:
-                    print(f"  IC↔IC emergency: could not find free slot for "
-                          f"{mover.ref} (overlaps {stayer.ref}) — overlap remains")
+                break  # found a slot, no need to refine
 
+        if best_slot is not None:
+            dx = best_slot[0] - mover.x
+            dy = best_slot[1] - mover.y
+            for comp in mover_group:
+                new_x = comp.x + dx
+                new_y = comp.y + dy
+                cw = comp.effective_width / 2.0
+                ch = comp.effective_height / 2.0
+                new_x = max(rx_min + cw, min(new_x, rx_max - cw))
+                new_y = max(ry_min + ch, min(new_y, ry_max - ch))
+                comp.x = new_x
+                comp.y = new_y
+            moved += 1
+            if verbose:
+                print(f"  Large-overlap emergency: moved {mover.ref} "
+                      f"({mover.effective_width:.1f}x{mover.effective_height:.1f}mm) "
+                      f"by ({dx:.1f},{dy:.1f})mm to resolve {area:.1f}mm² overlap with {stayer.ref}")
+        else:
+            # Last resort: try moving just the mover alone (not its caps).
+            # This breaks the cap-IC atomic group but resolves the overlap.
+            if len(mover_group) > 1:
+                best_slot_solo = None
+                best_dist_solo = float("inf")
+                for step_mult in [2.0, 1.0, 0.5]:
+                    step = max(mover.effective_width, mover.effective_height) * step_mult + 0.5
+                    if step < 1.0:
+                        step = 1.0
+                    x = rx_min + half_w
+                    while x <= rx_max - half_w:
+                        y = ry_min + half_h
+                        while y <= ry_max - half_h:
+                            # Solo: only exclude the mover itself
+                            if _slot_overlap_free(mover, x, y, exclude={id(mover)}):
+                                dist = math.hypot(x - orig_x, y - orig_y)
+                                if dist < best_dist_solo:
+                                    best_dist_solo = dist
+                                    best_slot_solo = (x, y)
+                            y += step
+                        x += step
+                    if best_slot_solo is not None:
+                        break
+                if best_slot_solo is not None:
+                    mover.x = max(rx_min + half_w, min(best_slot_solo[0], rx_max - half_w))
+                    mover.y = max(ry_min + half_h, min(best_slot_solo[1], ry_max - half_h))
+                    moved += 1
+                    if verbose:
+                        print(f"  Large-overlap emergency (solo): moved {mover.ref} "
+                              f"to ({mover.x:.1f},{mover.y:.1f}) to resolve {area:.1f}mm² overlap with {stayer.ref}")
+                    continue
+            unresolved += 1
+            if verbose:
+                print(f"  Large-overlap emergency: could not find free slot for "
+                      f"{mover.ref} (overlaps {stayer.ref}, area={area:.1f}mm²)")
+
+    if verbose and (moved or unresolved):
+        print(f"  Large-overlap emergency: {moved} moved, {unresolved} unresolved")
+
+
+# Backward-compatible alias
+_resolve_ic_ic_overlaps = _resolve_large_overlaps
 
 def _count_overlaps(model: BoardModel) -> int:
     count, _ = _compute_overlap_stats(model)

@@ -23,11 +23,11 @@ class LegalizationConfig:
     severity_threshold: float = 0.7
     severe_push_factor: float = 0.5
     # --- Adaptive push-apart (plan.md §2-3) ---
-    max_bbox_expansions: int = 2          # cap on bbox-growth rounds
+    max_bbox_expansions: int = 3          # cap on bbox-growth rounds
     push_apart_hard_cap: int = 1000       # absolute ceiling for _resolve_overlaps
     spread_pass_enabled: bool = True      # toggle anti-centroid spread pass
     bbox_expansion_factor: float = 0.05   # +5% per round toward board outline
-    bbox_expansion_density_threshold: float = 0.75  # only expand if used/board < 0.75
+    bbox_expansion_density_threshold: float = 0.80  # only expand if used/board < 0.80
     gradient_plateau_threshold: float = -0.5       # stop when gradient >= this (plateau)
     gradient_history_window: int = 20    # rolling history size
     gradient_split: int = 10             # split history into last-N vs prev-N

@@ -1463,7 +1463,15 @@ def _group_connectors(
     # detected signal-flow chain (J_in → IC → J_out), group them together
     # so they land on the same edge. This overrides the stem-based split
     # that would otherwise put "ADC1_in" and "Buffer1_out" on different
-    # edges. Chain pairs must be in the same footprint family.
+    # edges.
+    #
+    # NOTE: Cross-family chain pairs (e.g. SMA input → PinHeader output)
+    # ARE grouped. The signal-flow chain is the stronger signal — a human
+    # designer places the input and output of a signal path on the same
+    # edge so the trace runs straight across, even if the connectors are
+    # different footprints. The previous same-family constraint defeated
+    # the purpose on boards like cbbwO where 4 of 6 chains cross families.
+    #
     # NOTE: sort chain_pairs for deterministic iteration order — Python
     # set iteration order varies across runs (hash randomization), which
     # would otherwise cause non-deterministic group assignment.
@@ -1481,15 +1489,24 @@ def _group_connectors(
             cb = next((c for c in connectors if c.ref == ref_b), None)
             if ca is None or cb is None:
                 continue
-            # Only group if same footprint family (don't mix SMA with PinHeader)
-            if _footprint_family(ca) != _footprint_family(cb):
-                continue
-            family = _footprint_family(ca)
+            # Use the higher-priority family's priority for the chain
+            # group, so a chain pairing SMA + PinHeader gets PinHeader's
+            # priority (70) + 15 = 85, higher than stem groups.
             family_priorities_local = {"PinHeader": 70, "PinSocket": 68, "USB": 65, "SMA": 60, "Coaxial": 58}
-            pri = family_priorities_local.get(family, 50) + 15  # higher than stem groups
+            fam_a = _footprint_family(ca)
+            fam_b = _footprint_family(cb)
+            pri_a = family_priorities_local.get(fam_a, 50)
+            pri_b = family_priorities_local.get(fam_b, 50)
+            pri = max(pri_a, pri_b) + 15  # higher than stem groups
+            # Category reflects both families so downstream can see this
+            # is a cross-family chain group.
+            if fam_a == fam_b:
+                category = f"chain_{fam_a}"
+            else:
+                category = f"chain_{fam_a}_{fam_b}"
             groups.append(ConnectorGroup(
                 group_id=f"chain_{ref_a}_{ref_b}",
-                category=f"chain_{family}",
+                category=category,
                 connectors=sorted([ca, cb], key=lambda x: x.ref),
                 priority=pri,
             ))
@@ -1846,16 +1863,19 @@ def _place_connectors_perimeter(
     # Phase 1: Capacity-aware group → edge assignment.
     # Process groups in (priority desc, size desc) order so big/priority
     # groups claim their preferred edge before small groups fill the gaps.
-    # Prefer EMPTY edges first so groups fan out across all four edges
-    # when there are ≤4 groups. Only stack multiple groups on the same
-    # edge once every edge already has at least one group (or when the
-    # group doesn't fit on any empty edge).
+    #
+    # Load balancing uses CONNECTOR COUNT per edge (not group count), so
+    # a 4-connector power group counts as 4, not 1. This produces a true
+    # 4/4/4/4 distribution when 16 connectors split into groups of 4+2+2+4+4.
+    #
+    # For chain-pair groups, the primary sort key is chain-pair count per
+    # edge (so chains spread round-robin), then total connector count,
+    # then HPWL proximity. This prevents the "all chains on one edge"
+    # failure mode.
     edge_assigned_groups: Dict[str, List[int]] = {e: [] for e in edges}
     edge_used: Dict[str, float] = {e: 0.0 for e in edges}
-    # Chain-pair count per edge — used for round-robin load-balancing
-    # of chain-pair groups across occupied edges once empty edges are
-    # exhausted (plan.md §1).
-    edge_chain_count: Dict[str, int] = {e: 0 for e in edges}
+    edge_conn_count: Dict[str, int] = {e: 0 for e in edges}  # total connectors per edge
+    edge_chain_count: Dict[str, int] = {e: 0 for e in edges}  # chain-pair groups per edge
     empty_edges: Set[str] = set(edges)
 
     def _is_chain_pair_group(g: "ConnectorGroup") -> bool:
@@ -1872,12 +1892,11 @@ def _place_connectors_perimeter(
     for gi in group_order:
         group = groups[gi]
         gcx, gcy = _group_centroid(group)
+        group_n = len(group.connectors)
 
-        edges_by_proximity = sorted(
-            edges,
-            key=lambda e: math.hypot(gcx - edge_midpoints[e][0],
-                                     gcy - edge_midpoints[e][1]),
-        )
+        def _prox(edge: str) -> float:
+            return math.hypot(gcx - edge_midpoints[edge][0],
+                              gcy - edge_midpoints[edge][1])
 
         def _fits(edge: str) -> bool:
             extent = _group_extent(group, edge)
@@ -1886,45 +1905,57 @@ def _place_connectors_perimeter(
 
         assigned_edge: Optional[str] = None
 
-        # First pass: prefer empty edges, ranked by HPWL proximity.
-        if empty_edges:
-            empty_candidates = [e for e in edges_by_proximity
-                                if e in empty_edges and _fits(e)]
-            if empty_candidates:
-                assigned_edge = empty_candidates[0]
+        is_chain = _is_chain_pair_group(group)
 
-        # Second pass: chain-pair edge load-balancing (plan.md §1).
-        # Once empty edges are exhausted, distribute remaining chain-pair
-        # groups round-robin across occupied edges by LOWEST current
-        # chain-pair count. Tie-breaker: lowest total group count, then
-        # HPWL proximity. This prevents the "all chains on one edge"
-        # failure mode where the first 2 chains claim TOP+LEFT and
-        # chains 3+4 stack on TOP because their centroid is closest.
-        if assigned_edge is None and _is_chain_pair_group(group):
-            occupied = [e for e in edges if e not in empty_edges and _fits(e)]
-            if occupied:
-                def _chain_sort_key(e: str) -> tuple[int, int, float]:
-                    prox = math.hypot(gcx - edge_midpoints[e][0],
-                                      gcy - edge_midpoints[e][1])
-                    return (edge_chain_count[e],
-                            len(edge_assigned_groups[e]),
-                            prox)
-                occupied.sort(key=_chain_sort_key)
-                assigned_edge = occupied[0]
+        # For chain-pair groups: balance by (chain_count, conn_count, prox).
+        # This is the PRIMARY strategy — chain-pairs spread round-robin
+        # across all 4 edges, preferring empty edges but also load-
+        # balancing occupied edges when no empty edge fits.
+        if is_chain:
+            # First, try empty edges that fit (still prefer empty for fan-out)
+            if empty_edges:
+                empty_candidates = [e for e in edges if e in empty_edges and _fits(e)]
+                if empty_candidates:
+                    empty_candidates.sort(key=lambda e: _prox(e))
+                    assigned_edge = empty_candidates[0]
 
-        # Third pass: any edge that fits, sorted by load (group count)
-        # then HPWL proximity. This load-balances non-chain groups too,
-        # so a SMA "bufferout" group doesn't pile onto the same edge as
-        # a chain-pair group when other edges have spare capacity.
-        if assigned_edge is None:
-            candidates = [e for e in edges if _fits(e)]
-            if candidates:
-                def _load_sort_key(e: str) -> tuple[int, float]:
-                    prox = math.hypot(gcx - edge_midpoints[e][0],
-                                      gcy - edge_midpoints[e][1])
-                    return (len(edge_assigned_groups[e]), prox)
-                candidates.sort(key=_load_sort_key)
-                assigned_edge = candidates[0]
+            # If no empty edge, load-balance across ALL fitting edges.
+            # Sort by (conn_count, chain_count, prox) — connector count
+            # is the PRIMARY key because piling a 2-connector chain onto
+            # an edge that already has 4 connectors (total 6) is worse
+            # than putting it on an edge with 2 connectors (total 4),
+            # even if the 4-connector edge has fewer chain-pairs. The
+            # chain_count is a secondary tie-breaker so chains still
+            # spread round-robin when conn_counts are equal.
+            if assigned_edge is None:
+                candidates = [e for e in edges if _fits(e)]
+                if candidates:
+                    candidates.sort(key=lambda e: (
+                        edge_conn_count[e],
+                        edge_chain_count[e],
+                        _prox(e),
+                    ))
+                    assigned_edge = candidates[0]
+
+        # For non-chain groups: prefer empty edges first, then load-balance
+        # by (conn_count, prox) so a 4-connector group doesn't pile onto
+        # an edge that already has 6 connectors when a 2-connector edge
+        # is available.
+        else:
+            if empty_edges:
+                empty_candidates = [e for e in edges if e in empty_edges and _fits(e)]
+                if empty_candidates:
+                    empty_candidates.sort(key=lambda e: _prox(e))
+                    assigned_edge = empty_candidates[0]
+
+            if assigned_edge is None:
+                candidates = [e for e in edges if _fits(e)]
+                if candidates:
+                    candidates.sort(key=lambda e: (
+                        edge_conn_count[e],
+                        _prox(e),
+                    ))
+                    assigned_edge = candidates[0]
 
         # Last resort: overflow to least-loaded edge so placement proceeds.
         if assigned_edge is None:
@@ -1933,7 +1964,8 @@ def _place_connectors_perimeter(
         extent = _group_extent(group, assigned_edge)
         edge_used[assigned_edge] += extent + gap
         edge_assigned_groups[assigned_edge].append(gi)
-        if _is_chain_pair_group(group):
+        edge_conn_count[assigned_edge] += group_n
+        if is_chain:
             edge_chain_count[assigned_edge] += 1
         empty_edges.discard(assigned_edge)
 

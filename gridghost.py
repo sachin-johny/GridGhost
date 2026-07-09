@@ -13,6 +13,21 @@ import argparse
 import sys
 import os
 
+# Ensure deterministic hash seed for reproducible placement. Python's
+# hash randomization (PYTHONHASHSEED) changes set/dict iteration order
+# across runs, which propagates through clustering/SA and produces
+# different placements each run. We re-exec with PYTHONHASHSEED=0 if
+# it's not already set. This must happen BEFORE any imports that cache
+# hash values (e.g. engine modules that build sets at import time).
+# Use GRIDGHOST_NO_HASH_SEED=1 to opt out (truly random).
+if (not os.environ.get("PYTHONHASHSEED")
+        and not os.environ.get("GRIDGHOST_NO_HASH_SEED")
+        and os.environ.get("GRIDGHOST_HASH_SEEDED") != "1"):
+    os.environ["PYTHONHASHSEED"] = "0"
+    os.environ["GRIDGHOST_HASH_SEEDED"] = "1"
+    # Re-exec self with the new environment.
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.board_model import BoardModel
@@ -110,6 +125,22 @@ def cmd_place(args) -> None:
     """Run the full placement pipeline."""
     cfg = load_config(args.config)
     _apply_config_to_globals(cfg)
+
+    # Seed PRNG for deterministic placement. SA uses Python's random
+    # module; without a seed, each run produces a different placement.
+    # Default seed=42 (matches scripts/visualize_placement.py). Use
+    # --seed 0 to disable seeding (truly random).
+    import random as _random
+    seed = getattr(args, 'seed', 42)
+    if seed != 0:
+        _random.seed(seed)
+        if 'numpy' in sys.modules:
+            try:
+                import numpy as np
+                np.random.seed(seed)
+            except Exception:
+                pass
+        print(f"  Random seed: {seed} (deterministic mode)")
 
     print(f"\n{'#' * 60}")
     print(f"  GridGhost")
@@ -487,6 +518,8 @@ def main():
     p_place.add_argument("--sa-reheat", type=int, default=None,
                          help="Number of SA reheat rounds (default: from config.json)")
     p_place.add_argument("--debug-bbox", action="store_true", help="Draw component bounding boxes on Dwgs.User layer for visual debugging")
+    p_place.add_argument("--seed", type=int, default=42,
+                         help="Random seed for SA/placement determinism (default: 42; use --seed 0 for non-deterministic)")
 
     # profiles
     subparsers.add_parser("profiles", help="List available board profiles")
