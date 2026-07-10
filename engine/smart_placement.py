@@ -985,6 +985,36 @@ def _optimize_interior_sa(
     x_min, x_max = board.x_min + margin, board.x_max - margin
     y_min, y_max = board.y_min + margin, board.y_max - margin
 
+    # Type-aware edge keepout: ICs/MCUs/regulators get extra edge clearance
+    # so they don't end up at the board edge during SA. This is the SA-side
+    # complement to the legalizer's _enforce_boundary_single keepout. Without
+    # this, SA can freely drift ICs to the corner cells (the spread-move
+    # operator explicitly jumps to empty cells, which are usually corners),
+    # and the legalizer's post-hoc clamp is whack-a-mole.
+    try:
+        from engine.cost_state import edge_keepout_extra_for as _ek_for
+    except Exception:
+        def _ek_for(_c): return 0.0
+
+    def _clamp_bounds_for(comp):
+        """Return (x_min_c, x_max_c, y_min_c, y_max_c) for this component,
+        shrunk by its type-aware edge keepout extra."""
+        extra = _ek_for(comp)
+        hw = comp.effective_width / 2.0
+        hh = comp.effective_height / 2.0
+        cx_min = x_min + hw + extra
+        cx_max = x_max - hw - extra
+        cy_min = y_min + hh + extra
+        cy_max = y_max - hh - extra
+        # Guard against collapse for large ICs on small boards.
+        if cx_min > cx_max:
+            cx_min = x_min + hw
+            cx_max = x_max - hw
+        if cy_min > cy_max:
+            cy_min = y_min + hh
+            cy_max = y_max - hh
+        return cx_min, cx_max, cy_min, cy_max
+
     # HPWL refs: interior + fixed connectors (so SA sees interior↔connector nets)
     interior_only_refs = {c.ref for c in interior}
     hpwl_refs = set(interior_only_refs)
@@ -1205,11 +1235,11 @@ def _optimize_interior_sa(
             target_x = comp.x + dx * cell_w_spread
             target_y = comp.y + dy * cell_h_spread
 
-        # Clamp to interior bounds (component center stays in usable area)
-        target_x = max(x_min + comp.effective_width / 2,
-                       min(target_x, x_max - comp.effective_width / 2))
-        target_y = max(y_min + comp.effective_height / 2,
-                       min(target_y, y_max - comp.effective_height / 2))
+        # Clamp to interior bounds (component center stays in usable area),
+        # with type-aware extra keepout for ICs/MCUs/regulators.
+        cx_min, cx_max, cy_min, cy_max = _clamp_bounds_for(comp)
+        target_x = max(cx_min, min(target_x, cx_max))
+        target_y = max(cy_min, min(target_y, cy_max))
         return comp, target_x, target_y
 
     # Track best solution
@@ -1241,12 +1271,12 @@ def _optimize_interior_sa(
             old_x, old_y = comp.x, comp.y
 
             step    = T * 2.0
-            comp.x  = max(x_min + comp.effective_width  / 2,
-                          min(old_x + rng.uniform(-step, step),
-                              x_max - comp.effective_width  / 2))
-            comp.y  = max(y_min + comp.effective_height / 2,
-                          min(old_y + rng.uniform(-step, step),
-                              y_max - comp.effective_height / 2))
+            # Type-aware clamp: ICs/MCUs/regulators get extra edge keepout.
+            cx_min, cx_max, cy_min, cy_max = _clamp_bounds_for(comp)
+            comp.x  = max(cx_min,
+                          min(old_x + rng.uniform(-step, step), cx_max))
+            comp.y  = max(cy_min,
+                          min(old_y + rng.uniform(-step, step), cy_max))
 
         # Incremental: only recompute what changed
         new_hpwl = _fast_hpwl()
@@ -1408,6 +1438,36 @@ def _footprint_family(c: "Component") -> str:
     return m.group(1) if m else 'unknown'
 
 
+# Order in which connector families should appear along an edge so that
+# visually-similar connectors cluster together (a human PCB designer would
+# never interleave SMA coax connectors with horizontal pin headers, even
+# when both are part of the same signal-flow chain).
+#
+# Lower rank = placed first (leftmost / topmost) on the edge.  Families not
+# in the map get rank 9, so unknown/one-off connectors sort last.
+_FAMILY_EDGE_RANK = {
+    "PinHeader":    0,
+    "PinSocket":    1,
+    "USB":          2,
+    "BarrelJack":   3,
+    "TerminalBlock":4,
+    "SMA":          5,
+    "Coaxial":      6,
+    "BNC":          7,
+    "power":        8,
+}
+
+
+def _family_rank(family: str) -> int:
+    """Return the within-edge ordering rank for a connector family.
+
+    Used as the PRIMARY sort key when ordering connectors along an edge so
+    that same-family connectors stay contiguous and don't interleave with
+    other families (e.g. all SMAs together, then all PinHeaders together).
+    """
+    return _FAMILY_EDGE_RANK.get(family, 9)
+
+
 def _group_connectors(
     connectors: List["Component"],
     chain_pairs: set[tuple[str, str]] | None = None,
@@ -1448,15 +1508,25 @@ def _group_connectors(
         s = re.sub(r'[^a-zA-Z]', '', name).lower()
         return s or "misc"
 
-    # 1. Power group — single group regardless of footprint.
+    # 1. Power group — sub-group by family so a +12V SMA and a +12V
+    # PinHeader don't share a group (and thus don't share an edge slot).
+    # The previous code intentionally merged all power connectors into a
+    # single group regardless of footprint, which produced the
+    # "SMA mixed with pin header on the same edge" pattern that a human
+    # PCB designer would never create. Each family keeps the high priority
+    # (100) so they still claim edges before signal groups.
     power = [c for c in connectors if is_power(_connector_name(c))]
     if power:
-        groups.append(ConnectorGroup(
-            group_id="power",
-            category="power",
-            connectors=sorted(power, key=lambda x: x.ref),
-            priority=100,
-        ))
+        power_by_fam: Dict[str, List["Component"]] = defaultdict(list)
+        for c in power:
+            power_by_fam[_footprint_family(c)].append(c)
+        for fam, conns in sorted(power_by_fam.items()):
+            groups.append(ConnectorGroup(
+                group_id=f"power_{fam}",
+                category="power",
+                connectors=sorted(conns, key=lambda x: x.ref),
+                priority=100,
+            ))
         grouped.update(c.ref for c in power)
 
     # 1.5. Signal-flow chain pairs — if two connectors are endpoints of a
@@ -1465,12 +1535,16 @@ def _group_connectors(
     # that would otherwise put "ADC1_in" and "Buffer1_out" on different
     # edges.
     #
-    # NOTE: Cross-family chain pairs (e.g. SMA input → PinHeader output)
-    # ARE grouped. The signal-flow chain is the stronger signal — a human
-    # designer places the input and output of a signal path on the same
-    # edge so the trace runs straight across, even if the connectors are
-    # different footprints. The previous same-family constraint defeated
-    # the purpose on boards like cbbwO where 4 of 6 chains cross families.
+    # NOTE: Same-family chain pairs (e.g. SMA in → SMA out) are grouped so
+    # the signal-flow trace can run straight across one edge. CROSS-FAMILY
+    # chain pairs (e.g. SMA in → PinHeader out) are NO LONGER grouped into
+    # a single ConnectorGroup — that was the root cause of "SMA mixed with
+    # pin header on the same edge" that a human PCB designer would never
+    # create. Instead we emit one ConnectorGroup per family but tag both
+    # with the same `chain_id` in the group_id, so the edge-assignment
+    # phase CAN still place them on the same edge (preserving the signal-
+    # flow intent) while the within-edge ordering keeps each family
+    # contiguous (preserving the no-mixing rule).
     #
     # NOTE: sort chain_pairs for deterministic iteration order — Python
     # set iteration order varies across runs (hash randomization), which
@@ -1478,6 +1552,7 @@ def _group_connectors(
     if chain_pairs:
         conn_refs = {c.ref for c in connectors}
         chain_grouped: set[str] = set()
+        chain_seq = 0
         for ref_a, ref_b in sorted(chain_pairs):
             if ref_a not in conn_refs or ref_b not in conn_refs:
                 continue
@@ -1489,28 +1564,43 @@ def _group_connectors(
             cb = next((c for c in connectors if c.ref == ref_b), None)
             if ca is None or cb is None:
                 continue
-            # Use the higher-priority family's priority for the chain
-            # group, so a chain pairing SMA + PinHeader gets PinHeader's
-            # priority (70) + 15 = 85, higher than stem groups.
-            family_priorities_local = {"PinHeader": 70, "PinSocket": 68, "USB": 65, "SMA": 60, "Coaxial": 58}
             fam_a = _footprint_family(ca)
             fam_b = _footprint_family(cb)
+            family_priorities_local = {"PinHeader": 70, "PinSocket": 68, "USB": 65, "SMA": 60, "Coaxial": 58}
             pri_a = family_priorities_local.get(fam_a, 50)
             pri_b = family_priorities_local.get(fam_b, 50)
-            pri = max(pri_a, pri_b) + 15  # higher than stem groups
-            # Category reflects both families so downstream can see this
-            # is a cross-family chain group.
             if fam_a == fam_b:
-                category = f"chain_{fam_a}"
+                # Same family — keep as a single group (original behavior).
+                pri = pri_a + 15
+                groups.append(ConnectorGroup(
+                    group_id=f"chain_{ref_a}_{ref_b}",
+                    category=f"chain_{fam_a}",
+                    connectors=sorted([ca, cb], key=lambda x: x.ref),
+                    priority=pri,
+                ))
+                chain_grouped.update({ref_a, ref_b})
             else:
-                category = f"chain_{fam_a}_{fam_b}"
-            groups.append(ConnectorGroup(
-                group_id=f"chain_{ref_a}_{ref_b}",
-                category=category,
-                connectors=sorted([ca, cb], key=lambda x: x.ref),
-                priority=pri,
-            ))
-            chain_grouped.update({ref_a, ref_b})
+                # Cross-family — emit TWO per-family groups tagged with a
+                # shared chain_seq so the edge-assigner can co-locate them
+                # on the same edge, while the within-edge ordering keeps
+                # each family contiguous. Both groups carry the higher of
+                # the two family priorities so they claim edges early.
+                pri = max(pri_a, pri_b) + 15
+                tag = f"xchain{chain_seq}"
+                chain_seq += 1
+                groups.append(ConnectorGroup(
+                    group_id=f"chain_{tag}_{fam_a}_{ref_a}",
+                    category=f"chain_{fam_a}",
+                    connectors=[ca],
+                    priority=pri,
+                ))
+                groups.append(ConnectorGroup(
+                    group_id=f"chain_{tag}_{fam_b}_{ref_b}",
+                    category=f"chain_{fam_b}",
+                    connectors=[cb],
+                    priority=pri,
+                ))
+                chain_grouped.update({ref_a, ref_b})
         grouped.update(chain_grouped)
 
     # 2./3. Remaining connectors bucketed by footprint family.
@@ -1780,8 +1870,11 @@ def _place_connectors_perimeter(
                 + gap * (len(group.connectors) - 1)
         if total <= max_edge_len + 0.5:
             return [group]
-        # Sort by ref for deterministic splitting, then greedy-chunk
-        sorted_conns = sorted(group.connectors, key=lambda c: c.ref)
+        # Sort by family first (so same-family connectors stay in the
+        # same chunk when a group is split for capacity), then by ref for
+        # determinism.
+        sorted_conns = sorted(group.connectors,
+                              key=lambda c: (_footprint_family(c), c.ref))
         chunks: List[List["Component"]] = []
         current: List["Component"] = []
         current_ext = 0.0
@@ -1876,12 +1969,38 @@ def _place_connectors_perimeter(
     edge_used: Dict[str, float] = {e: 0.0 for e in edges}
     edge_conn_count: Dict[str, int] = {e: 0 for e in edges}  # total connectors per edge
     edge_chain_count: Dict[str, int] = {e: 0 for e in edges}  # chain-pair groups per edge
+    edge_family: Dict[str, Optional[str]] = {e: None for e in edges}  # family lock
     empty_edges: Set[str] = set(edges)
 
     def _is_chain_pair_group(g: "ConnectorGroup") -> bool:
         """A chain-pair group is created in _group_connectors when two
         connectors are endpoints of a detected signal-flow chain."""
         return g.group_id.startswith("chain_") or g.category.startswith("chain_")
+
+    def _xchain_tag(g: "ConnectorGroup") -> Optional[str]:
+        """For cross-family chain pairs we emit two groups tagged with a
+        shared `xchainN` token in their group_id."""
+        if not g.group_id.startswith("chain_"):
+            return None
+        parts = g.group_id.split("_")
+        if len(parts) >= 2 and parts[1].startswith("xchain"):
+            return parts[1]
+        return None
+
+    def _group_family_for_edge(g: "ConnectorGroup") -> str:
+        """Return the footprint family of a group, for edge-exclusivity.
+        Power groups use 'power' as their family. Chain groups use their
+        category's family (e.g. 'chain_SMA' -> 'SMA')."""
+        cat = g.category or ""
+        if cat.startswith("chain_"):
+            return cat.split("_", 1)[1]
+        if cat == "power":
+            # Power groups have per-family group_ids like "power_SMA".
+            gid = g.group_id
+            if gid.startswith("power_"):
+                return gid.split("_", 1)[1]
+            return "power"
+        return cat
 
     group_order = sorted(
         range(len(groups)),
@@ -1893,6 +2012,7 @@ def _place_connectors_perimeter(
         group = groups[gi]
         gcx, gcy = _group_centroid(group)
         group_n = len(group.connectors)
+        group_fam = _group_family_for_edge(group)
 
         def _prox(edge: str) -> float:
             return math.hypot(gcx - edge_midpoints[edge][0],
@@ -1903,61 +2023,44 @@ def _place_connectors_perimeter(
             remaining = edge_lengths[edge] - edge_used[edge]
             return extent <= remaining + 0.5
 
+        def _family_ok(edge: str) -> bool:
+            """Edge is family-compatible: either no family assigned yet,
+            or the same family as this group. This enforces the human-
+            designer rule: never mix SMA with PinHeader on the same edge."""
+            ef = edge_family[edge]
+            return ef is None or ef == group_fam
+
         assigned_edge: Optional[str] = None
 
         is_chain = _is_chain_pair_group(group)
+        xtag = _xchain_tag(group)
 
-        # For chain-pair groups: balance by (chain_count, conn_count, prox).
-        # This is the PRIMARY strategy — chain-pairs spread round-robin
-        # across all 4 edges, preferring empty edges but also load-
-        # balancing occupied edges when no empty edge fits.
-        if is_chain:
-            # First, try empty edges that fit (still prefer empty for fan-out)
-            if empty_edges:
-                empty_candidates = [e for e in edges if e in empty_edges and _fits(e)]
-                if empty_candidates:
-                    empty_candidates.sort(key=lambda e: _prox(e))
-                    assigned_edge = empty_candidates[0]
+        # ---- FAMILY-EXCLUSIVE + LOAD-BALANCED EDGE ASSIGNMENT ----
+        # Two hard rules a human PCB designer follows:
+        #   1. Each edge gets ONE family — never mix SMA with PinHeader.
+        #   2. Connectors should be EVENLY DISTRIBUTED across edges (4/4/4/4
+        #      for 16 connectors, not 6/6/4/0).
+        #
+        # A family CAN span multiple edges (12 SMAs can go on 3 edges with
+        # 4 each). The constraint is per-EDGE (one family), not per-FAMILY
+        # (one edge).
+        #
+        # Strategy: among all family-compatible edges (empty OR same-family),
+        # pick the one with the FEWEST connectors. This naturally distributes
+        # same-family groups across multiple edges until all are evenly
+        # loaded, then starts filling empty edges for the next family.
+        # Only fall back to least-loaded (breaking exclusivity) if no
+        # family-compatible edge fits.
 
-            # If no empty edge, load-balance across ALL fitting edges.
-            # Sort by (conn_count, chain_count, prox) — connector count
-            # is the PRIMARY key because piling a 2-connector chain onto
-            # an edge that already has 4 connectors (total 6) is worse
-            # than putting it on an edge with 2 connectors (total 4),
-            # even if the 4-connector edge has fewer chain-pairs. The
-            # chain_count is a secondary tie-breaker so chains still
-            # spread round-robin when conn_counts are equal.
-            if assigned_edge is None:
-                candidates = [e for e in edges if _fits(e)]
-                if candidates:
-                    candidates.sort(key=lambda e: (
-                        edge_conn_count[e],
-                        edge_chain_count[e],
-                        _prox(e),
-                    ))
-                    assigned_edge = candidates[0]
+        # Family-compatible edges: empty (no family yet) OR same family
+        compat = [e for e in edges if _family_ok(e) and _fits(e)]
+        if compat:
+            # Primary: connector count (load balance → even distribution)
+            # Secondary: HPWL proximity (tiebreaker)
+            compat.sort(key=lambda e: (edge_conn_count[e], _prox(e)))
+            assigned_edge = compat[0]
 
-        # For non-chain groups: prefer empty edges first, then load-balance
-        # by (conn_count, prox) so a 4-connector group doesn't pile onto
-        # an edge that already has 6 connectors when a 2-connector edge
-        # is available.
-        else:
-            if empty_edges:
-                empty_candidates = [e for e in edges if e in empty_edges and _fits(e)]
-                if empty_candidates:
-                    empty_candidates.sort(key=lambda e: _prox(e))
-                    assigned_edge = empty_candidates[0]
-
-            if assigned_edge is None:
-                candidates = [e for e in edges if _fits(e)]
-                if candidates:
-                    candidates.sort(key=lambda e: (
-                        edge_conn_count[e],
-                        _prox(e),
-                    ))
-                    assigned_edge = candidates[0]
-
-        # Last resort: overflow to least-loaded edge so placement proceeds.
+        # Last resort: overflow to least-loaded edge (may break exclusivity)
         if assigned_edge is None:
             assigned_edge = min(edges, key=lambda e: edge_used[e])
 
@@ -1967,6 +2070,9 @@ def _place_connectors_perimeter(
         edge_conn_count[assigned_edge] += group_n
         if is_chain:
             edge_chain_count[assigned_edge] += 1
+        # Lock the edge to this family (idempotent if already same)
+        if edge_family[assigned_edge] is None:
+            edge_family[assigned_edge] = group_fam
         empty_edges.discard(assigned_edge)
 
     # Phase 2: Per-edge placement.
@@ -1979,30 +2085,79 @@ def _place_connectors_perimeter(
         if not assigned_groups:
             continue
 
-        # Keep each group's connectors contiguous on the edge (no interleaving
-        # with other groups). Order groups by their centroid's along-edge
-        # coordinate; within each group, sort connectors the same way.
+        # Order groups on the edge by FAMILY RANK first (so same-family
+        # groups stay contiguous — all SMA groups together, then all
+        # PinHeader groups together — instead of interleaving by net
+        # centroid), then by along-edge net-centroid coordinate as a
+        # tiebreaker so the layout still respects HPWL proximity within
+        # a family band. This is the human-designer rule: never mix SMA
+        # connectors with horizontal pin headers on the same edge.
+        #
+        # The family for a group is extracted from its category, which is
+        # set by _group_connectors to either the bare family ("SMA",
+        # "PinHeader", …), "power", or "chain_<family>". We take the last
+        # underscore-separated token so cross-family chain groups (whose
+        # category is "chain_<family>") are still ordered by their own
+        # family rather than dumped together.
+        def _group_family(gi: int) -> str:
+            cat = groups[gi].category or ""
+            if cat.startswith("chain_"):
+                return cat.split("_", 1)[1]
+            return cat
+
         def _group_along_coord(gi: int) -> float:
             gx, gy = _group_centroid(groups[gi])
             return gx if edge in ("bottom", "top") else gy
 
-        ordered_groups = sorted(assigned_groups, key=_group_along_coord)
+        ordered_groups = sorted(
+            assigned_groups,
+            key=lambda gi: (_family_rank(_group_family(gi)),
+                            _group_along_coord(gi)),
+        )
 
         comps_on_edge: List["Component"] = []
         for gi in ordered_groups:
-            group_conns = list(groups[gi].connectors)
+            comps_on_edge.extend(groups[gi].connectors)
+
+        # Global sort of ALL connectors on this edge by a LOGICAL key:
+        #   1. footprint family (SMA, PinHeader, etc.)
+        #   2. signal stem (ADC_in, Buffer_out, +12V, etc.)
+        #   3. channel number (1, 2, 3, 4) extracted from the value
+        #   4. along-edge net-centroid (fallback tiebreaker)
+        #
+        # This produces human-logical ordering: ADC1, ADC2, ADC3, ADC4
+        # together, then Buffer1, Buffer2, Buffer3, Buffer4 together —
+        # instead of interleaving by net centroid or group centroid.
+        def _signal_sort_key(c):
+            name = _connector_name(c)
+            stem = re.sub(r'[^a-zA-Z]', '', name).lower() or 'misc'
+            num_match = re.search(r'\d+', name)
+            chan = int(num_match.group()) if num_match else 999
+            fam = _footprint_family(c)
             if edge in ("bottom", "top"):
-                group_conns.sort(key=lambda c: conn_centroids[c.ref][0])
+                centroid = conn_centroids[c.ref][0]
             else:
-                group_conns.sort(key=lambda c: conn_centroids[c.ref][1])
-            comps_on_edge.extend(group_conns)
+                centroid = conn_centroids[c.ref][1]
+            return (fam, stem, chan, centroid)
+        comps_on_edge.sort(key=_signal_sort_key)
 
         total_needed = sum(
             _connector_along_edge_extent(c, edge, mating_margin)
             for c in comps_on_edge
         ) + gap * max(0, len(comps_on_edge) - 1)
-        available = edge_lengths[edge]
-        offset = max(0.0, (available - total_needed) / 2.0)
+        # Center on the BOARD OUTLINE, not the interior_bbox.
+        # The interior_bbox may be smaller than the board (interior
+        # components don't fill the full board), so centering on it
+        # makes connectors appear pushed to one corner. Centering on
+        # the board outline puts connectors in the visual center of
+        # each edge — what a human designer expects.
+        if edge in ("bottom", "top"):
+            board_edge_start = board.x_min
+            board_edge_len = board.x_max - board.x_min
+        else:
+            board_edge_start = board.y_min
+            board_edge_len = board.y_max - board.y_min
+        offset = max(0.0, (board_edge_len - total_needed) / 2.0)
         pos = offset
 
         for comp in comps_on_edge:
@@ -2016,17 +2171,17 @@ def _place_connectors_perimeter(
             along = w if edge in ("bottom", "top") else h
 
             if edge == "bottom":
-                cx = ib_x_min + pos + along / 2
+                cx = board_edge_start + pos + along / 2
                 cy = ib_y_max + em + h / 2
             elif edge == "top":
-                cx = ib_x_min + pos + along / 2
+                cx = board_edge_start + pos + along / 2
                 cy = ib_y_min - em - h / 2
             elif edge == "left":
                 cx = ib_x_min - em - w / 2
-                cy = ib_y_min + pos + along / 2
+                cy = board_edge_start + pos + along / 2
             else:  # right
                 cx = ib_x_max + em + w / 2
-                cy = ib_y_min + pos + along / 2
+                cy = board_edge_start + pos + along / 2
 
             comp.x = cx
             comp.y = cy

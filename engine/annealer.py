@@ -1181,6 +1181,57 @@ def _resolve_overlaps_greedy(
     cost_state._compute_all()
 
 
+def _repair_cap_ic_groups_after_sa(model, cost_state, config):
+    """Re-attach decoupling caps to their ICs after SA + greedy + swap.
+
+    The SA move operators (do_translate / do_swap / do_rotate / do_median)
+    and the greedy nudge/rotate operators correctly propagate IC deltas to
+    caps. But `_try_single_swap` (used by `_greedy_swap_refine`) does NOT —
+    it swaps IC positions without moving the caps, leaving the cap-IC link
+    broken after every accepted IC swap. Greedy swap runs in both the
+    greedy-only path and the post-SA path, so this gap fires on every board.
+
+    This post-hoc repair runs `_nudge_caps_to_ics` (closes distance gaps)
+    and `_cleanup_cap_ic_overlaps` (resolves any cap-IC overlaps the nudge
+    leaves behind). Idempotent and cheap (~1–2ms on a 50-component board).
+
+    Local import avoids a circular dependency: legalizer imports from
+    engine.group_moves which imports from engine.cost_state which is
+    imported here.
+    """
+    rules = getattr(cost_state, '_rules', None)
+    if not rules:
+        return
+    if not any(getattr(r, 'name', '') == 'decoupling_proximity' and r.enabled
+               for r in rules):
+        return
+    try:
+        from legalization.legalizer import _repair_cap_ic_groups
+        # Compute interior_bbox the same way the CLI does — board ± 5mm.
+        # This is only used for clamping cap positions during the nudge,
+        # so an approximate bbox is fine.
+        board = model.board
+        margin = 5.0
+        interior = [c for c in model.components
+                    if not c.is_fixed
+                    and getattr(c, 'component_type', '') != 'connector']
+        if interior:
+            ib = (board.x_min + margin, board.y_min + margin,
+                  board.x_max - margin, board.y_max - margin)
+        else:
+            ib = None
+        cached_decap_map = getattr(cost_state, '_decap_map', None)
+        _repair_cap_ic_groups(model, rules, ib,
+                              cached_decap_map=cached_decap_map,
+                              verbose=False)
+        # The nudge may have moved caps (and not the ICs), so the cost
+        # state's cached cap bboxes / overlaps are stale. Re-compute.
+        cost_state._compute_all()
+    except Exception:
+        # Repair is best-effort — never fail SA because of it.
+        pass
+
+
 def simulate_annealing(
     model: BoardModel,
     cost_state: CostState,
@@ -1218,6 +1269,12 @@ def simulate_annealing(
         if config.verbose:
             print("  Phase 3: Final greedy nudge+rotate...")
         _greedy_refine(model, cost_state, moveable_indices, config, enhanced=True)
+
+        # Phase 3.5: Repair cap-IC groups. `_try_single_swap` (Phase 2)
+        # does not propagate IC deltas to caps, so accepted IC swaps leave
+        # the caps behind. Re-attach them now so the legalizer starts from
+        # a sane cap-IC configuration.
+        _repair_cap_ic_groups_after_sa(model, cost_state, config)
 
         if cost_state.overlap_count > 0 and config.verbose:
             print(f"  Greedy leaving {cost_state.overlap_count} overlaps for legalizer to resolve")
@@ -1281,6 +1338,10 @@ def simulate_annealing(
     _greedy_refine(model, cost_state, moveable_indices, config, enhanced=True)
     _greedy_swap_refine(model, cost_state, moveable_indices, config)
     _greedy_refine(model, cost_state, moveable_indices, config, enhanced=True)
+
+    # Repair cap-IC groups after greedy swap (which doesn't propagate IC
+    # deltas to caps). Same rationale as Phase 3.5 in the greedy-only path.
+    _repair_cap_ic_groups_after_sa(model, cost_state, config)
 
     # NO overlap resolution in SA. The legalizer handles overlaps.
     # SA overlap resolution destroys HPWL optimization for dense boards

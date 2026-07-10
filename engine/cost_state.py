@@ -24,6 +24,86 @@ BOUNDARY_WEIGHT = 4.0   # stronger — discourage OOB during SA, not just legali
 CONSTRAINT_WEIGHT = 4.0  # delta — matches BoardProfile default
 OVERLAP_COUNT_WEIGHT = 12.0  # extra penalty per overlapping pair
 
+
+# ---------------------------------------------------------------------------
+# Component-type-aware edge keepout
+# ---------------------------------------------------------------------------
+# Loads the per-type edge keepout extra from config.json (single source of
+# truth). Returns {component_type: extra_mm}. ICs/MCUs/regulators get extra
+# edge clearance so they don't end up at the board edge — a common-sense
+# DFM rule a human PCB designer always applies. Falls back to the
+# PlacementConfig defaults if config loading fails.
+_EDGE_KEEPOUT_TABLE_CACHE: dict[str, float] | None = None
+
+
+def _load_edge_keepout_table() -> dict[str, float]:
+    """Load the per-type edge keepout extra (mm) from config.json.
+
+    Cached after first call. Falls back to PlacementConfig defaults if
+    config loading fails (e.g. config.json missing).
+    """
+    global _EDGE_KEEPOUT_TABLE_CACHE
+    if _EDGE_KEEPOUT_TABLE_CACHE is not None:
+        return _EDGE_KEEPOUT_TABLE_CACHE
+    try:
+        from config import load_config
+        cfg = load_config()
+        _EDGE_KEEPOUT_TABLE_CACHE = dict(cfg.placement.edge_keepout_extra)
+    except Exception:
+        # Fall back to the defaults hardcoded in PlacementConfig.
+        _EDGE_KEEPOUT_TABLE_CACHE = {
+            "ic": 5.0, "mcu": 5.0, "regulator": 5.0, "crystal": 3.0,
+        }
+    return _EDGE_KEEPOUT_TABLE_CACHE
+
+
+def edge_keepout_extra_for(comp, model=None) -> float:
+    """Return the extra edge keepout (mm) for a component's type.
+
+    Returns 0.0 for passives/connectors/generic — they only get the base
+    `margin`. ICs/MCUs/regulators get the base `margin` PLUS this extra.
+
+    The extra is DENSITY-ADAPTIVE when ``model`` is provided: on dense
+    boards there isn't room for a full 5mm extra keepout without creating
+    overlaps, so the extra is scaled down proportionally. On sparse boards
+    (density < 0.20) the full extra applies; on dense boards (density >
+    0.45) the extra is scaled to 20% of the base. This prevents the
+    keepout from causing overlap regressions on packed boards while still
+    keeping ICs away from edges when there's room.
+
+    When ``model`` is None (e.g. called from a context without model
+    access), the full base extra is returned — the caller should pass the
+    model whenever possible to get the density-adaptive scaling.
+    """
+    t = getattr(comp, 'component_type', '') or ''
+    base = _load_edge_keepout_table().get(t, 0.0)
+    if base <= 0.0:
+        return 0.0
+    if model is None:
+        return base
+    try:
+        board = model.board
+        board_area = max(1.0, board.width * board.height)
+        comp_area = sum(
+            c.effective_width * c.effective_height
+            for c in model.components
+            if not c.is_fixed
+        )
+        density = comp_area / board_area
+        # Scale: full extra below 0.35 density (sparse — plenty of room),
+        # linearly toward 0.3 above 0.55 (very dense — barely any room).
+        # Previous thresholds (0.20/0.45) were too aggressive — a 26%-dense
+        # board was already being scaled down when it has plenty of room.
+        if density <= 0.35:
+            scale = 1.0
+        elif density >= 0.55:
+            scale = 0.3  # never fully zero — always keep a small margin
+        else:
+            scale = 1.0 - 0.7 * (density - 0.35) / 0.20
+        return base * scale
+    except Exception:
+        return base
+
 # Density-equality penalty (Gini coefficient on a 10x10 cell-occupancy grid).
 # Penalizes inequality of cell-occupancy — 0 when components are uniformly
 # spread, increases as they cluster.
@@ -343,6 +423,7 @@ class CostState:
             self._comp_boundary[i] = self._compute_boundary(
                 comp.bbox, board, keepouts=keepouts,
                 is_edge_connector=comp.is_edge_connector,
+                edge_keepout_extra=edge_keepout_extra_for(comp, self.model),
             )
 
         # Constraint penalties
@@ -497,6 +578,7 @@ class CostState:
         board,
         keepouts: list | None = None,
         is_edge_connector: bool = False,
+        edge_keepout_extra: float = 0.0,
     ) -> float:
         """Boundary penalty for a single component bbox.
 
@@ -514,6 +596,17 @@ class CostState:
 
         Edge connectors are exempt from keepout penalties — their body
         may legitimately overhang a mounting hole near the board edge.
+
+        ``edge_keepout_extra`` adds a LINEAR edge-proximity penalty for
+        component types that need extra edge clearance (ICs, MCUs,
+        regulators).  Without this, SA has no gradient to keep ICs away
+        from the board edge — the overflow penalty only fires once a
+        component is OUTSIDE the board, so an IC sitting 0.1mm inside the
+        margin gets zero penalty.  The proximity term charges
+        ``max(0, extra - dist_to_edge)`` for each of the 4 edges, giving
+        SA a smooth ramp that pushes ICs toward the interior.  This is
+        the common-sense DFM rule a human PCB designer always applies
+        (routing room, panelization clearance, assembly clearance).
         """
         left = max(0.0, board.x_min - bbox[0])
         right = max(0.0, bbox[2] - board.x_max)
@@ -531,6 +624,21 @@ class CostState:
                 oy2 = min(y_max, k.y_max)
                 if ox2 > ox1 and oy2 > oy1:
                     overflow += (ox2 - ox1) * (oy2 - oy1)
+
+        # Edge-proximity penalty for component types that need extra
+        # clearance (ICs, MCUs, regulators). Linear ramp so SA has a
+        # smooth gradient toward the interior. Only fires when the
+        # component is INSIDE the board (overflow == 0); once it's
+        # outside, the overflow term dominates.
+        if edge_keepout_extra > 0.0 and overflow == 0.0 and not is_edge_connector:
+            d_left = bbox[0] - board.x_min
+            d_right = board.x_max - bbox[2]
+            d_top = bbox[1] - board.y_min
+            d_bottom = board.y_max - bbox[3]
+            overflow += max(0.0, edge_keepout_extra - d_left)
+            overflow += max(0.0, edge_keepout_extra - d_right)
+            overflow += max(0.0, edge_keepout_extra - d_top)
+            overflow += max(0.0, edge_keepout_extra - d_bottom)
 
         return overflow  # linear ramp (quadratic too aggressive for SA)
 
@@ -594,6 +702,7 @@ class CostState:
             self._comp_boundary[i] = self._compute_boundary(
                 comp.bbox, board, keepouts=keepouts,
                 is_edge_connector=comp.is_edge_connector,
+                edge_keepout_extra=edge_keepout_extra_for(comp, self.model),
             )
 
         # Constraint penalties — recompute the VALUE (depends on positions)

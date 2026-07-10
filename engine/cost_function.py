@@ -246,7 +246,15 @@ def total_boundary_penalty(model: BoardModel) -> float:
     holes during optimization (the legalizer would push them out post-hoc,
     but SA never learned to avoid the keepout in the first place).  This
     closes the SA-loop gap identified in the post-audit recommendations.
+
+    Also adds a linear edge-proximity penalty for component types that need
+    extra edge clearance (ICs, MCUs, regulators) — see
+    ``cost_state.edge_keepout_extra_for``.  This gives SA a gradient toward
+    the interior even when the component is inside the board, so ICs don't
+    end up at the board edge (a common-sense DFM rule).
     """
+    from engine.cost_state import edge_keepout_extra_for
+
     total = 0.0
     board = model.board
     keepouts = getattr(model, 'keepouts', None) or []
@@ -281,6 +289,21 @@ def total_boundary_penalty(model: BoardModel) -> float:
                 oy2 = min(y_max, k.y_max)
                 if ox2 > ox1 and oy2 > oy1:
                     total += (ox2 - ox1) * (oy2 - oy1)
+
+        # --- Edge-proximity penalty for ICs/MCUs/regulators ---
+        # Only fires when the component is INSIDE the board (overflow == 0);
+        # once it's outside, the overflow term dominates.  Linear ramp so
+        # SA has a smooth gradient toward the interior.
+        extra = edge_keepout_extra_for(comp, model)
+        if extra > 0.0 and overflow == 0.0:
+            d_left = x_min - board.x_min
+            d_right = board.x_max - x_max
+            d_top = y_min - board.y_min
+            d_bottom = board.y_max - y_max
+            total += max(0.0, extra - d_left)
+            total += max(0.0, extra - d_right)
+            total += max(0.0, extra - d_top)
+            total += max(0.0, extra - d_bottom)
 
     return total
 

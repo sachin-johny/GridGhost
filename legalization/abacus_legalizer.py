@@ -582,6 +582,21 @@ def _count_pair_overlaps_involving(
 # Utility functions
 # ---------------------------------------------------------------------------
 
+def _edge_keepout_for(comp) -> float:
+    """Type-aware edge keepout extra (mm) — ICs/MCUs/regulators get extra
+    edge clearance so abacus row DP doesn't place them at the row edge.
+
+    NOTE: abacus row DP is a hard constraint solver — it places components
+    in rows with no overlaps. Applying the keepout here can make the row
+    infeasible (no slot that satisfies both the keepout AND the no-overlap
+    constraint), causing the row DP to fail and fall back to greedy. We
+    return 0.0 by default; the SA cost gradient and the legalizer's
+    initial _enforce_boundary already keep ICs away from edges. Abacus
+    should have freedom to find a legal row placement.
+    """
+    return 0.0
+
+
 def _clamp_to_bounds(
     comp: Component,
     board: BoardOutline,

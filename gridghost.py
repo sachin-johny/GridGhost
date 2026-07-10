@@ -352,19 +352,16 @@ def cmd_place(args) -> None:
         print(f"  Post-legalization overlap resolution ({post_legal_overlaps} "
               f"non-cap-IC overlaps)...")
         from legalization.legalizer import (
-            _greedy_resolve, _nudge_caps_to_ics, _cleanup_cap_ic_overlaps,
+            _greedy_resolve, _cleanup_cap_ic_overlaps,
+            _displace_passives_for_caps,
         )
         _greedy_resolve(model, lcfg.grid_mm, True, interior_bbox)
-        # The greedy cleanup treats every overlap as bad, so it can push caps
-        # away from their ICs while clearing other overlaps.  Re-run the
-        # cap-IC nudge to restore decoupling adjacency before HPWL recovery.
-        # _nudge_caps_to_ics intentionally lets a cap overlap its own IC (its
-        # overlap check excludes the IC), so the cleanup companion must run
-        # afterward to relocate such caps to a free adjacent slot — otherwise
-        # the nudge leaves illegal cap-IC overlaps behind.
+        # Re-attach caps to ICs after greedy cleanup pushed them away.
+        # Uses displacement (not nudge) — see _repair_cap_ic_groups for why.
         if final_decap_map and getattr(model, 'active_rules', None):
-            _nudge_caps_to_ics(model, model.active_rules, interior_bbox,
-                               verbose=True, cached_decap_map=final_decap_map)
+            _displace_passives_for_caps(model, model.active_rules, interior_bbox,
+                                        cached_decap_map=final_decap_map,
+                                        verbose=True)
             _cleanup_cap_ic_overlaps(model, final_decap_map, interior_bbox,
                                      verbose=True)
         print_board_summary(model, "After Post-Legalization Overlap Resolution")
@@ -397,6 +394,66 @@ def cmd_place(args) -> None:
             _grid.build(list(model.components))
             _resolve_ic_ic_overlaps(model, interior_bbox, _grid, verbose=True)
             _enforce_boundary(model, interior_bbox)
+
+    # Step 7.6: FINAL brute-force overlap check + cap-IC displacement.
+    from legalization.legalizer import (
+        _greedy_resolve as _final_greedy,
+        _enforce_boundary as _final_boundary,
+        _cleanup_cap_ic_overlaps as _final_cleanup,
+        _displace_passives_for_caps as _final_displace,
+    )
+    _bf_overlaps = 0
+    _comps = list(model.components)
+    for _i in range(len(_comps)):
+        for _j in range(_i + 1, len(_comps)):
+            if _comps[_i].overlaps(_comps[_j]):
+                _bf_overlaps += 1
+    print(f"  Step 7.6 brute-force check: {_bf_overlaps} overlaps found")
+    if _bf_overlaps > 0:
+        print(f"  Final brute-force check: {_bf_overlaps} overlaps found, resolving")
+        _final_greedy(model, lcfg.grid_mm, True, interior_bbox)
+        _final_boundary(model, interior_bbox)
+        _final_displace(model,
+                        model.active_rules if getattr(model, 'active_rules', None) else profile.rules,
+                        interior_bbox, cached_decap_map=final_decap_map, verbose=True)
+        _final_cleanup(model, final_decap_map, interior_bbox, verbose=True)
+        _bf_after = 0
+        _comps = list(model.components)
+        for _i in range(len(_comps)):
+            for _j in range(_i + 1, len(_comps)):
+                if _comps[_i].overlaps(_comps[_j]):
+                    _bf_after += 1
+        if _bf_after > 0:
+            print(f"  WARNING: {_bf_after} overlaps could not be resolved (board may be too dense)")
+
+    # Step 7.7: FINAL FINAL brute-force overlap check (right before save).
+    # Verify no overlaps exist. If any slipped through, resolve them now.
+    _bf_final = 0
+    _comps = list(model.components)
+    for _i in range(len(_comps)):
+        for _j in range(_i + 1, len(_comps)):
+            if _comps[_i].overlaps(_comps[_j]):
+                _bf_final += 1
+    if _bf_final > 0:
+        print(f"  Pre-save overlap check: {_bf_final} overlaps found, final resolution")
+        from legalization.legalizer import (
+            _greedy_resolve as _pre_save_greedy,
+            _enforce_boundary as _pre_save_boundary,
+            _cleanup_cap_ic_overlaps as _pre_save_cleanup,
+        )
+        _pre_save_greedy(model, lcfg.grid_mm, True, interior_bbox)
+        _pre_save_boundary(model, interior_bbox)
+        if final_decap_map:
+            _pre_save_cleanup(model, final_decap_map, interior_bbox, verbose=True)
+        # Last resort: if still overlapping, nudge the overlapping cap away
+        _bf_check = 0
+        _comps = list(model.components)
+        for _i in range(len(_comps)):
+            for _j in range(_i + 1, len(_comps)):
+                if _comps[_i].overlaps(_comps[_j]):
+                    _bf_check += 1
+        if _bf_check > 0:
+            print(f"  WARNING: {_bf_check} overlaps remain after all resolution passes")
 
     # Step 8: Final cost evaluation
     costs_after = cost_fn.evaluate(model)

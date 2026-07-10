@@ -168,9 +168,13 @@ def legalize(
         _enforce_boundary(model, interior_bbox, keepouts=keepouts)
         grid.build(list(model.components))
 
-    # Step 8: Cap nudge
+    # Step 8: Cap-IC displacement (direct-slot search + passive swap).
+    # Skips the nudge — see _repair_cap_ic_groups for why the nudge's
+    # Phase 2 (place at IC center) is counterproductive.
     if rules:
-        _nudge_caps_to_ics(model, rules, interior_bbox, verbose, cached_decap_map, grid)
+        _displace_passives_for_caps(model, rules, interior_bbox,
+                                    cached_decap_map=cached_decap_map,
+                                    verbose=verbose)
 
     # Step 9: Post-legalization HPWL recovery (cell sliding + pair swap)
     from legalization.post_legalize import post_legalization_refine
@@ -225,16 +229,42 @@ def legalize(
         grid.build(list(model.components))
 
     # Step 10.6: Large-overlap emergency resolution.
-    # If two large components (IC↔IC, or large cap↔IC) still overlap
-    # after all greedy passes, they're stuck in a corner where neither
-    # can be pushed away. Find the largest open space in the interior
-    # bbox and teleport the smaller one there. This is a last resort —
-    # it ignores HPWL — but a legal placement with bad HPWL is strictly
-    # better than an illegal one.
     grid.build(list(model.components))
     final_overlaps, _ = _compute_overlap_stats(model, grid)
     if final_overlaps > 0:
         _resolve_large_overlaps(model, interior_bbox, grid, verbose=verbose)
+        grid.build(list(model.components))
+
+    # Step 11: FINAL cap-IC repair + displacement.
+    # post_legalization_refine (Step 9) and the safety-net greedy passes
+    # (Steps 9.5, 10.5) move components for HPWL recovery — these moves
+    # do NOT propagate IC deltas to caps, so caps drift away from their
+    # ICs. This final pass re-attaches them. Runs UNCONDITIONALLY.
+    # Uses displacement (direct-slot search + passive swap) instead of
+    # the nudge — see _repair_cap_ic_groups for why.
+    if rules and cached_decap_map:
+        _repair_cap_ic_groups(model, rules, interior_bbox,
+                              cached_decap_map=cached_decap_map,
+                              verbose=verbose)
+        grid.build(list(model.components))
+
+    # Step 11.5: Brute-force final overlap check.
+    # The spatial grid can miss overlaps between components in non-adjacent
+    # cells (grid resolution limitation). Do a final brute-force pairwise
+    # check and resolve any remaining overlaps with greedy + boundary.
+    _bf_overlaps = 0
+    comps = list(model.components)
+    for i in range(len(comps)):
+        for j in range(i + 1, len(comps)):
+            if comps[i].overlaps(comps[j]):
+                _bf_overlaps += 1
+    if _bf_overlaps > 0:
+        if verbose:
+            print(f"  Brute-force final check: {_bf_overlaps} overlaps missed by grid, resolving")
+        _greedy_resolve(model, grid_mm, verbose, interior_bbox, cached_decap_map, grid, keepouts=keepouts)
+        _enforce_boundary(model, interior_bbox, keepouts=keepouts)
+        if rules and cached_decap_map:
+            _cleanup_cap_ic_overlaps(model, cached_decap_map, interior_bbox, verbose)
         grid.build(list(model.components))
 
     if verbose:
@@ -380,7 +410,12 @@ def _enforce_boundary(
         if getattr(comp, "component_type", "") in ic_types:
             ic_pre_positions[comp.ref] = (old_x, old_y)
         old_rot = comp.rotation
-        _enforce_boundary_single(comp, interior_bbox, board, keepouts=keepouts)
+        # Apply the type-aware edge keepout here (initial boundary clamp).
+        # Overlap resolvers call _enforce_boundary_single with
+        # extra_keepout_mm=0.0 so they can push ICs to the edge to
+        # resolve overlaps without the keepout fighting them.
+        _enforce_boundary_single(comp, interior_bbox, board,
+                                 keepouts=keepouts, model=model)
 
         # Rotation-aware: if still OOB and non-square, try 90°
         if _is_non_square(comp):
@@ -491,6 +526,8 @@ def _enforce_boundary_single(
     interior_bbox: tuple[float, float, float, float] | None,
     board: BoardOutline,
     keepouts: list[BoardOutline] | None = None,
+    extra_keepout_mm: float | None = None,
+    model: BoardModel | None = None,
 ) -> None:
     """Clamp a component inside the board / interior bbox AND push it
     out of any internal keepout zones (mounting holes, slots).
@@ -500,21 +537,52 @@ def _enforce_boundary_single(
     conservative — a component straddling a keepout boundary may still
     overlap it after the nudge — but the legalizer's overlap-resolution
     loop will catch any remaining overlap on subsequent iterations.
+
+    ``extra_keepout_mm`` shrinks the clamp bounds by an additional margin
+    for component types that need extra edge clearance (ICs, MCUs,
+    regulators).  If None, the keepout extra is looked up automatically
+    from the component's type via ``cost_state.edge_keepout_extra_for``
+    (density-adaptive when ``model`` is provided). Pass 0.0 explicitly to
+    disable the extra keepout for a specific call — this is what overlap
+    resolvers should do so they have freedom to push ICs toward the edge
+    to resolve overlaps without the keepout fighting them.
     """
     if comp.is_fixed or comp.is_edge_connector:
         return
+    # Look up the type-aware edge keepout extra if not explicitly provided.
+    # This is the common-sense DFM rule: ICs stay further from the board
+    # edge than passives (routing room, panelization clearance, assembly
+    # clearance). Without this, ICs end up with their courtyard flush
+    # against (board_edge + margin) — exactly what a human PCB designer
+    # avoids. Callers that need to push ICs to resolve overlaps should
+    # pass extra_keepout_mm=0.0 to disable this.
+    if extra_keepout_mm is None:
+        try:
+            from engine.cost_state import edge_keepout_extra_for
+            extra_keepout_mm = edge_keepout_extra_for(comp, model)
+        except Exception:
+            extra_keepout_mm = 0.0
     half_w = comp.effective_width / 2.0
     half_h = comp.effective_height / 2.0
     if interior_bbox:
-        x_min = interior_bbox[0] + half_w
-        x_max = interior_bbox[2] - half_w
-        y_min = interior_bbox[1] + half_h
-        y_max = interior_bbox[3] - half_h
+        x_min = interior_bbox[0] + half_w + extra_keepout_mm
+        x_max = interior_bbox[2] - half_w - extra_keepout_mm
+        y_min = interior_bbox[1] + half_h + extra_keepout_mm
+        y_max = interior_bbox[3] - half_h - extra_keepout_mm
     else:
-        x_min = board.x_min + half_w
-        x_max = board.x_max - half_w
-        y_min = board.y_min + half_h
-        y_max = board.y_max - half_h
+        x_min = board.x_min + half_w + extra_keepout_mm
+        x_max = board.x_max - half_w - extra_keepout_mm
+        y_min = board.y_min + half_h + extra_keepout_mm
+        y_max = board.y_max - half_h - extra_keepout_mm
+    # Guard against the clamp window collapsing for large ICs on small
+    # boards — fall back to the non-extra-keepout bounds so the component
+    # still has somewhere to sit.
+    if x_min > x_max:
+        x_min = interior_bbox[0] + half_w if interior_bbox else board.x_min + half_w
+        x_max = interior_bbox[2] - half_w if interior_bbox else board.x_max - half_w
+    if y_min > y_max:
+        y_min = interior_bbox[1] + half_h if interior_bbox else board.y_min + half_h
+        y_max = interior_bbox[3] - half_h if interior_bbox else board.y_max - half_h
     comp.x = max(x_min, min(comp.x, x_max))
     comp.y = max(y_min, min(comp.y, y_max))
 
@@ -821,8 +889,8 @@ def _resolve_overlaps(
                 grid=grid, comp_to_idx=comp_to_idx,
             )
 
-            _enforce_boundary_single(c1, interior_bbox, board, keepouts=keepouts)
-            _enforce_boundary_single(c2, interior_bbox, board, keepouts=keepouts)
+            _enforce_boundary_single(c1, interior_bbox, board, keepouts=keepouts, extra_keepout_mm=0.0)
+            _enforce_boundary_single(c2, interior_bbox, board, keepouts=keepouts, extra_keepout_mm=0.0)
 
             local_after = _count_pair_overlaps_involving(c1, c2, components, grid)
 
@@ -849,8 +917,8 @@ def _resolve_overlaps(
                     comp_map=comp_map,
                     grid=grid, comp_to_idx=comp_to_idx,
                 )
-                _enforce_boundary_single(c1, interior_bbox, board, keepouts=keepouts)
-                _enforce_boundary_single(c2, interior_bbox, board, keepouts=keepouts)
+                _enforce_boundary_single(c1, interior_bbox, board, keepouts=keepouts, extra_keepout_mm=0.0)
+                _enforce_boundary_single(c2, interior_bbox, board, keepouts=keepouts, extra_keepout_mm=0.0)
 
                 if base_score <= pre_score:
                     resolved_this_pass += 1
@@ -868,8 +936,8 @@ def _resolve_overlaps(
                     grid=grid, comp_to_idx=comp_to_idx,
                 )
 
-                _enforce_boundary_single(c1, interior_bbox, board, keepouts=keepouts)
-                _enforce_boundary_single(c2, interior_bbox, board, keepouts=keepouts)
+                _enforce_boundary_single(c1, interior_bbox, board, keepouts=keepouts, extra_keepout_mm=0.0)
+                _enforce_boundary_single(c2, interior_bbox, board, keepouts=keepouts, extra_keepout_mm=0.0)
 
                 local_after_reduced = _count_pair_overlaps_involving(c1, c2, components, grid)
                 if local_after_reduced <= local_before:
@@ -1018,7 +1086,7 @@ def _greedy_resolve(
                     for dist in nudge_dists:
                         comp.x = old_x + dx_dir * dist
                         comp.y = old_y + dy_dir * dist
-                        _enforce_boundary_single(comp, interior_bbox, board, keepouts=keepouts)
+                        _enforce_boundary_single(comp, interior_bbox, board, keepouts=keepouts, extra_keepout_mm=0.0)
 
                         new_overlaps = _count_overlaps_involving(comp, components, grid)
                         if new_overlaps < best_overlaps:
@@ -1408,7 +1476,7 @@ def _push_apart_hpwl(
                     mover.x = old_x + dx_dir * dist
                     mover.y = old_y + dy_dir * dist
                     if not can_skip_clamp:
-                        _enforce_boundary_single(mover, interior_bbox, board, keepouts=keepouts)
+                        _enforce_boundary_single(mover, interior_bbox, board, keepouts=keepouts, extra_keepout_mm=0.0)
 
                     if mover.overlaps(other):
                         pair_ov = mover.overlap_area(other)
@@ -1742,6 +1810,10 @@ def _cleanup_cap_ic_overlaps(
         """Return True if cap at (trial_x, trial_y) overlaps nothing (IC included).
 
         Mutates cap.x/cap.y temporarily; always restores.
+        Temporarily inflates the cap's courtyard by 0.3mm for the overlap
+        check to account for bbox discrepancies between the in-memory model
+        and the re-parsed .kicad_pcb file (rounding differences in
+        bbox_offset can cause tiny ~0.1mm overlaps to appear after write).
         """
         half_w = cap.effective_width / 2.0
         half_h = cap.effective_height / 2.0
@@ -1759,8 +1831,10 @@ def _cleanup_cap_ic_overlaps(
             return False
 
         saved_x, saved_y = cap.x, cap.y
+        saved_court = cap.courtyard_margin
         cap.x = trial_x
         cap.y = trial_y
+        cap.courtyard_margin = saved_court + 0.3  # safety inflation
         try:
             for other in components:
                 if other is cap or other.is_fixed:
@@ -1771,6 +1845,7 @@ def _cleanup_cap_ic_overlaps(
         finally:
             cap.x = saved_x
             cap.y = saved_y
+            cap.courtyard_margin = saved_court
 
     moved = 0
     unresolved = 0
@@ -1785,8 +1860,27 @@ def _cleanup_cap_ic_overlaps(
                 continue
             if cap.is_fixed or cap.is_edge_connector:
                 continue
+            # Check for overlap OR near-overlap. The model's bbox can differ
+            # slightly from the re-parsed .kicad_pcb file's bbox (rounding
+            # in bbox_offset), so a cap that's 0.1mm clear in the model
+            # might overlap after re-parse. Treat any cap within 0.5mm of
+            # its IC's bbox edge as "overlapping" and push it to a safe slot.
             if not cap.overlaps(ic):
-                continue
+                # Also check: is the cap within 0.5mm of the IC bbox?
+                cap_bbox = cap.bbox
+                ic_bbox_check = ic.bbox
+                gap_x = min(abs(cap_bbox[0] - ic_bbox_check[2]),
+                            abs(cap_bbox[2] - ic_bbox_check[0]))
+                gap_y = min(abs(cap_bbox[1] - ic_bbox_check[3]),
+                            abs(cap_bbox[3] - ic_bbox_check[1]))
+                # If bboxes intersect in one axis, check the gap in the other
+                intersects_x = cap_bbox[0] < ic_bbox_check[2] and cap_bbox[2] > ic_bbox_check[0]
+                intersects_y = cap_bbox[1] < ic_bbox_check[3] and cap_bbox[3] > ic_bbox_check[1]
+                near_overlap = ((intersects_x and gap_y < 0.5) or
+                                (intersects_y and gap_x < 0.5) or
+                                (gap_x < 0.5 and gap_y < 0.5))
+                if not near_overlap:
+                    continue
 
             ic_bbox = ic.bbox
             ic_bbox_cx = (ic_bbox[0] + ic_bbox[2]) / 2.0
@@ -1807,10 +1901,14 @@ def _cleanup_cap_ic_overlaps(
                 cap_half_w = cap.effective_width / 2.0
                 cap_half_h = cap.effective_height / 2.0
 
-                # Try spacings from tight (0.5mm gap) to wide (10mm gap).
+                # Try spacings from tight (1.0mm gap) to wide (10mm gap).
                 # Tight is preferred (cap close to IC); wide is the fallback
                 # when near slots are all occupied by other components.
-                for spacing_mult in [1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0]:
+                # NOTE: minimum gap is 1.0mm (not 0.5mm) to account for bbox
+                # discrepancies between the in-memory model and the re-parsed
+                # .kicad_pcb file — rounding in bbox_offset can cause ~0.1mm
+                # overlaps to appear after file write if the gap is too tight.
+                for spacing_mult in [2.0, 3.0, 4.0, 5.0, 8.0, 12.0, 20.0]:
                     gap = 0.5 * spacing_mult
                     right_cx = ic_bbox[2] + gap + cap_half_w
                     left_cx = ic_bbox[0] - gap - cap_half_w
@@ -2003,6 +2101,251 @@ def _cleanup_any_cap_ic_overlaps(
     if verbose and (moved or unresolved):
         print(f"  Any-cap-IC overlap cleanup: moved {moved} caps off non-assigned ICs"
               + (f", {unresolved} still overlapping (no free adjacent slot)" if unresolved else ""))
+
+
+def _displace_passives_for_caps(
+    model: BoardModel,
+    rules: list | None = None,
+    interior_bbox: tuple[float, float, float, float] | None = None,
+    cached_decap_map: dict | None = None,
+    verbose: bool = False,
+) -> int:
+    """Displace passives to make room for decoupling caps adjacent to their ICs.
+
+    When the board is dense, `_nudge_caps_to_ics` can't find overlap-free
+    slots within `max_distance_mm` of the IC — all 8 adjacent slots are
+    occupied by resistors/caps that don't belong to this IC. This pass
+    SWAPS the decoupling cap with a nearby passive that's sitting in a
+    prime slot adjacent to the IC. The passive goes to the cap's old
+    position (passives are less position-critical), and the cap takes the
+    prime slot next to its IC.
+
+    This is the "common sense" fix a human PCB designer applies: decoupling
+    caps have PRIORITY for the real estate immediately adjacent to IC power
+    pins. Other passives can sit anywhere.
+
+    Only displaces passives (resistors, capacitors not in any decap_map,
+    generics). Never displaces ICs, crystals, connectors, or other ICs'
+    assigned caps.
+
+    Returns the number of caps displaced into better slots.
+    """
+    if not rules:
+        return 0
+    max_dist = 5.0
+    for rule in rules:
+        if getattr(rule, 'name', '') == 'decoupling_proximity' and rule.enabled:
+            max_dist = rule.params.get('max_distance_mm', 5.0)
+            break
+    else:
+        return 0
+
+    decap_map = cached_decap_map if cached_decap_map is not None \
+        else _build_decoupling_map(model)
+    if not decap_map:
+        return 0
+
+    # Build a set of all cap refs that are assigned to some IC — these
+    # must NOT be displaced.
+    assigned_cap_refs: set[str] = set()
+    for caps in decap_map.values():
+        assigned_cap_refs.update(caps)
+
+    # Candidates for displacement: passives not assigned to any IC.
+    passive_types = {"resistor", "capacitor", "generic"}
+    passives = [c for c in model.components
+                if getattr(c, 'component_type', '') in passive_types
+                and c.ref not in assigned_cap_refs
+                and not c.is_fixed
+                and not c.is_edge_connector]
+
+    if not passives:
+        return 0
+
+    board = model.board
+    components = list(model.components)
+    moved = 0
+
+    for ic_ref, cap_refs in decap_map.items():
+        ic = model.get_component(ic_ref)
+        if ic is None or ic.is_fixed:
+            continue
+        for cap_ref in cap_refs:
+            cap = model.get_component(cap_ref)
+            if cap is None:
+                continue
+            d = math.hypot(ic.x - cap.x, ic.y - cap.y)
+            if d <= max_dist:
+                continue  # already close enough
+
+            # PHASE 1: Direct free-slot search.
+            # On sparse boards there are empty slots near the IC that the
+            # nudge missed (its search radius is limited). Search a wider
+            # grid of candidate positions around the IC and place the cap
+            # in the closest free one. No swap needed — just move the cap.
+            ic_bbox = ic.bbox
+            ic_cx = (ic_bbox[0] + ic_bbox[2]) / 2.0
+            ic_cy = (ic_bbox[1] + ic_bbox[3]) / 2.0
+            cap_hw = cap.effective_width / 2.0
+            cap_hh = cap.effective_height / 2.0
+            best_direct = None  # (x, y, dist)
+            # Search spacings from tight to wide, 8 directions each.
+            # NOTE: do NOT filter by max_dist here — max_dist is measured
+            # from the IC CENTER, but for a 10mm IC, a cap at 1mm from the
+            # bbox edge is already 6mm from center (>5mm threshold). The
+            # goal is to get the cap as close as possible to the IC BBOX,
+            # not to the IC center. A cap at 1mm from the bbox edge is
+            # excellent decoupling even if it's 6mm from center.
+            for spacing in [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0]:
+                gap = spacing
+                right_cx = ic_bbox[2] + gap + cap_hw
+                left_cx = ic_bbox[0] - gap - cap_hw
+                below_cy = ic_bbox[3] + gap + cap_hh
+                above_cy = ic_bbox[1] - gap - cap_hh
+                candidates = [
+                    (right_cx, ic_cy),
+                    (left_cx, ic_cy),
+                    (ic_cx, below_cy),
+                    (ic_cx, above_cy),
+                    (right_cx, below_cy),
+                    (left_cx, below_cy),
+                    (right_cx, above_cy),
+                    (left_cx, above_cy),
+                ]
+                for cand_x, cand_y in candidates:
+                    cand_d = math.hypot(ic.x - cand_x, ic.y - cand_y)
+                    if cand_d >= d:
+                        continue  # no improvement over current position
+                    # Check bounds
+                    if interior_bbox:
+                        if not (interior_bbox[0] + cap_hw <= cand_x <= interior_bbox[2] - cap_hw
+                                and interior_bbox[1] + cap_hh <= cand_y <= interior_bbox[3] - cap_hh):
+                            continue
+                    else:
+                        if not (board.x_min + cap_hw <= cand_x <= board.x_max - cap_hw
+                                and board.y_min + cap_hh <= cand_y <= board.y_max - cap_hh):
+                            continue
+                    # Check overlap-free (with safety margin)
+                    saved_x, saved_y = cap.x, cap.y
+                    saved_court = cap.courtyard_margin
+                    cap.x, cap.y = cand_x, cand_y
+                    cap.courtyard_margin = saved_court + 0.3
+                    free = True
+                    for other in components:
+                        if other is cap or other.is_fixed:
+                            continue
+                        if cap.overlaps(other):
+                            free = False
+                            break
+                    cap.x, cap.y = saved_x, saved_y
+                    cap.courtyard_margin = saved_court
+                    if not free:
+                        continue
+                    if best_direct is None or cand_d < best_direct[2]:
+                        best_direct = (cand_x, cand_y, cand_d)
+
+            if best_direct is not None:
+                cap.x, cap.y = best_direct[0], best_direct[1]
+                moved += 1
+                if verbose:
+                    print(f"    Direct-placed {cap_ref} near {ic_ref} "
+                          f"(dist {d:.1f} -> {best_direct[2]:.1f}mm)")
+                continue  # cap is now close enough, skip swap
+
+            # PHASE 2: Swap with a passive sitting in a prime slot.
+            best_passive = None
+            best_slot_dist = d  # current distance — must improve
+            for pas in passives:
+                if pas.ref == cap_ref:
+                    continue
+                pas_d = math.hypot(ic.x - pas.x, ic.y - pas.y)
+                if pas_d >= d:
+                    continue
+                # Check that swapping won't create an overlap at the
+                # passive's position (cap takes passive's slot).
+                orig_cx, orig_cy = cap.x, cap.y
+                cap.x, cap.y = pas.x, pas.y
+                cap_fits = True
+                for other in components:
+                    if other is cap or other is pas:
+                        continue
+                    if other is ic:
+                        continue
+                    if cap.overlaps(other):
+                        cap_fits = False
+                        break
+                if cap_fits and cap.overlaps(ic):
+                    cap_fits = False
+                cap.x, cap.y = orig_cx, orig_cy
+                if not cap_fits:
+                    continue
+                # Check that the passive fits at the cap's old position
+                orig_px, orig_py = pas.x, pas.y
+                pas.x, pas.y = orig_cx, orig_cy
+                pas_fits = True
+                for other in components:
+                    if other is cap or other is pas:
+                        continue
+                    if pas.overlaps(other):
+                        pas_fits = False
+                        break
+                pas.x, pas.y = orig_px, orig_py
+                if not pas_fits:
+                    continue
+                if pas_d < best_slot_dist:
+                    best_slot_dist = pas_d
+                    best_passive = pas
+
+            if best_passive is not None:
+                old_cap_x, old_cap_y = cap.x, cap.y
+                cap.x, cap.y = best_passive.x, best_passive.y
+                best_passive.x, best_passive.y = old_cap_x, old_cap_y
+                moved += 1
+                if verbose:
+                    new_d = math.hypot(ic.x - cap.x, ic.y - cap.y)
+                    print(f"    Displaced {best_passive.ref} to make room for "
+                          f"{cap_ref} near {ic_ref} (dist {d:.1f} -> {new_d:.1f}mm)")
+
+    if verbose and moved:
+        print(f"  Cap-IC displacement: swapped {moved} caps with passives "
+              f"to bring them within {max_dist}mm of their ICs")
+    return moved
+
+
+def _repair_cap_ic_groups(
+    model: BoardModel,
+    rules: list | None = None,
+    interior_bbox: tuple[float, float, float, float] | None = None,
+    cached_decap_map: dict | None = None,
+    verbose: bool = False,
+) -> None:
+    """Post-hoc repair pass that re-attaches decoupling caps to their ICs.
+
+    Two phases:
+    1. `_displace_passives_for_caps` — search for free slots adjacent to
+       each IC (8 directions × 9 spacings) and place the cap in the closest
+       one. If no free slot, swap with a passive sitting in a prime slot.
+    2. `_cleanup_cap_ic_overlaps` — resolve any cap-IC overlaps.
+
+    NOTE: does NOT run `_nudge_caps_to_ics` — that function's Phase 2
+    places caps at IC center (IC-excluded overlap check), then the cleanup
+    pushes them to 1mm from the bbox edge. For a 10mm IC, that's ~8mm
+    from center — worse than the displacement's direct-slot search which
+    can place caps at 1mm from the bbox edge directly.
+    """
+    if not rules:
+        rules = []
+    if not any(getattr(r, 'name', '') == 'decoupling_proximity' and r.enabled
+               for r in rules):
+        return
+    _displace_passives_for_caps(model, rules, interior_bbox,
+                                cached_decap_map=cached_decap_map,
+                                verbose=verbose)
+    decap_map = cached_decap_map if cached_decap_map is not None \
+        else _build_decoupling_map(model)
+    if decap_map:
+        _cleanup_cap_ic_overlaps(model, decap_map, interior_bbox,
+                                 verbose=verbose)
 
 
 def _resolve_large_overlaps(

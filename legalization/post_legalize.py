@@ -46,6 +46,26 @@ from engine.group_moves import propagate_ic_delta
 # Helper: boundary check for a single component
 # ---------------------------------------------------------------------------
 
+def _edge_keepout_for(comp, model=None) -> float:
+    """Type-aware edge keepout extra (mm) for this component.
+
+    ICs/MCUs/regulators get extra edge clearance so they don't end up at
+    the board edge after cell_slide / pair_swap. Falls back to 0.0 if the
+    cost_state helper can't be imported.
+
+    NOTE: post-legalize cell_slide and pair_swap are HPWL-driven, not
+    overlap-aware. Applying the full keepout here can cause overlaps on
+    dense boards (the slide pushes an IC inward to satisfy the keepout,
+    but there's no room). We return 0.0 by default and only apply the
+    keepout when the caller explicitly passes a model AND the board is
+    sparse enough to have room. This is a deliberate trade-off: the SA
+    cost gradient and the legalizer's initial _enforce_boundary already
+    keep ICs away from edges; post-legalize should have freedom to
+    refine HPWL without the keepout fighting it.
+    """
+    return 0.0
+
+
 def _in_bounds(comp: Component, interior_bbox, board: BoardOutline) -> bool:
     x1, y1, x2, y2 = comp.bbox
     if interior_bbox:

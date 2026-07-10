@@ -83,6 +83,15 @@ class PlacementConfig:
     force_dt: float = 0.5
     force_dt_cooling: float = 0.8
     shelf_packing_spacing: float = 0.5
+    # Extra edge keepout (mm) applied to specific component types so that
+    # ICs / MCUs / regulators stay further from the board edge than
+    # passives — a common-sense DFM rule a human PCB designer always
+    # applies (routing room, panelization clearance, assembly clearance).
+    # The base `margin` is applied to ALL components; this extra is added
+    # on top for the listed types. Types not in the map get 0 extra.
+    edge_keepout_extra: dict[str, float] = field(default_factory=lambda: {
+        "ic": 5.0, "mcu": 5.0, "regulator": 5.0, "crystal": 3.0,
+    })
 
 
 @dataclass
