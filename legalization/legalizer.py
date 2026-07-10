@@ -13,7 +13,7 @@ from typing import Optional
 
 from models.board_model import BoardModel, Component, BoardOutline, Net, Pad
 from engine.constraint_evaluator import evaluate_constraint_penalties, _build_decoupling_map
-from engine.group_moves import propagate_ic_delta
+from engine.group_moves import propagate_ic_delta, propagate_ic_move, is_macro_member
 from legalization.spatial_grid import SpatialGrid, compute_overlap_stats_fast, count_overlaps_involving_fast, count_pair_overlaps_involving_fast
 
 
@@ -168,13 +168,13 @@ def legalize(
         _enforce_boundary(model, interior_bbox, keepouts=keepouts)
         grid.build(list(model.components))
 
-    # Step 8: Cap-IC displacement (direct-slot search + passive swap).
-    # Skips the nudge — see _repair_cap_ic_groups for why the nudge's
-    # Phase 2 (place at IC center) is counterproductive.
-    if rules:
-        _displace_passives_for_caps(model, rules, interior_bbox,
-                                    cached_decap_map=cached_decap_map,
-                                    verbose=verbose)
+    # Step 8: Cap-IC re-attachment is NO LONGER NEEDED.
+    # With the macro approach, caps follow their IC through every stage
+    # via propagate_ic_move (translation + rotation). No nudge, displacement,
+    # or repair passes needed — the cap-IC group is a rigid body.
+    # _cleanup_cap_ic_overlaps (Step 10) remains as a safety net for edge
+    # cases where cap-IC overlaps might still occur (e.g. two ICs pushed
+    # close together and their caps overlap).
 
     # Step 9: Post-legalization HPWL recovery (cell sliding + pair swap)
     from legalization.post_legalize import post_legalization_refine
@@ -198,14 +198,11 @@ def legalize(
         _enforce_boundary(model, interior_bbox, keepouts=keepouts)
         grid.build(list(model.components))
 
-    # Step 10: Cap-IC overlap cleanup.
-    # _nudge_caps_to_ics above intentionally allows caps to overlap their own
-    # IC (Phase 2 places the cap at IC center because the IC is excluded from
-    # its overlap check).  That keeps caps close for decoupling but produces
-    # illegal placements.  This final pass moves any such cap to the closest
-    # overlap-free slot adjacent to its IC, leaving all other components
-    # untouched.  Runs after post-legalization refine so nothing re-introduces
-    # the overlap afterward.
+    # Step 10: Cap-IC overlap cleanup (edge-case safety net).
+    # The macro invariant keeps caps adjacent to their IC, but edge
+    # clamping at board boundaries can deform the macro and produce a
+    # cap-IC overlap. This final pass moves any such cap to the closest
+    # overlap-free slot adjacent to its IC.
     if rules:
         _cleanup_cap_ic_overlaps(model, cached_decap_map, interior_bbox, verbose)
 
@@ -235,23 +232,11 @@ def legalize(
         _resolve_large_overlaps(model, interior_bbox, grid, verbose=verbose)
         grid.build(list(model.components))
 
-    # Step 11: FINAL cap-IC repair + displacement.
-    # post_legalization_refine (Step 9) and the safety-net greedy passes
-    # (Steps 9.5, 10.5) move components for HPWL recovery — these moves
-    # do NOT propagate IC deltas to caps, so caps drift away from their
-    # ICs. This final pass re-attaches them. Runs UNCONDITIONALLY.
-    # Uses displacement (direct-slot search + passive swap) instead of
-    # the nudge — see _repair_cap_ic_groups for why.
-    if rules and cached_decap_map:
-        _repair_cap_ic_groups(model, rules, interior_bbox,
-                              cached_decap_map=cached_decap_map,
-                              verbose=verbose)
-        grid.build(list(model.components))
-
-    # Step 11.5: Brute-force final overlap check.
-    # The spatial grid can miss overlaps between components in non-adjacent
-    # cells (grid resolution limitation). Do a final brute-force pairwise
-    # check and resolve any remaining overlaps with greedy + boundary.
+    # Step 11: Brute-force final overlap check.
+    # Catch-all for any overlaps missed by the spatial grid (non-adjacent
+    # cells) or introduced by macro propagation clamping at board edges.
+    # The macro invariant (caps follow their IC via propagate_ic_move) is
+    # enforced in every stage above — no snapshot/restore needed.
     _bf_overlaps = 0
     comps = list(model.components)
     for i in range(len(comps)):
@@ -260,7 +245,7 @@ def legalize(
                 _bf_overlaps += 1
     if _bf_overlaps > 0:
         if verbose:
-            print(f"  Brute-force final check: {_bf_overlaps} overlaps missed by grid, resolving")
+            print(f"  Brute-force final check: {_bf_overlaps} overlaps, resolving")
         _greedy_resolve(model, grid_mm, verbose, interior_bbox, cached_decap_map, grid, keepouts=keepouts)
         _enforce_boundary(model, interior_bbox, keepouts=keepouts)
         if rules and cached_decap_map:
@@ -280,19 +265,27 @@ def _is_non_square(comp: Component) -> bool:
 
 
 def _snap_to_grid(model: BoardModel, grid_mm: float) -> None:
+    from engine.group_moves import get_macro_member_refs
     components = list(model.components)
     snapped_positions = []
-    # Track IC pre-snap positions so we can propagate deltas to caps.
-    ic_pre_positions: dict[str, tuple[float, float]] = {}
+    # Track IC pre-snap positions AND rotations for macro-aware propagation.
+    ic_pre: dict[str, tuple[float, float, float]] = {}  # ref -> (x, y, rot)
     ic_types = {"ic", "mcu", "regulator"}
+    # Macro member caps are NOT snapped independently — they follow their
+    # IC via propagate_ic_move at the end of this function.
+    macro_member_refs = get_macro_member_refs(model)
 
     for comp in components:
         if comp.is_fixed or comp.is_edge_connector:
             continue
+        # Skip macro member caps — they follow their IC via propagation.
+        if comp.ref in macro_member_refs:
+            continue
 
         old_x, old_y = comp.x, comp.y
+        old_rot = comp.rotation
         if getattr(comp, "component_type", "") in ic_types:
-            ic_pre_positions[comp.ref] = (old_x, old_y)
+            ic_pre[comp.ref] = (old_x, old_y, old_rot)
         new_x = round(old_x / grid_mm) * grid_mm
         new_y = round(old_y / grid_mm) * grid_mm
         comp.rotation = round(comp.rotation / 90.0) * 90.0
@@ -379,16 +372,17 @@ def _snap_to_grid(model: BoardModel, grid_mm: float) -> None:
 
         snapped_positions.append((comp, old_x, old_y))
 
-    # Group-aware: propagate IC snap deltas to caps so they follow.
+    # Macro-aware: propagate IC snap deltas (translation + rotation) to caps.
     for comp in components:
         if getattr(comp, "component_type", "") not in ic_types:
             continue
         if comp.is_fixed or comp.is_edge_connector:
             continue
-        pre = ic_pre_positions.get(comp.ref)
+        pre = ic_pre.get(comp.ref)
         if pre is None:
             continue
-        propagate_ic_delta(model, comp, pre[0], pre[1], comp.x, comp.y)
+        propagate_ic_move(model, comp, pre[0], pre[1], pre[2],
+                          comp.x, comp.y, comp.rotation)
 
 
 def _enforce_boundary(
@@ -396,20 +390,27 @@ def _enforce_boundary(
     interior_bbox: tuple[float, float, float, float] | None = None,
     keepouts: list[BoardOutline] | None = None,
 ) -> None:
+    from engine.group_moves import get_macro_member_refs
     board = model.board
     components = list(model.components)
     ic_types = {"ic", "mcu", "regulator"}
-    # Track IC pre-clamp positions so we can propagate deltas to caps.
-    ic_pre_positions: dict[str, tuple[float, float]] = {}
+    # Track IC pre-clamp positions AND rotations so we can propagate
+    # both translation and rotation to caps (macro-aware).
+    ic_pre: dict[str, tuple[float, float, float]] = {}  # ref -> (x, y, rot)
+    # Macro member caps follow their IC via propagate_ic_move — skip here.
+    macro_member_refs = get_macro_member_refs(model)
 
     for comp in model.components:
         if comp.is_fixed or comp.is_edge_connector:
             continue
+        # Skip macro member caps — they follow their IC via propagation.
+        if comp.ref in macro_member_refs:
+            continue
 
         old_x, old_y = comp.x, comp.y
-        if getattr(comp, "component_type", "") in ic_types:
-            ic_pre_positions[comp.ref] = (old_x, old_y)
         old_rot = comp.rotation
+        if getattr(comp, "component_type", "") in ic_types:
+            ic_pre[comp.ref] = (old_x, old_y, old_rot)
         # Apply the type-aware edge keepout here (initial boundary clamp).
         # Overlap resolvers call _enforce_boundary_single with
         # extra_keepout_mm=0.0 so they can push ICs to the edge to
@@ -508,17 +509,20 @@ def _enforce_boundary(
                 comp.x = best_x
                 comp.y = best_y
 
-    # Group-aware: propagate IC clamp deltas to caps so they follow.
+    # Macro-aware: propagate IC clamp deltas (translation + rotation) to caps.
+    # Uses propagate_ic_move instead of propagate_ic_delta so caps also
+    # follow IC rotation — the cap-IC group acts as a rigid body.
     bounds = (interior_bbox[0], interior_bbox[1], interior_bbox[2], interior_bbox[3]) if interior_bbox else None
     for comp in model.components:
         if getattr(comp, "component_type", "") not in ic_types:
             continue
         if comp.is_fixed or comp.is_edge_connector:
             continue
-        pre = ic_pre_positions.get(comp.ref)
+        pre = ic_pre.get(comp.ref)
         if pre is None:
             continue
-        propagate_ic_delta(model, comp, pre[0], pre[1], comp.x, comp.y, bounds=bounds)
+        propagate_ic_move(model, comp, pre[0], pre[1], pre[2],
+                          comp.x, comp.y, comp.rotation, bounds=bounds)
 
 
 def _enforce_boundary_single(
@@ -1013,9 +1017,15 @@ def _greedy_resolve(
     grid: SpatialGrid | None = None,
     keepouts: list[BoardOutline] | None = None,
 ) -> None:
+    from engine.group_moves import get_macro_member_refs
     board = model.board
     components = list(model.components)
-    movable = [c for c in components if not c.is_fixed and not c.is_edge_connector]
+    # MACRO-AWARE: Skip macro member caps — they follow their IC via
+    # propagate_ic_move. Moving them independently breaks the group.
+    macro_member_refs = get_macro_member_refs(model)
+    movable = [c for c in components
+               if not c.is_fixed and not c.is_edge_connector
+               and c.ref not in macro_member_refs]
     directions = [(1, 0), (-1, 0), (0, 1), (0, -1),
                   (1, 1), (-1, 1), (1, -1), (-1, -1)]
 
@@ -1159,18 +1169,21 @@ def _greedy_resolve(
                     comp.set_rotation(old_rot)
 
             comp_old_x, comp_old_y = comp.x, comp.y
+            comp_old_rot = comp.rotation
             comp.x, comp.y = best_x, best_y
             if comp.rotation != best_rot:
                 comp.set_rotation(best_rot)
 
             if best_overlaps < old_overlaps:
                 improved = True
-                # Group-aware: if comp is an IC, propagate delta to caps.
-                propagate_ic_delta(model, comp, comp_old_x, comp_old_y, comp.x, comp.y,
+                # Macro-aware: propagate IC move (translation + rotation) to caps.
+                propagate_ic_move(model, comp, comp_old_x, comp_old_y, comp_old_rot,
+                                  comp.x, comp.y, comp.rotation,
                                   bounds=(interior_bbox[0], interior_bbox[1], interior_bbox[2], interior_bbox[3]) if interior_bbox else None)
             elif best_overlaps == old_overlaps and best_local_hpwl < orig_local_hpwl:
                 improved = True
-                propagate_ic_delta(model, comp, comp_old_x, comp_old_y, comp.x, comp.y,
+                propagate_ic_move(model, comp, comp_old_x, comp_old_y, comp_old_rot,
+                                  comp.x, comp.y, comp.rotation,
                                   bounds=(interior_bbox[0], interior_bbox[1], interior_bbox[2], interior_bbox[3]) if interior_bbox else None)
             else:
                 comp.x, comp.y = old_x, old_y
@@ -1405,6 +1418,12 @@ def _push_apart_hpwl(
     c2_fixed = c2.is_fixed or c2.is_edge_connector
     if c1_fixed and c2_fixed:
         return
+    # MACRO-AWARE: if either side is a macro member cap, skip — its IC
+    # leader will be pushed elsewhere and the cap follows via propagate.
+    from engine.group_moves import get_macro_member_refs
+    macro_refs = get_macro_member_refs(model)
+    if c1.ref in macro_refs or c2.ref in macro_refs:
+        return
 
     directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
     base_dists = [grid_mm, grid_mm * 2, grid_mm * 5, grid_mm * 10]
@@ -1498,10 +1517,14 @@ def _push_apart_hpwl(
         _, which, new_x, new_y = best
         mover = c1 if which == 1 else c2
         mover_old_x, mover_old_y = mover.x, mover.y
+        mover_old_rot = mover.rotation
         mover.x = new_x
         mover.y = new_y
-        # Group-aware: if mover is an IC, propagate delta to its caps.
-        propagate_ic_delta(model, mover, mover_old_x, mover_old_y, new_x, new_y,
+        # Macro-aware: if mover is an IC, propagate move (translation +
+        # rotation) to its caps. push_apart doesn't rotate, but using
+        # propagate_ic_move is consistent and future-proof.
+        propagate_ic_move(model, mover, mover_old_x, mover_old_y, mover_old_rot,
+                          new_x, new_y, mover.rotation,
                           bounds=(interior_bbox[0], interior_bbox[1], interior_bbox[2], interior_bbox[3]) if interior_bbox else None)
 
 
@@ -1781,16 +1804,17 @@ def _cleanup_cap_ic_overlaps(
 ) -> None:
     """Move caps that overlap their assigned IC to the closest free adjacent slot.
 
-    _nudge_caps_to_ics intentionally lets a cap overlap its own IC (Phase 2
-    places it at the IC center via an IC-excluding overlap check).  That keeps
-    the cap close for decoupling but is geometrically illegal.  This pass
-    finds each such cap and relocates it to the nearest slot that sits just
-    outside the IC's bbox, checking overlap against *all* components (IC
-    included).  Leaves every other component where it is.
+    Edge-case safety net for the macro approach. The macro invariant
+    preserves cap-IC offset through translation + rotation, but when an
+    IC is clamped near a board edge the propagated cap position may end
+    up overlapping the IC. This pass finds each such cap and relocates
+    it to the nearest slot just outside the IC's bbox, checking overlap
+    against *all* components (IC included). Leaves every other component
+    where it is.
 
-    The candidate search mirrors _nudge_caps_to_ics Phase 1: 8 slots (4
-    sides + 4 corners) at spacings 0.5→2.5 mm, smallest spacing first so the
-    cap ends up packed tightly against the IC rather than drifting away.
+    The candidate search: 8 slots (4 sides + 4 corners) at spacings
+    0.5→2.5 mm, smallest spacing first so the cap ends up packed tightly
+    against the IC rather than drifting away.
     """
     if not decap_map:
         return
@@ -2103,251 +2127,6 @@ def _cleanup_any_cap_ic_overlaps(
               + (f", {unresolved} still overlapping (no free adjacent slot)" if unresolved else ""))
 
 
-def _displace_passives_for_caps(
-    model: BoardModel,
-    rules: list | None = None,
-    interior_bbox: tuple[float, float, float, float] | None = None,
-    cached_decap_map: dict | None = None,
-    verbose: bool = False,
-) -> int:
-    """Displace passives to make room for decoupling caps adjacent to their ICs.
-
-    When the board is dense, `_nudge_caps_to_ics` can't find overlap-free
-    slots within `max_distance_mm` of the IC — all 8 adjacent slots are
-    occupied by resistors/caps that don't belong to this IC. This pass
-    SWAPS the decoupling cap with a nearby passive that's sitting in a
-    prime slot adjacent to the IC. The passive goes to the cap's old
-    position (passives are less position-critical), and the cap takes the
-    prime slot next to its IC.
-
-    This is the "common sense" fix a human PCB designer applies: decoupling
-    caps have PRIORITY for the real estate immediately adjacent to IC power
-    pins. Other passives can sit anywhere.
-
-    Only displaces passives (resistors, capacitors not in any decap_map,
-    generics). Never displaces ICs, crystals, connectors, or other ICs'
-    assigned caps.
-
-    Returns the number of caps displaced into better slots.
-    """
-    if not rules:
-        return 0
-    max_dist = 5.0
-    for rule in rules:
-        if getattr(rule, 'name', '') == 'decoupling_proximity' and rule.enabled:
-            max_dist = rule.params.get('max_distance_mm', 5.0)
-            break
-    else:
-        return 0
-
-    decap_map = cached_decap_map if cached_decap_map is not None \
-        else _build_decoupling_map(model)
-    if not decap_map:
-        return 0
-
-    # Build a set of all cap refs that are assigned to some IC — these
-    # must NOT be displaced.
-    assigned_cap_refs: set[str] = set()
-    for caps in decap_map.values():
-        assigned_cap_refs.update(caps)
-
-    # Candidates for displacement: passives not assigned to any IC.
-    passive_types = {"resistor", "capacitor", "generic"}
-    passives = [c for c in model.components
-                if getattr(c, 'component_type', '') in passive_types
-                and c.ref not in assigned_cap_refs
-                and not c.is_fixed
-                and not c.is_edge_connector]
-
-    if not passives:
-        return 0
-
-    board = model.board
-    components = list(model.components)
-    moved = 0
-
-    for ic_ref, cap_refs in decap_map.items():
-        ic = model.get_component(ic_ref)
-        if ic is None or ic.is_fixed:
-            continue
-        for cap_ref in cap_refs:
-            cap = model.get_component(cap_ref)
-            if cap is None:
-                continue
-            d = math.hypot(ic.x - cap.x, ic.y - cap.y)
-            if d <= max_dist:
-                continue  # already close enough
-
-            # PHASE 1: Direct free-slot search.
-            # On sparse boards there are empty slots near the IC that the
-            # nudge missed (its search radius is limited). Search a wider
-            # grid of candidate positions around the IC and place the cap
-            # in the closest free one. No swap needed — just move the cap.
-            ic_bbox = ic.bbox
-            ic_cx = (ic_bbox[0] + ic_bbox[2]) / 2.0
-            ic_cy = (ic_bbox[1] + ic_bbox[3]) / 2.0
-            cap_hw = cap.effective_width / 2.0
-            cap_hh = cap.effective_height / 2.0
-            best_direct = None  # (x, y, dist)
-            # Search spacings from tight to wide, 8 directions each.
-            # NOTE: do NOT filter by max_dist here — max_dist is measured
-            # from the IC CENTER, but for a 10mm IC, a cap at 1mm from the
-            # bbox edge is already 6mm from center (>5mm threshold). The
-            # goal is to get the cap as close as possible to the IC BBOX,
-            # not to the IC center. A cap at 1mm from the bbox edge is
-            # excellent decoupling even if it's 6mm from center.
-            for spacing in [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0]:
-                gap = spacing
-                right_cx = ic_bbox[2] + gap + cap_hw
-                left_cx = ic_bbox[0] - gap - cap_hw
-                below_cy = ic_bbox[3] + gap + cap_hh
-                above_cy = ic_bbox[1] - gap - cap_hh
-                candidates = [
-                    (right_cx, ic_cy),
-                    (left_cx, ic_cy),
-                    (ic_cx, below_cy),
-                    (ic_cx, above_cy),
-                    (right_cx, below_cy),
-                    (left_cx, below_cy),
-                    (right_cx, above_cy),
-                    (left_cx, above_cy),
-                ]
-                for cand_x, cand_y in candidates:
-                    cand_d = math.hypot(ic.x - cand_x, ic.y - cand_y)
-                    if cand_d >= d:
-                        continue  # no improvement over current position
-                    # Check bounds
-                    if interior_bbox:
-                        if not (interior_bbox[0] + cap_hw <= cand_x <= interior_bbox[2] - cap_hw
-                                and interior_bbox[1] + cap_hh <= cand_y <= interior_bbox[3] - cap_hh):
-                            continue
-                    else:
-                        if not (board.x_min + cap_hw <= cand_x <= board.x_max - cap_hw
-                                and board.y_min + cap_hh <= cand_y <= board.y_max - cap_hh):
-                            continue
-                    # Check overlap-free (with safety margin)
-                    saved_x, saved_y = cap.x, cap.y
-                    saved_court = cap.courtyard_margin
-                    cap.x, cap.y = cand_x, cand_y
-                    cap.courtyard_margin = saved_court + 0.3
-                    free = True
-                    for other in components:
-                        if other is cap or other.is_fixed:
-                            continue
-                        if cap.overlaps(other):
-                            free = False
-                            break
-                    cap.x, cap.y = saved_x, saved_y
-                    cap.courtyard_margin = saved_court
-                    if not free:
-                        continue
-                    if best_direct is None or cand_d < best_direct[2]:
-                        best_direct = (cand_x, cand_y, cand_d)
-
-            if best_direct is not None:
-                cap.x, cap.y = best_direct[0], best_direct[1]
-                moved += 1
-                if verbose:
-                    print(f"    Direct-placed {cap_ref} near {ic_ref} "
-                          f"(dist {d:.1f} -> {best_direct[2]:.1f}mm)")
-                continue  # cap is now close enough, skip swap
-
-            # PHASE 2: Swap with a passive sitting in a prime slot.
-            best_passive = None
-            best_slot_dist = d  # current distance — must improve
-            for pas in passives:
-                if pas.ref == cap_ref:
-                    continue
-                pas_d = math.hypot(ic.x - pas.x, ic.y - pas.y)
-                if pas_d >= d:
-                    continue
-                # Check that swapping won't create an overlap at the
-                # passive's position (cap takes passive's slot).
-                orig_cx, orig_cy = cap.x, cap.y
-                cap.x, cap.y = pas.x, pas.y
-                cap_fits = True
-                for other in components:
-                    if other is cap or other is pas:
-                        continue
-                    if other is ic:
-                        continue
-                    if cap.overlaps(other):
-                        cap_fits = False
-                        break
-                if cap_fits and cap.overlaps(ic):
-                    cap_fits = False
-                cap.x, cap.y = orig_cx, orig_cy
-                if not cap_fits:
-                    continue
-                # Check that the passive fits at the cap's old position
-                orig_px, orig_py = pas.x, pas.y
-                pas.x, pas.y = orig_cx, orig_cy
-                pas_fits = True
-                for other in components:
-                    if other is cap or other is pas:
-                        continue
-                    if pas.overlaps(other):
-                        pas_fits = False
-                        break
-                pas.x, pas.y = orig_px, orig_py
-                if not pas_fits:
-                    continue
-                if pas_d < best_slot_dist:
-                    best_slot_dist = pas_d
-                    best_passive = pas
-
-            if best_passive is not None:
-                old_cap_x, old_cap_y = cap.x, cap.y
-                cap.x, cap.y = best_passive.x, best_passive.y
-                best_passive.x, best_passive.y = old_cap_x, old_cap_y
-                moved += 1
-                if verbose:
-                    new_d = math.hypot(ic.x - cap.x, ic.y - cap.y)
-                    print(f"    Displaced {best_passive.ref} to make room for "
-                          f"{cap_ref} near {ic_ref} (dist {d:.1f} -> {new_d:.1f}mm)")
-
-    if verbose and moved:
-        print(f"  Cap-IC displacement: swapped {moved} caps with passives "
-              f"to bring them within {max_dist}mm of their ICs")
-    return moved
-
-
-def _repair_cap_ic_groups(
-    model: BoardModel,
-    rules: list | None = None,
-    interior_bbox: tuple[float, float, float, float] | None = None,
-    cached_decap_map: dict | None = None,
-    verbose: bool = False,
-) -> None:
-    """Post-hoc repair pass that re-attaches decoupling caps to their ICs.
-
-    Two phases:
-    1. `_displace_passives_for_caps` — search for free slots adjacent to
-       each IC (8 directions × 9 spacings) and place the cap in the closest
-       one. If no free slot, swap with a passive sitting in a prime slot.
-    2. `_cleanup_cap_ic_overlaps` — resolve any cap-IC overlaps.
-
-    NOTE: does NOT run `_nudge_caps_to_ics` — that function's Phase 2
-    places caps at IC center (IC-excluded overlap check), then the cleanup
-    pushes them to 1mm from the bbox edge. For a 10mm IC, that's ~8mm
-    from center — worse than the displacement's direct-slot search which
-    can place caps at 1mm from the bbox edge directly.
-    """
-    if not rules:
-        rules = []
-    if not any(getattr(r, 'name', '') == 'decoupling_proximity' and r.enabled
-               for r in rules):
-        return
-    _displace_passives_for_caps(model, rules, interior_bbox,
-                                cached_decap_map=cached_decap_map,
-                                verbose=verbose)
-    decap_map = cached_decap_map if cached_decap_map is not None \
-        else _build_decoupling_map(model)
-    if decap_map:
-        _cleanup_cap_ic_overlaps(model, decap_map, interior_bbox,
-                                 verbose=verbose)
-
-
 def _resolve_large_overlaps(
     model: BoardModel,
     interior_bbox: tuple[float, float, float, float] | None,
@@ -2372,6 +2151,10 @@ def _resolve_large_overlaps(
     """
     board = model.board
     ic_types = {"ic", "mcu", "regulator"}
+
+    # MACRO-AWARE: skip macro member caps — they follow their IC leader.
+    from engine.group_moves import get_macro_member_refs
+    macro_refs = get_macro_member_refs(model)
 
     if interior_bbox is not None:
         rx_min, ry_min, rx_max, ry_max = interior_bbox
@@ -2423,8 +2206,12 @@ def _resolve_large_overlaps(
     for i, a in enumerate(components):
         if a.is_fixed or a.is_edge_connector:
             continue
+        if a.ref in macro_refs:
+            continue
         for b in components[i+1:]:
             if b.is_fixed or b.is_edge_connector:
+                continue
+            if b.ref in macro_refs:
                 continue
             if not a.overlaps(b):
                 continue

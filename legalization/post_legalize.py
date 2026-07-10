@@ -125,11 +125,22 @@ def cell_slide(
     verbose: bool,
     cached_decap_map: dict | None,
 ) -> None:
-    """Slide each movable component along its row to reduce local HPWL."""
+    """Slide each movable component along its row to reduce local HPWL.
+
+    MACRO-AWARE: Macro member caps (decoupling caps assigned to ICs) are
+    SKIPPED — they follow their IC via the group-aware SA/legalizer moves
+    and should never be moved independently. Sliding a cap away from its
+    IC breaks the decoupling group.
+    """
+    from engine.group_moves import get_macro_member_refs
+
     board = model.board
     components = list(model.components)
+    # Macro member caps follow their IC — exclude from independent slide.
+    macro_member_refs = get_macro_member_refs(model)
     movable = [c for c in components
-               if not c.is_fixed and not c.is_edge_connector]
+               if not c.is_fixed and not c.is_edge_connector
+               and c.ref not in macro_member_refs]
 
     # Step sizes for sliding: small grid steps then larger jumps
     slide_steps = [grid_mm, grid_mm * 2, grid_mm * 5, 0.5, 1.0, 2.0]
@@ -324,11 +335,19 @@ def pair_swap_refine(
     verbose: bool,
     cached_decap_map: dict | None,
 ) -> None:
-    """Try swapping positions of component pairs to reduce HPWL."""
+    """Try swapping positions of component pairs to reduce HPWL.
+
+    MACRO-AWARE: Macro member caps are SKIPPED — they follow their IC.
+    """
+    from engine.group_moves import get_macro_member_refs
+
     board = model.board
     components = list(model.components)
+    # Macro member caps follow their IC — exclude from independent swap.
+    macro_member_refs = get_macro_member_refs(model)
     movable = [c for c in components
-               if not c.is_fixed and not c.is_edge_connector]
+               if not c.is_fixed and not c.is_edge_connector
+               and c.ref not in macro_member_refs]
 
     comp_net_lookup = _build_comp_net_lookup(model)
     comp_map = {c.ref: c for c in components}

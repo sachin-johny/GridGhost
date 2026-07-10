@@ -771,28 +771,34 @@ def _build_swap_candidates(
 
     For small boards (<60 components), falls back to all-pairs since
     the overhead of filtering exceeds the brute-force cost.
+
+    MACRO-AWARE: Macro member caps (decoupling caps assigned to ICs)
+    are EXCLUDED from swap candidates. They follow their IC via the
+    group-aware SA move operators (do_translate/do_swap/do_rotate/
+    do_median) and should never be swapped independently — swapping a
+    cap away from its IC breaks the decoupling group.
     """
-    n = len(moveable_indices)
+    from engine.group_moves import is_macro_member, get_decap_map
+
+    # Filter out macro member caps — they move with their IC, never independently
+    decap_map = get_decap_map(model)
+    swappable = [idx for idx in moveable_indices
+                 if not is_macro_member(model, idx, decap_map)]
+    n = len(swappable)
 
     # For small boards, all-pairs is fine
     if n < 60:
-        all_set = set(moveable_indices)
-        return {idx: [j for j in moveable_indices if j != idx] for idx in moveable_indices}
+        return {idx: [j for j in swappable if j != idx] for idx in swappable}
 
     # Build per-component data
     comp_area = {}
     comp_nets = {}
     comp_hpwl = {}
 
-    for idx in moveable_indices:
+    for idx in swappable:
         comp = model.components[idx]
         comp_area[idx] = comp.effective_width * comp.effective_height
-        # Store as a sorted list so downstream iteration is deterministic
-        # (set iteration varies with id() under ASLR, which made the
-        # swap-candidate order — and therefore the entire greedy+swap
-        # trajectory — non-deterministic across runs).
         comp_nets[idx] = sorted(cost_state._comp_nets[idx])
-        # HPWL contribution
         total = 0.0
         for net_name in comp_nets[idx]:
             if net_name in cost_state._net_hpwl:
@@ -801,7 +807,7 @@ def _build_swap_candidates(
 
     # Build net → component index map for fast lookup
     net_to_comps: dict[str, list[int]] = {}
-    for idx in moveable_indices:
+    for idx in swappable:
         for net_name in comp_nets[idx]:
             if net_name not in net_to_comps:
                 net_to_comps[net_name] = []
@@ -809,7 +815,7 @@ def _build_swap_candidates(
 
     # Build size-class buckets (log-scale area bins)
     size_buckets: dict[int, list[int]] = {}
-    for idx in moveable_indices:
+    for idx in swappable:
         area = comp_area[idx]
         if area <= 0:
             bucket = 0
@@ -820,7 +826,7 @@ def _build_swap_candidates(
         size_buckets[bucket].append(idx)
 
     # Build candidates for each component
-    candidates: dict[int, list[int]] = {idx: [] for idx in moveable_indices}
+    candidates: dict[int, list[int]] = {idx: [] for idx in swappable}
     seen_pairs: set[tuple[int, int]] = set()
 
     # Strategy 1: Net-connected candidates (highest priority)
@@ -859,7 +865,7 @@ def _build_swap_candidates(
 
     # Strategy 3: Top-20% HPWL contributors can swap with each other
     # (even if not net-connected or size-similar)
-    sorted_by_hpwl = sorted(moveable_indices, key=lambda i: comp_hpwl[i], reverse=True)
+    sorted_by_hpwl = sorted(swappable, key=lambda i: comp_hpwl[i], reverse=True)
     top_k = max(5, n // 5)
     top_comps = sorted_by_hpwl[:top_k]
     for i_idx in range(len(top_comps)):
@@ -885,7 +891,17 @@ def _try_single_swap(
 
     Tries: position swap, then position+rotation swap. Accepts the best
     improving option. Reverts everything if no improvement.
+
+    MACRO-AWARE: Rejects swaps where either component is a macro member
+    cap. Swapping a cap away from its IC breaks the decoupling group.
     """
+    # Macro invariant: caps follow their IC — never swap them independently.
+    from engine.group_moves import is_macro_member, get_decap_map
+    decap_map = get_decap_map(model)
+    if (is_macro_member(model, idx_a, decap_map)
+            or is_macro_member(model, idx_b, decap_map)):
+        return False
+
     c_a = model.components[idx_a]
     c_b = model.components[idx_b]
 
@@ -1181,57 +1197,6 @@ def _resolve_overlaps_greedy(
     cost_state._compute_all()
 
 
-def _repair_cap_ic_groups_after_sa(model, cost_state, config):
-    """Re-attach decoupling caps to their ICs after SA + greedy + swap.
-
-    The SA move operators (do_translate / do_swap / do_rotate / do_median)
-    and the greedy nudge/rotate operators correctly propagate IC deltas to
-    caps. But `_try_single_swap` (used by `_greedy_swap_refine`) does NOT —
-    it swaps IC positions without moving the caps, leaving the cap-IC link
-    broken after every accepted IC swap. Greedy swap runs in both the
-    greedy-only path and the post-SA path, so this gap fires on every board.
-
-    This post-hoc repair runs `_nudge_caps_to_ics` (closes distance gaps)
-    and `_cleanup_cap_ic_overlaps` (resolves any cap-IC overlaps the nudge
-    leaves behind). Idempotent and cheap (~1–2ms on a 50-component board).
-
-    Local import avoids a circular dependency: legalizer imports from
-    engine.group_moves which imports from engine.cost_state which is
-    imported here.
-    """
-    rules = getattr(cost_state, '_rules', None)
-    if not rules:
-        return
-    if not any(getattr(r, 'name', '') == 'decoupling_proximity' and r.enabled
-               for r in rules):
-        return
-    try:
-        from legalization.legalizer import _repair_cap_ic_groups
-        # Compute interior_bbox the same way the CLI does — board ± 5mm.
-        # This is only used for clamping cap positions during the nudge,
-        # so an approximate bbox is fine.
-        board = model.board
-        margin = 5.0
-        interior = [c for c in model.components
-                    if not c.is_fixed
-                    and getattr(c, 'component_type', '') != 'connector']
-        if interior:
-            ib = (board.x_min + margin, board.y_min + margin,
-                  board.x_max - margin, board.y_max - margin)
-        else:
-            ib = None
-        cached_decap_map = getattr(cost_state, '_decap_map', None)
-        _repair_cap_ic_groups(model, rules, ib,
-                              cached_decap_map=cached_decap_map,
-                              verbose=False)
-        # The nudge may have moved caps (and not the ICs), so the cost
-        # state's cached cap bboxes / overlaps are stale. Re-compute.
-        cost_state._compute_all()
-    except Exception:
-        # Repair is best-effort — never fail SA because of it.
-        pass
-
-
 def simulate_annealing(
     model: BoardModel,
     cost_state: CostState,
@@ -1270,11 +1235,8 @@ def simulate_annealing(
             print("  Phase 3: Final greedy nudge+rotate...")
         _greedy_refine(model, cost_state, moveable_indices, config, enhanced=True)
 
-        # Phase 3.5: Repair cap-IC groups. `_try_single_swap` (Phase 2)
-        # does not propagate IC deltas to caps, so accepted IC swaps leave
-        # the caps behind. Re-attach them now so the legalizer starts from
-        # a sane cap-IC configuration.
-        _repair_cap_ic_groups_after_sa(model, cost_state, config)
+        # Phase 3.5: macro invariant is preserved by _try_single_swap's
+        # macro-member early-out — no post-hoc repair needed.
 
         if cost_state.overlap_count > 0 and config.verbose:
             print(f"  Greedy leaving {cost_state.overlap_count} overlaps for legalizer to resolve")
@@ -1339,9 +1301,7 @@ def simulate_annealing(
     _greedy_swap_refine(model, cost_state, moveable_indices, config)
     _greedy_refine(model, cost_state, moveable_indices, config, enhanced=True)
 
-    # Repair cap-IC groups after greedy swap (which doesn't propagate IC
-    # deltas to caps). Same rationale as Phase 3.5 in the greedy-only path.
-    _repair_cap_ic_groups_after_sa(model, cost_state, config)
+    # Macro invariant preserved by _try_single_swap + group-aware greedy ops.
 
     # NO overlap resolution in SA. The legalizer handles overlaps.
     # SA overlap resolution destroys HPWL optimization for dense boards

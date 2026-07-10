@@ -322,6 +322,14 @@ class CostState:
                         cap = model.get_component(cap_ref)
                         if cap:
                             self._decap_pairs.append((ic, cap))
+                # Warm macro registry caches — legalizer/post_legalize
+                # query them on every stage. Build once here so the first
+                # stage doesn't pay the build cost mid-pipeline.
+                from engine.group_moves import (
+                    get_macro_member_refs, get_macro_leader_of,
+                )
+                get_macro_member_refs(model)
+                get_macro_leader_of(model)
             if 'crystal_mcu' in rule_names:
                 self._crystal_pairs = _find_crystal_mcu_pairs(model)
             if 'connector_edge' in rule_names:

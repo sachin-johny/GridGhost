@@ -353,15 +353,11 @@ def cmd_place(args) -> None:
               f"non-cap-IC overlaps)...")
         from legalization.legalizer import (
             _greedy_resolve, _cleanup_cap_ic_overlaps,
-            _displace_passives_for_caps,
         )
         _greedy_resolve(model, lcfg.grid_mm, True, interior_bbox)
-        # Re-attach caps to ICs after greedy cleanup pushed them away.
-        # Uses displacement (not nudge) — see _repair_cap_ic_groups for why.
+        # With the macro approach, caps follow their IC through greedy
+        # resolve via propagate_ic_move. No displace/nudge needed.
         if final_decap_map and getattr(model, 'active_rules', None):
-            _displace_passives_for_caps(model, model.active_rules, interior_bbox,
-                                        cached_decap_map=final_decap_map,
-                                        verbose=True)
             _cleanup_cap_ic_overlaps(model, final_decap_map, interior_bbox,
                                      verbose=True)
         print_board_summary(model, "After Post-Legalization Overlap Resolution")
@@ -395,12 +391,12 @@ def cmd_place(args) -> None:
             _resolve_ic_ic_overlaps(model, interior_bbox, _grid, verbose=True)
             _enforce_boundary(model, interior_bbox)
 
-    # Step 7.6: FINAL brute-force overlap check + cap-IC displacement.
+    # Step 7.6: FINAL brute-force overlap check.
+    # With the macro approach, caps follow their IC — no displacement needed.
     from legalization.legalizer import (
         _greedy_resolve as _final_greedy,
         _enforce_boundary as _final_boundary,
         _cleanup_cap_ic_overlaps as _final_cleanup,
-        _displace_passives_for_caps as _final_displace,
     )
     _bf_overlaps = 0
     _comps = list(model.components)
@@ -413,10 +409,8 @@ def cmd_place(args) -> None:
         print(f"  Final brute-force check: {_bf_overlaps} overlaps found, resolving")
         _final_greedy(model, lcfg.grid_mm, True, interior_bbox)
         _final_boundary(model, interior_bbox)
-        _final_displace(model,
-                        model.active_rules if getattr(model, 'active_rules', None) else profile.rules,
-                        interior_bbox, cached_decap_map=final_decap_map, verbose=True)
-        _final_cleanup(model, final_decap_map, interior_bbox, verbose=True)
+        if final_decap_map:
+            _final_cleanup(model, final_decap_map, interior_bbox, verbose=True)
         _bf_after = 0
         _comps = list(model.components)
         for _i in range(len(_comps)):

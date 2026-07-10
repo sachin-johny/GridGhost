@@ -24,6 +24,7 @@ by `engine/cost_state.py:CostState.__init__`. If that cache is missing
 """
 from __future__ import annotations
 
+import math
 from typing import Iterable, TYPE_CHECKING
 
 from models.board_model import BoardModel
@@ -85,6 +86,55 @@ def get_ref_idx_map(model: BoardModel) -> dict[str, int]:
     rim = {c.ref: i for i, c in enumerate(model.components)}
     model._comp_ref_idx_map = rim
     return rim
+
+
+def get_macro_member_refs(model: BoardModel) -> frozenset[str]:
+    """Cached set of all cap refs that belong to any macro.
+
+    Use for O(1) 'is this component a macro member?' checks across all
+    pipeline stages. The set is the flattened union of every cap ref in
+    ``get_decap_map(model).values()``.
+    """
+    cached = getattr(model, '_macro_member_refs_cache', None)
+    if cached is None:
+        decap_map = get_decap_map(model)
+        cached = frozenset(
+            ref for cap_refs in decap_map.values() for ref in cap_refs
+        )
+        model._macro_member_refs_cache = cached
+    return cached
+
+
+def get_macro_leader_of(model: BoardModel, cap_ref: str | None = None) -> str | None:
+    """Cached reverse map: cap_ref -> ic_ref. None if cap is independent.
+
+    Pass ``cap_ref=None`` to just warm the cache (returns None).
+    """
+    cached = getattr(model, '_macro_leader_of_cache', None)
+    if cached is None:
+        decap_map = get_decap_map(model)
+        cached = {}
+        for ic_ref, cap_refs in decap_map.items():
+            for r in cap_refs:
+                cached[r] = ic_ref
+        model._macro_leader_of_cache = cached
+    if cap_ref is None:
+        return None
+    return cached.get(cap_ref)
+
+
+def clear_macro_caches(model: BoardModel) -> None:
+    """Invalidate macro-related caches on ``model``.
+
+    Call this whenever components are added/removed (refs change). SA and
+    legalizer mutate positions in place — refs don't change — so they do
+    NOT need to call this.
+    """
+    for attr in ('_macro_member_refs_cache', '_macro_leader_of_cache',
+                 '_decap_map_cache', '_signal_flow_chain_map_cache',
+                 '_comp_ref_idx_map'):
+        if hasattr(model, attr):
+            delattr(model, attr)
 
 
 def get_group_indices(
@@ -261,7 +311,7 @@ def propagate_ic_delta(
     bounds: tuple[float, float, float, float] | None = None,
     decap_map: dict[str, list[str]] | None = None,
 ) -> list[int]:
-    """Propagate an IC's position delta to its assigned caps.
+    """Propagate an IC's TRANSLATION delta to its assigned caps.
 
     Call this AFTER a legalizer/SA function has moved an IC from
     (old_x, old_y) to (new_x, new_y). Each cap is translated by the
@@ -270,12 +320,9 @@ def propagate_ic_delta(
     Returns the list of cap indices that were moved. If `ic` is not an
     IC or has no caps, returns [].
 
-    This is the legalizer's group-awareness hook: any function that
-    moves a component should call this with the IC's old/new position
-    so caps follow. Caps that get clamped to bounds (because the IC
-    moved near a board edge) will be temporarily desynchronized from
-    the IC — the legalizer's `_nudge_caps_to_ics` (Step 8) repairs
-    that at the end.
+    NOTE: This only handles translation. If the IC was also rotated,
+    use `propagate_ic_move` instead (which handles both translation
+    AND rotation).
     """
     if getattr(ic, 'component_type', '') not in IC_TYPES:
         return []
@@ -283,7 +330,6 @@ def propagate_ic_delta(
         return []
     dx = new_x - old_x
     dy = new_y - old_y
-    # Find the IC's index by ref
     if decap_map is None:
         decap_map = get_decap_map(model)
     cap_refs = decap_map.get(ic.ref, [])
@@ -309,3 +355,122 @@ def propagate_ic_delta(
         cap.y = max(y_min + half_h, min(cap.y + dy, y_max - half_h))
         moved.append(cap_idx)
     return moved
+
+
+def propagate_ic_move(
+    model: BoardModel,
+    ic: Component,
+    old_x: float,
+    old_y: float,
+    old_rot: float,
+    new_x: float,
+    new_y: float,
+    new_rot: float,
+    bounds: tuple[float, float, float, float] | None = None,
+    decap_map: dict[str, list[str]] | None = None,
+) -> list[int]:
+    """Propagate an IC's TRANSLATION + ROTATION to its assigned caps.
+
+    This is the macro-aware propagation function. When an IC moves from
+    (old_x, old_y, old_rot) to (new_x, new_y, new_rot), each cap:
+      1. Computes its offset from the IC's OLD center
+      2. Rotates that offset by (new_rot - old_rot) around the IC center
+      3. Translates by (new_x - old_x, new_y - old_y)
+      4. Clamps to bounds
+
+    This preserves the cap's relative position to the IC through both
+    translation AND rotation — the cap-IC group acts as a rigid body
+    (a "macro" or "composite component").
+
+    Caps do NOT change their own rotation — only their (x,y) position
+    rotates around the IC. Cap orientation is independent of IC
+    orientation (a decoupling cap doesn't need to rotate when the IC
+    rotates; it just needs to stay adjacent to the same power pin).
+
+    Returns the list of cap indices that were moved.
+    """
+    if getattr(ic, 'component_type', '') not in IC_TYPES:
+        return []
+    dx = new_x - old_x
+    dy = new_y - old_y
+    drot = new_rot - old_rot
+    # Normalize rotation delta to [-360, 360]
+    drot = ((drot + 360.0) % 360.0)
+    if drot > 180.0:
+        drot -= 360.0
+
+    if abs(dx) < 1e-9 and abs(dy) < 1e-9 and abs(drot) < 1e-9:
+        return []
+
+    if decap_map is None:
+        decap_map = get_decap_map(model)
+    cap_refs = decap_map.get(ic.ref, [])
+    if not cap_refs:
+        return []
+    rim = get_ref_idx_map(model)
+    moved = []
+
+    if bounds is None:
+        b = model.board
+        x_min, y_min, x_max, y_max = b.x_min, b.y_min, b.x_max, b.y_max
+    else:
+        x_min, y_min, x_max, y_max = bounds
+
+    # Rotation matrix for the cap offset (KiCad CW-positive convention)
+    if abs(drot) > 1e-9:
+        rad = math.radians(drot)
+        cos_r = math.cos(rad)
+        sin_r = -math.sin(rad)  # KiCad CW-positive
+    else:
+        cos_r, sin_r = 1.0, 0.0
+
+    for cap_ref in cap_refs:
+        cap_idx = rim.get(cap_ref)
+        if cap_idx is None:
+            continue
+        cap = model.components[cap_idx]
+        if cap.is_fixed or getattr(cap, 'is_edge_connector', False):
+            continue
+
+        # Compute cap offset from IC's OLD center, rotate, then translate
+        ox = cap.x - old_x
+        oy = cap.y - old_y
+        if abs(drot) > 1e-9:
+            new_ox = ox * cos_r - oy * sin_r
+            new_oy = ox * sin_r + oy * cos_r
+        else:
+            new_ox, new_oy = ox, oy
+
+        # New cap position = IC new center + rotated offset
+        cap_new_x = new_x + new_ox
+        cap_new_y = new_y + new_oy
+
+        # Clamp to bounds
+        half_w = cap.effective_width / 2.0
+        half_h = cap.effective_height / 2.0
+        cap.x = max(x_min + half_w, min(cap_new_x, x_max - half_w))
+        cap.y = max(y_min + half_h, min(cap_new_y, y_max - half_h))
+        moved.append(cap_idx)
+    return moved
+
+
+def is_macro_member(
+    model: BoardModel,
+    idx: int,
+    decap_map: dict[str, list[str]] | None = None,
+) -> bool:
+    """Return True if the component at `idx` is a macro MEMBER (a cap
+    assigned to an IC). Macro members should NOT be moved independently
+    by legalizer/post-legalize stages — they follow their IC.
+
+    ICs themselves are NOT macro members (they're macro LEADERS). Fixed
+    components and edge connectors are not macro members.
+
+    O(1) via ``get_macro_member_refs`` cached lookup.
+    """
+    comp = model.components[idx]
+    if comp.is_fixed or getattr(comp, 'is_edge_connector', False):
+        return False
+    if getattr(comp, 'component_type', '') not in ('capacitor',):
+        return False
+    return comp.ref in get_macro_member_refs(model)
