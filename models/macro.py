@@ -46,21 +46,25 @@ def find_cap_offset(
     cap: "Component",
     others: Iterable["Component"],
 ) -> tuple[float, float]:
-    """Find an overlap-free offset for ``cap`` around ``leader``.
+    """Find an offset for ``cap`` around ``leader``.
 
     Returns an offset (dx, dy) in leader-local coords at leader
     rotation=0. The fan search tries 8 directions at increasing
-    spacings; the first overlap-free slot within
-    MAX_CAP_IC_DISTANCE_MM is returned.
+    spacings; the first slot within MAX_CAP_IC_DISTANCE_MM that
+    doesn't overlap the leader or any component in ``others`` is
+    returned.
 
-    "Overlap-free" is checked against `others` (typically the leader
-    plus any other components already placed nearby) using the
-    leader's CURRENT rotation to compute the candidate cap position in
-    board coords.
+    ``others`` is typically the macro's already-placed followers — we
+    want the new cap to avoid overlapping its sibling caps. We do NOT
+    check against other components in the model because at macro-
+    construction time everything is still at parse positions and the
+    "overlap-free" check would almost always fail, producing a >8mm
+    fallback offset. The legalizer's push-apart will resolve macro-
+    vs-macro overlaps after SA.
 
-    If no slot is overlap-free, returns a default offset just outside
-    the leader's right edge; the legalizer's relocate pass (Commit 2)
-    will move other components aside to make room.
+    If no slot within MAX_CAP_IC_DISTANCE_MM is free of siblings,
+    falls back to the largest diagonal spacing within the limit; this
+    keeps the cap near its IC even at the cost of a sibling overlap.
     """
     leader_w = leader.effective_width
     leader_h = leader.effective_height
@@ -73,23 +77,31 @@ def find_cap_offset(
     sin_r = -math.sin(rad)
 
     saved_x, saved_y = cap.x, cap.y
+    fallback: tuple[float, float] | None = None
+
     try:
         for spacing in _FAN_SPACINGS:
             for dx_dir, dy_dir in _FAN_DIRS:
-                # Offset from leader center to cap center, in leader-local at rot=0.
                 offset_x = dx_dir * (leader_w / 2 + cap_w / 2 + spacing)
                 offset_y = dy_dir * (leader_h / 2 + cap_h / 2 + spacing)
 
                 # Reject offsets exceeding the hard cap-IC distance.
-                if math.hypot(offset_x, offset_y) > MAX_CAP_IC_DISTANCE_MM:
+                dist = math.hypot(offset_x, offset_y)
+                if dist > MAX_CAP_IC_DISTANCE_MM:
                     continue
 
-                # Candidate cap position in board coords.
                 cap_x = leader.x + offset_x * cos_r - offset_y * sin_r
                 cap_y = leader.y + offset_x * sin_r + offset_y * cos_r
-
                 cap.x = cap_x
                 cap.y = cap_y
+
+                # Reject slots where cap overlaps the leader's courtyard.
+                if cap.overlaps(leader):
+                    continue
+
+                # Track a fallback in case no slot is sibling-free.
+                if fallback is None:
+                    fallback = (offset_x, offset_y)
 
                 if not any(cap.overlaps(o) for o in others_list):
                     return (offset_x, offset_y)
@@ -97,8 +109,12 @@ def find_cap_offset(
         cap.x = saved_x
         cap.y = saved_y
 
-    # Fallback: 1mm to the right of the leader. The legalizer will fix.
-    return (leader_w / 2 + cap_w / 2 + 1.0, 0.0)
+    if fallback is not None:
+        return fallback
+
+    # Absolute last resort: a diagonal slot just under the limit.
+    s = MAX_CAP_IC_DISTANCE_MM / math.sqrt(2)
+    return (s, s)
 
 
 @dataclass

@@ -187,7 +187,23 @@ def cmd_place(args) -> None:
     algorithm = args.algorithm
     pcfg = cfg.placement
 
-    if algorithm == "force-directed":
+    if getattr(args, "macro_v2", False):
+        # New macro-first pipeline (Commit 2 of the rewrite).
+        # Treats cap-IC as a true rigid macro through every stage.
+        # Falls through to the legacy pipeline for steps after placement.
+        from place.pipeline import place_v2
+        print("  Algorithm: macro-v2 (rigid cap-IC macros)")
+        margin = args.margin if args.margin is not None else pcfg.margin
+        place_v2(
+            model,
+            margin=margin,
+            grid_mm=cfg.legalization.grid_mm,
+            sa_iterations=cfg.annealer.max_iterations // 2,
+            sa_reheats=cfg.annealer.reheat_count,
+            seed=seed,
+            verbose=True,
+        )
+    elif algorithm == "force-directed":
         print("  Algorithm: force-directed (attractive + repulsive forces)")
         force_directed_place(
             model,
@@ -208,6 +224,31 @@ def cmd_place(args) -> None:
         )
 
     print_board_summary(model, "After Placement")
+
+    if getattr(args, "macro_v2", False):
+        # Macro-v2 pipeline does its own SA + legalize. Skip the legacy
+        # post-processing (Steps 4.5–7.7) and go straight to saving.
+        print("\nStep 8: Saving results (macro-v2 pipeline — skipping legacy SA/legalize)")
+        model_json = args.input.replace(".kicad_pcb", "_placed_model.json")
+        model.to_json(model_json)
+        print(f"  Board model JSON: {model_json}")
+
+        pos_json = args.input.replace(".kicad_pcb", "_positions.json")
+        export_positions_json(model, pos_json)
+        print(f"  Positions JSON: {pos_json}")
+
+        if not args.dry_run:
+            output_pcb = args.output or args.input.replace(".kicad_pcb", "_placed.kicad_pcb")
+            apply_placement(model, args.input, output_pcb)
+            print(f"  Placed PCB: {output_pcb}")
+        else:
+            print("  [DRY RUN] Not writing PCB file")
+
+        print(f"\n{'#' * 60}")
+        print(f"  Placement Complete! (macro-v2)")
+        print(f"  Components placed: {len([c for c in model.components if not c.is_fixed])}")
+        print(f"{'#' * 60}\n")
+        return
 
     # Step 4.5: Pre-place decoupling caps adjacent to their ICs.
     # Gives SA a good starting configuration so the group-aware density
@@ -569,6 +610,8 @@ def main():
     p_place.add_argument("--sa-reheat", type=int, default=None,
                          help="Number of SA reheat rounds (default: from config.json)")
     p_place.add_argument("--debug-bbox", action="store_true", help="Draw component bounding boxes on Dwgs.User layer for visual debugging")
+    p_place.add_argument("--macro-v2", action="store_true",
+                         help="Use the new macro-first placement pipeline (rigid cap-IC macros). Recommended over the default grid pipeline.")
     p_place.add_argument("--seed", type=int, default=42,
                          help="Random seed for SA/placement determinism (default: 42; use --seed 0 for non-deterministic)")
 
