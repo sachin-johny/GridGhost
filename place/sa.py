@@ -62,6 +62,7 @@ def _calibrate_initial_temp(
     alpha: float,
     beta: float,
     gamma: float,
+    rng: random.Random | None = None,
 ) -> float:
     """Estimate an initial temperature by sampling random moves.
 
@@ -70,14 +71,16 @@ def _calibrate_initial_temp(
     """
     if not macros or n_samples <= 0:
         return 1.0
+    if rng is None:
+        rng = random
 
     positive_deltas: list[float] = []
     base = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma)["total"]
 
     for _ in range(n_samples):
-        m = random.choice(macros)
-        dx = random.uniform(-window_mm, window_mm)
-        dy = random.uniform(-window_mm, window_mm)
+        m = rng.choice(macros)
+        dx = rng.uniform(-window_mm, window_mm)
+        dy = rng.uniform(-window_mm, window_mm)
         snap = m._snapshot()
         if not m.translate(dx, dy, bounds=bounds):
             continue
@@ -124,9 +127,6 @@ def run_macro_sa(
         return {"initial_total": 0.0, "final_total": 0.0}
 
     rng = random.Random(seed)
-    # Patch the global random too — helper functions in cost/macro use it
-    # only via choice/uniform here, so the local rng is sufficient as long
-    # as we route all randomness through it.
 
     initial = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma)
     initial_total = initial["total"]
@@ -135,7 +135,7 @@ def run_macro_sa(
 
     T0 = _calibrate_initial_temp(
         model, macros, bounds, n_samples=80, window_mm=initial_window_mm,
-        alpha=alpha, beta=beta, gamma=gamma,
+        alpha=alpha, beta=beta, gamma=gamma, rng=rng,
     )
     T0 = max(T0, 1.0)
     T_min = max(T0 * 1e-4, 1e-6)
