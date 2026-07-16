@@ -47,14 +47,15 @@ def grid_snap(macros: list["Macro"], grid_mm: float, bounds: tuple[float, float,
 def push_apart_overlapping(
     macros: list["Macro"],
     bounds: tuple[float, float, float, float],
-    max_passes: int = 50,
+    max_passes: int = 200,
 ) -> int:
     """Greedy macro-macro overlap repair.
 
-    For each pair of overlapping macros, push the smaller one along
-    the cheaper axis (the one with less overlap depth). Moves are
-    rigid; followers come along. Returns the number of overlaps
-    remaining after ``max_passes`` passes.
+    For each overlapping pair, push the smaller macro along the cheaper
+    axis (the one with less overlap depth). If that push is rejected by
+    bounds, try the other macro, then the perpendicular axis, then
+    fractional pushes (half, quarter, eighth). Returns residual overlap
+    count after ``max_passes`` passes (or earlier when no progress).
     """
     for _ in range(max_passes):
         any_overlap = False
@@ -68,79 +69,84 @@ def push_apart_overlapping(
                     continue
                 any_overlap = True
 
-                # Compute overlap depth on each axis
                 ax1, ay1, ax2, ay2 = a.bbox
                 bx1, by1, bx2, by2 = b.bbox
                 ox = min(ax2, bx2) - max(ax1, bx1)
                 oy = min(ay2, by2) - max(ay1, by1)
 
-                # Push along the axis with LESS overlap (cheaper escape)
-                # Move the smaller macro (by area)
                 a_area = (ax2 - ax1) * (ay2 - ay1)
                 b_area = (bx2 - bx1) * (by2 - by1)
                 mover = a if a_area < b_area else b
                 other = b if mover is a else a
 
-                snap = mover._snapshot()
-                if ox < oy:
-                    # Push along X
-                    mx1, _, mx2, _ = mover.bbox
-                    ox1, _, ox2, _ = other.bbox
-                    if mx1 < ox1:
-                        dx = -(ox + 0.01)
-                    else:
-                        dx = ox + 0.01
-                    ok = mover.translate(dx, 0.0, bounds=bounds)
+                # Cheaper axis first: lower overlap depth = easier escape.
+                # If tied, prefer X (arbitrary).
+                if ox <= oy:
+                    cheap_axis, cheap_depth = "x", ox
+                    steep_axis, steep_depth = "y", oy
                 else:
-                    # Push along Y
-                    _, my1, _, my2 = mover.bbox
-                    _, oy1, _, oy2 = other.bbox
-                    if my1 < oy1:
-                        dy = -(oy + 0.01)
-                    else:
-                        dy = oy + 0.01
-                    ok = mover.translate(0.0, dy, bounds=bounds)
+                    cheap_axis, cheap_depth = "y", oy
+                    steep_axis, steep_depth = "x", ox
 
-                if not ok:
-                    # Push rejected (bounds). Try the other macro.
-                    snap2 = other._snapshot()
-                    if ox < oy:
-                        mx1, _, mx2, _ = other.bbox
-                        ox1, _, ox2, _ = mover.bbox
-                        if mx1 < ox1:
-                            dx = -(ox + 0.01)
-                        else:
-                            dx = ox + 0.01
-                        ok = other.translate(dx, 0.0, bounds=bounds)
-                    else:
-                        _, my1, _, my2 = other.bbox
-                        _, oy1, _, oy2 = mover.bbox
-                        if my1 < oy1:
-                            dy = -(oy + 0.01)
-                        else:
-                            dy = oy + 0.01
-                        ok = other.translate(0.0, dy, bounds=bounds)
-                    if not ok:
-                        # Neither can move; restore both and give up on this pair
-                        mover._restore(snap)
-                        continue
-                    else:
-                        mover._restore(snap)
-                any_resolved = True
+                attempts = [
+                    (mover, cheap_axis, cheap_depth, 1.0),
+                    (other, cheap_axis, cheap_depth, 1.0),
+                    (mover, steep_axis, steep_depth, 1.0),
+                    (other, steep_axis, steep_depth, 1.0),
+                    (mover, cheap_axis, cheap_depth, 0.5),
+                    (other, cheap_axis, cheap_depth, 0.5),
+                    (mover, cheap_axis, cheap_depth, 0.25),
+                    (other, cheap_axis, cheap_depth, 0.25),
+                    (mover, cheap_axis, cheap_depth, 0.125),
+                    (other, cheap_axis, cheap_depth, 0.125),
+                ]
+                for who, axis, depth, frac in attempts:
+                    if _try_push(who, other if who is mover else mover, axis, depth, frac, bounds):
+                        any_resolved = True
+                        break
 
         if not any_overlap:
             return 0
         if not any_resolved:
-            # Made no progress; further passes won't help
             break
 
-    # Count residual overlaps
     residual = 0
     for i in range(len(macros)):
         for j in range(i + 1, len(macros)):
             if macros[i].overlaps(macros[j]):
                 residual += 1
     return residual
+
+
+def _try_push(
+    mover: "Macro",
+    other: "Macro",
+    axis: str,
+    depth: float,
+    frac: float,
+    bounds: tuple[float, float, float, float],
+) -> bool:
+    """Push `mover` out of `other` along `axis` ('x' or 'y') by depth*frac.
+
+    Direction is set by which side of `other` the `mover` is currently on.
+    Returns True on success, restores mover on failure.
+    """
+    snap = mover._snapshot()
+    mx1, my1, _, _ = mover.bbox
+    ox1, oy1, _, _ = other.bbox
+    mag = depth * frac + 0.01
+
+    if axis == "x":
+        sign = -1.0 if mx1 < ox1 else 1.0
+        ok = mover.translate(sign * mag, 0.0, bounds=bounds)
+    else:
+        sign = -1.0 if my1 < oy1 else 1.0
+        ok = mover.translate(0.0, sign * mag, bounds=bounds)
+
+    if ok:
+        return True
+    mover._restore(snap)
+    return False
 
 
 def boundary_clamp(macros: list["Macro"], bounds: tuple[float, float, float, float]) -> int:
@@ -188,18 +194,41 @@ def legalize(
     bounds: tuple[float, float, float, float],
     *,
     grid_mm: float = 1.0,
-    max_push_passes: int = 50,
+    max_push_passes: int = 200,
+    max_rounds: int = 5,
     verbose: bool = False,
 ) -> dict[str, int]:
-    """Single-pass legalization: snap → push apart → clamp.
+    """Iterative legalization: snap → (push apart → clamp) repeated.
 
-    Returns a dict with overlap count and failed-macro count.
+    Each round repairs the overlaps created by the previous clamp, then
+    clamps the resulting positions back inside bounds. Stops when a
+    round makes no progress or after ``max_rounds`` iterations.
+
+    Returns a dict with overlap count, boundary-failure count, and
+    cap-IC distance violation count.
     """
     grid_snap(macros, grid_mm, bounds)
+
     residual = push_apart_overlapping(macros, bounds, max_passes=max_push_passes)
     failed = boundary_clamp(macros, bounds)
 
-    # Verify cap-IC distances are preserved
+    # Iterate: clamp creates overlaps, push-apart fixes them but may push
+    # something back OOB, clamp fixes that, etc. Continue until stable.
+    for round_idx in range(max_rounds):
+        new_residual = push_apart_overlapping(macros, bounds, max_passes=max_push_passes)
+        new_failed = boundary_clamp(macros, bounds)
+        if new_residual == residual and new_failed == failed:
+            # No progress this round.
+            residual, failed = new_residual, new_failed
+            break
+        residual, failed = new_residual, new_failed
+        if residual == 0 and failed == 0:
+            break
+
+    # One last push-apart to clean up overlaps introduced by the final clamp.
+    if failed > 0:
+        residual = push_apart_overlapping(macros, bounds, max_passes=max_push_passes)
+
     cap_ic_violations = 0
     for m in macros:
         if not m.followers:

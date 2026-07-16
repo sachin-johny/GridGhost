@@ -21,45 +21,48 @@ def place_interior_grid(
     interior_bbox: tuple[float, float, float, float],
     gap: float = 2.0,
 ) -> None:
-    """Place macros in a row-major grid filling ``interior_bbox``.
+    """Shelf-pack macros into ``interior_bbox``.
 
-    Each macro is centered in its own cell. Cell size is determined
-    by the macro's bbox extent plus ``gap``. Macros are placed in
-    sorted-ref order so the layout is deterministic.
+    Sort by macro-bbox height descending so the first row carries the
+    tallest macros and sets that row's height. Place left-to-right;
+    when the next macro would overflow the row width, wrap. Macros
+    that don't fit in the interior (overpacked board) overflow past
+    the bottom edge — SA + legalizer will deal with them.
+
+    The leader is placed so the macro's bbox starts at the cursor
+    (leader offset within bbox is preserved). set_pose is called
+    without bounds so initial placement never rejects a position.
     """
     if not macros:
         return
 
     x_min, y_min, x_max, y_max = interior_bbox
-    interior_w = x_max - x_min
-    interior_h = y_max - y_min
 
-    # Sort macros by ref of leader for determinism
-    sorted_macros = sorted(macros, key=lambda m: m.leader.ref)
+    sorted_macros = sorted(macros, key=lambda m: -(m.bbox[3] - m.bbox[1]))
 
-    # Cell size = max macro bbox + gap
-    cell_w = max(m.bbox[2] - m.bbox[0] for m in sorted_macros) + gap
-    cell_h = max(m.bbox[3] - m.bbox[1] for m in sorted_macros) + gap
+    cursor_x = x_min
+    cursor_y = y_min
+    row_height = 0.0
 
-    cols = max(1, int(interior_w // cell_w))
-    rows = max(1, math.ceil(len(sorted_macros) / cols))
+    for m in sorted_macros:
+        bx1, by1, bx2, by2 = m.bbox
+        mw = bx2 - bx1
+        mh = by2 - by1
 
-    # If we can't fit, shrink cells
-    while cols * cell_w > interior_w and cols > 1:
-        cols -= 1
-        rows = math.ceil(len(sorted_macros) / cols)
-    # Recompute cell size to fit
-    cell_w = max(cell_w, interior_w / cols)
-    cell_h = max(cell_h, interior_h / rows)
+        # Wrap if this macro would extend past the right edge.
+        if cursor_x + mw > x_max and cursor_x > x_min:
+            cursor_y += row_height + gap
+            cursor_x = x_min
+            row_height = 0.0
 
-    for i, m in enumerate(sorted_macros):
-        col = i % cols
-        row = i // cols
-        cx = x_min + (col + 0.5) * cell_w
-        cy = y_min + (row + 0.5) * cell_h
-        # Position macro so its leader is at the cell center. We use
-        # set_pose with rotation=0 (initial placement, no rotation).
-        m.set_pose(cx, cy, 0.0)
+        # Leader's offset within macro bbox is preserved through set_pose
+        # (rotation=0, no followers change their relative positions).
+        leader_offset_x = m.leader.x - bx1
+        leader_offset_y = m.leader.y - by1
+        m.set_pose(cursor_x + leader_offset_x, cursor_y + leader_offset_y, 0.0)
+
+        cursor_x += mw + gap
+        row_height = max(row_height, mh)
 
 
 def compute_interior_bbox(
