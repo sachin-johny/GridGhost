@@ -187,10 +187,10 @@ def cmd_place(args) -> None:
     algorithm = args.algorithm
     pcfg = cfg.placement
 
-    if getattr(args, "macro_v2", False):
-        # New macro-first pipeline (Commit 2 of the rewrite).
-        # Treats cap-IC as a true rigid macro through every stage.
-        # Falls through to the legacy pipeline for steps after placement.
+    if getattr(args, "macro_v2", True):
+        # Macro-first pipeline: cap-IC as a true rigid macro through every
+        # stage. Default since 2026-07. Use --no-macro-v2 to fall back to
+        # the legacy grid pipeline (engine/smart_placement.py).
         from place.pipeline import place_v2
         print("  Algorithm: macro-v2 (rigid cap-IC macros)")
         margin = args.margin if args.margin is not None else pcfg.margin
@@ -610,8 +610,8 @@ def main():
     p_place.add_argument("--sa-reheat", type=int, default=None,
                          help="Number of SA reheat rounds (default: from config.json)")
     p_place.add_argument("--debug-bbox", action="store_true", help="Draw component bounding boxes on Dwgs.User layer for visual debugging")
-    p_place.add_argument("--macro-v2", action="store_true",
-                         help="Use the new macro-first placement pipeline (rigid cap-IC macros). Recommended over the default grid pipeline.")
+    p_place.add_argument("--macro-v2", action=argparse.BooleanOptionalAction, default=True,
+                         help="Use the macro-first placement pipeline (rigid cap-IC macros). Default: on. Use --no-macro-v2 for the legacy grid pipeline.")
     p_place.add_argument("--seed", type=int, default=42,
                          help="Random seed for SA/placement determinism (default: 42; use --seed 0 for non-deterministic)")
 
