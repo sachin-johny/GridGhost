@@ -17,7 +17,7 @@ from assign.assign_caps import assign_caps, IC_TYPES
 from cost.cost import evaluate
 from models.macro import Macro
 from place.connectors import place_connectors_perimeter
-from place.initial import place_interior_grid, compute_interior_bbox
+from place.initial import place_interior_clustered, compute_interior_bbox
 from place.legalizer import legalize as legalize_macros
 from place.sa import run_macro_sa
 
@@ -119,11 +119,11 @@ def place_v2(
             f"{len(connector_macros)} connector macros"
         )
 
-    # ─── Phase 2: initial placement ──────────────────────────────────
-    # Reserve perimeter for connectors
+    # ─── Phase 2: connector placement on perimeter ───────────────────
+    # Connectors go first so interior placement can be net-aware about
+    # their final positions (connector centroid acts as attractor).
     from place.connectors import _along_edge_extent  # local import for reserve estimate
     if connector_macros:
-        # Average extent as a rough perimeter reserve
         avg_extent = sum(
             _along_edge_extent(m.leader, "bottom", connector_mating_margin)
             for m in connector_macros
@@ -132,13 +132,21 @@ def place_v2(
             (avg_extent + connector_mating_margin) / 2,
             min(model.board.width, model.board.height) * 0.2,
         )
+        connectors = [m.leader for m in connector_macros]
+        place_connectors_perimeter(
+            model, connectors, model.board, margin,
+            mating_margin=connector_mating_margin,
+        )
+        for m in connector_macros:
+            m.apply_offsets()
     else:
         connector_reserve = 0.0
 
+    # ─── Phase 3: net-aware interior placement ───────────────────────
     interior_bbox = compute_interior_bbox(
         interior_macros, model.board, margin, connector_reserve=connector_reserve,
     )
-    place_interior_grid(interior_macros, interior_bbox, gap=2.0)
+    place_interior_clustered(model, interior_macros, interior_bbox)
 
     if verbose:
         cost_init = evaluate(model, interior_macros + connector_macros,
@@ -146,17 +154,6 @@ def place_v2(
         print(f"  After initial: total={cost_init['total']:.2f} "
               f"(hpwl={cost_init['hpwl']:.1f}, overlap={cost_init['overlap']:.1f}, "
               f"boundary={cost_init['boundary']:.1f})")
-
-    # ─── Phase 3: connector placement on perimeter ───────────────────
-    if connector_macros:
-        connectors = [m.leader for m in connector_macros]
-        place_connectors_perimeter(
-            connectors, model.board, margin,
-            mating_margin=connector_mating_margin,
-        )
-        # Macro followers (none for connectors) stay aligned
-        for m in connector_macros:
-            m.apply_offsets()
 
     # ─── Phase 4: SA on interior macros (connectors stay put) ────────
     # Bounds = interior_bbox so SA doesn't push into connector zone

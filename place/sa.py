@@ -68,6 +68,14 @@ def _calibrate_initial_temp(
 
     Returns T0 such that a move with average positive delta has ~85%
     acceptance probability: T0 = -avg_delta / ln(0.85).
+
+    Crucially, samples that *create or increase* macro overlap are
+    excluded from the average. The overlap penalty (beta=25) dominates
+    HPWL by ~3 orders of magnitude; if we include those samples, T0
+    ends up in the thousands and SA spends the hot phase doing nothing
+    useful — every accepted move is dominated by overlap noise. By
+    restricting the average to overlap-clean moves, T0 reflects the
+    HPWL gradient SA actually wants to follow.
     """
     if not macros or n_samples <= 0:
         return 1.0
@@ -75,7 +83,7 @@ def _calibrate_initial_temp(
         rng = random
 
     positive_deltas: list[float] = []
-    base = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma)["total"]
+    base = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma)
 
     for _ in range(n_samples):
         m = rng.choice(macros)
@@ -84,9 +92,13 @@ def _calibrate_initial_temp(
         snap = m._snapshot()
         if not m.translate(dx, dy, bounds=bounds):
             continue
-        new_cost = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma)["total"]
-        delta = new_cost - base
+        new_cost = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma)
+        delta_overlap = new_cost["overlap"] - base["overlap"]
         m._restore(snap)
+        # Skip overlap-penalty samples: they're noise for HPWL calibration.
+        if delta_overlap > 1e-9:
+            continue
+        delta = new_cost["total"] - base["total"]
         if delta > 0:
             positive_deltas.append(delta)
 
@@ -113,6 +125,7 @@ def run_macro_sa(
     final_window_mm: float = 0.5,
     rotate_prob: float = 0.15,
     swap_prob: float = 0.10,
+    displace_prob: float = 0.15,
     seed: int = 42,
     verbose: bool = False,
 ) -> dict[str, float]:
@@ -122,6 +135,15 @@ def run_macro_sa(
 
     The macro is rigid throughout SA. Cap-leader distance is fixed at
     construction time, so the <8mm hard rule is automatically enforced.
+
+    Move operators:
+      - ``translate``: rigid (dx, dy) on one macro.
+      - ``rotate``: 90/180/270 of one macro around its leader.
+      - ``swap``: exchange leader positions of two macros.
+      - ``displace``: pick a macro, find a neighbor it overlaps, and
+        try to push the neighbor to a clear slot adjacent to the
+        picked macro. Helps SA escape jammed configurations where
+        pure translate can't make room.
     """
     if not macros:
         return {"initial_total": 0.0, "final_total": 0.0}
@@ -155,11 +177,14 @@ def run_macro_sa(
             m_idx = rng.randrange(len(macros))
             m = macros[m_idx]
 
-            # Pick move type
+            # Pick move type. Probabilities are cumulative thresholds
+            # checked in order: rotate → displace → swap → translate.
             r = rng.random()
             if r < rotate_prob:
                 move = "rotate"
-            elif r < rotate_prob + swap_prob and len(macros) >= 2:
+            elif r < rotate_prob + displace_prob and len(macros) >= 2:
+                move = "displace"
+            elif r < rotate_prob + displace_prob + swap_prob and len(macros) >= 2:
                 move = "swap"
             else:
                 move = "translate"
@@ -171,6 +196,8 @@ def run_macro_sa(
             snap = m._snapshot()
             swap_partner = None
             swap_partner_snap = None
+            displaced = None
+            displaced_snap = None
 
             if move == "translate":
                 dx = rng.uniform(-window, window)
@@ -184,6 +211,32 @@ def run_macro_sa(
                 ok = m.set_pose(m.leader.x, m.leader.y, new_rot, bounds=bounds)
                 if not ok:
                     continue
+            elif move == "displace":
+                # Try to find an overlapping neighbor and shove it sideways.
+                neighbor = _find_overlapping_neighbor(m, macros, rng)
+                if neighbor is None:
+                    # No overlap to resolve — fall through to a translate
+                    # so we don't waste this iteration.
+                    dx = rng.uniform(-window, window)
+                    dy = rng.uniform(-window, window)
+                    ok = m.translate(dx, dy, bounds=bounds)
+                    if not ok:
+                        continue
+                    move = "translate"
+                else:
+                    displaced = neighbor
+                    displaced_snap = neighbor._snapshot()
+                    ok = _try_displace_neighbor(m, neighbor, bounds, window, rng)
+                    if not ok:
+                        # Displace failed (no clear slot found) — try a
+                        # plain translate instead so the iteration still
+                        # does something.
+                        dx = rng.uniform(-window, window)
+                        dy = rng.uniform(-window, window)
+                        ok = m.translate(dx, dy, bounds=bounds)
+                        if not ok:
+                            continue
+                        move = "translate"
             else:  # swap
                 other_idx = rng.randrange(len(macros))
                 if other_idx == m_idx:
@@ -212,12 +265,12 @@ def run_macro_sa(
                     best_total = new_total
                     best_snapshot = _snapshot_positions(model)
             else:
-                # Reject — revert
+                # Reject — revert all touched macros.
+                m._restore(snap)
                 if move == "swap" and swap_partner is not None:
-                    m._restore(snap)
                     swap_partner._restore(swap_partner_snap)
-                else:
-                    m._restore(snap)
+                elif move == "displace" and displaced is not None:
+                    displaced._restore(displaced_snap)
 
             T *= cooling
 
@@ -246,3 +299,61 @@ def run_macro_sa(
         "final_overlap": final["overlap"],
         "best_total": best_total,
     }
+
+
+def _find_overlapping_neighbor(
+    m: "Macro",
+    macros: list["Macro"],
+    rng: random.Random,
+) -> "Macro | None":
+    """Pick a random macro whose bbox overlaps ``m``'s bbox. None if no overlap."""
+    candidates = [other for other in macros if other is not m and m.overlaps(other)]
+    if not candidates:
+        return None
+    return rng.choice(candidates)
+
+
+def _try_displace_neighbor(
+    m: "Macro",
+    neighbor: "Macro",
+    bounds: tuple[float, float, float, float],
+    window: float,
+    rng: random.Random,
+) -> bool:
+    """Push ``neighbor`` out of ``m`` along the cheaper axis.
+
+    Tries the four cardinal directions, picks the first that lands
+    ``neighbor`` inside bounds. Distance pushed is the current overlap
+    depth plus a small jitter drawn from ``window`` so the move
+    explores, not just barely resolves.
+    """
+    mx1, my1, mx2, my2 = m.bbox
+    nx1, ny1, nx2, ny2 = neighbor.bbox
+    ox = min(mx2, nx2) - max(mx1, nx1)
+    oy = min(my2, ny2) - max(my1, ny1)
+    if ox <= 0 and oy <= 0:
+        return False
+
+    # Try cheaper axis first (less overlap depth to clear).
+    if ox <= oy:
+        primary = ("x", ox)
+        secondary = ("y", oy)
+    else:
+        primary = ("y", oy)
+        secondary = ("x", ox)
+
+    snap = neighbor._snapshot()
+    for axis, depth in (primary, secondary):
+        # Direction: push neighbor away from m along this axis.
+        if axis == "x":
+            sign = -1.0 if (nx1 + nx2) / 2 < (mx1 + mx2) / 2 else 1.0
+            jitter = rng.uniform(0.0, max(window - depth, 0.0))
+            ok = neighbor.translate(sign * (depth + 0.5 + jitter), 0.0, bounds=bounds)
+        else:
+            sign = -1.0 if (ny1 + ny2) / 2 < (my1 + my2) / 2 else 1.0
+            jitter = rng.uniform(0.0, max(window - depth, 0.0))
+            ok = neighbor.translate(0.0, sign * (depth + 0.5 + jitter), bounds=bounds)
+        if ok:
+            return True
+        neighbor._restore(snap)
+    return False
