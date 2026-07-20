@@ -15,9 +15,14 @@ from typing import TYPE_CHECKING
 
 from assign.assign_caps import assign_caps, IC_TYPES
 from cost.cost import evaluate
+from cost.chains import detect_interior_chains, build_chain_net_weights, CHAIN_NET_WEIGHT
 from models.macro import Macro
 from place.connectors import place_connectors_perimeter
-from place.initial import place_interior_clustered, compute_interior_bbox
+from place.initial import (
+    place_interior_phase_a,
+    apply_connectivity_nudges,
+    compute_interior_bbox,
+)
 from place.legalizer import legalize as legalize_macros
 from place.sa import run_macro_sa
 
@@ -122,14 +127,14 @@ def place_v2(
     # ─── Phase 2: connector placement on perimeter ───────────────────
     # Connectors go first so interior placement can be net-aware about
     # their final positions (connector centroid acts as attractor).
-    from place.connectors import _along_edge_extent  # local import for reserve estimate
     if connector_macros:
-        avg_extent = sum(
-            _along_edge_extent(m.leader, "bottom", connector_mating_margin)
-            for m in connector_macros
-        ) / max(1, len(connector_macros))
+        # Edge connectors OVERHANG the outline (body outside, pads inside),
+        # so their interior footprint is just the pad depth (mating_margin),
+        # not the full body. Reserving more than that needlessly shrinks the
+        # interior — on cbb the old along-edge-extent estimate carved out
+        # ~12.5mm/edge and left only ~57% of the board usable.
         connector_reserve = min(
-            (avg_extent + connector_mating_margin) / 2,
+            connector_mating_margin,
             min(model.board.width, model.board.height) * 0.2,
         )
         connectors = [m.leader for m in connector_macros]
@@ -142,15 +147,34 @@ def place_v2(
     else:
         connector_reserve = 0.0
 
-    # ─── Phase 3: net-aware interior placement ───────────────────────
+    # ─── Phase 3: interior placement (Phase A space-fill + Phase B nudge) ──
     interior_bbox = compute_interior_bbox(
         interior_macros, model.board, margin, connector_reserve=connector_reserve,
     )
-    place_interior_clustered(model, interior_macros, interior_bbox)
+    # Phase A: height-ordered shelf-pack of net-clusters to fill the interior
+    # (connectivity-blind positioning — uses the board, doesn't collapse).
+    clusters = place_interior_phase_a(model, interior_macros, interior_bbox)
+    if verbose:
+        print(f"  Phase A (space-filling shelf-pack): {len(clusters)} clusters seeded")
+
+    # Phase B: bounded, per-net-weighted connectivity nudge on top of Phase A.
+    apply_connectivity_nudges(model, clusters, interior_bbox, verbose=verbose)
+
+    # Issue 3: detect interior signal-flow chains and upweight their internal
+    # nets' HPWL so SA pulls chain members into a line.  Connectivity-based, so
+    # it's computed once here and threaded through SA + evaluate.  No change to
+    # the shelf-packer — this is purely a cost-function nudge (Zhu et al. 2020).
+    chains = detect_interior_chains(model)
+    chain_net_weights = build_chain_net_weights(model, chains)
+    if verbose and chains:
+        n_chain_nets = len(chain_net_weights)
+        print(f"  Issue 3 (signal-flow chains): {len(chains)} chain(s), "
+              f"{n_chain_nets} net(s) upweighted x{CHAIN_NET_WEIGHT:.1f}")
 
     if verbose:
         cost_init = evaluate(model, interior_macros + connector_macros,
-                              alpha=alpha, beta=beta, gamma=gamma)
+                              alpha=alpha, beta=beta, gamma=gamma,
+                              net_weights=chain_net_weights)
         print(f"  After initial: total={cost_init['total']:.2f} "
               f"(hpwl={cost_init['hpwl']:.1f}, overlap={cost_init['overlap']:.1f}, "
               f"boundary={cost_init['boundary']:.1f})")
@@ -163,6 +187,7 @@ def place_v2(
         iterations=sa_iterations, reheats=sa_reheats,
         alpha=alpha, beta=beta, gamma=gamma,
         seed=seed, verbose=verbose,
+        net_weights=chain_net_weights,
     )
 
     # ─── Phase 5: legalize all macros together ───────────────────────
@@ -178,7 +203,8 @@ def place_v2(
     )
 
     # Final cost (all macros including connectors)
-    final_cost = evaluate(model, all_macros, alpha=alpha, beta=beta, gamma=gamma)
+    final_cost = evaluate(model, all_macros, alpha=alpha, beta=beta, gamma=gamma,
+                          net_weights=chain_net_weights)
     if verbose:
         print(
             f"  Final: total={final_cost['total']:.2f} "

@@ -1,8 +1,9 @@
 """Dump per-component placement diagnostics for a single board.
 
-Runs the same pipeline as measure_placement.py but prints each interior
+Runs the legacy placement pipeline in-process and prints each interior
 component's position, distance from board center, and OOB status. Used to
-diagnose centroid shift and OOB regressions.
+diagnose centroid shift and OOB regressions at component granularity (the
+aggregate KPI harness is ``measure_placement_v2.py``).
 """
 from __future__ import annotations
 

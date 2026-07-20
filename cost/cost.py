@@ -19,12 +19,14 @@ if TYPE_CHECKING:
     from models.macro import Macro
 
 
-def hpwl_net(net: "Net", ref_map: dict[str, "object"]) -> float:
+def hpwl_net(net: "Net", ref_map: dict[str, "object"], weight: float = 1.0) -> float:
     """Standard half-perimeter wirelength for one net.
 
     Uses the bounding-box model: (max_x - min_x) + (max_y - min_y)
     over all pin positions on the net. Tight for 2-pin nets, lower
-    bound for multi-pin nets.
+    bound for multi-pin nets.  ``weight`` scales the contribution — used
+    by Issue 3's signal-flow-chain net weighting to pull chain members
+    together.
     """
     if len(net.pins) < 2:
         return 0.0
@@ -38,13 +40,14 @@ def hpwl_net(net: "Net", ref_map: dict[str, "object"]) -> float:
         ys.append(c.y)
     if len(xs) < 2:
         return 0.0
-    return (max(xs) - min(xs)) + (max(ys) - min(ys))
+    return ((max(xs) - min(xs)) + (max(ys) - min(ys))) * weight
 
 
 def total_hpwl(
     model: "BoardModel",
     include_power: bool = True,
     exclude_nets: set[str] | None = None,
+    net_weights: dict[str, float] | None = None,
 ) -> float:
     """Total HPWL across all nets.
 
@@ -55,13 +58,18 @@ def total_hpwl(
     Ground nets can optionally be excluded via ``exclude_nets`` (they
     are nearly constant for HPWL because every component touches
     ground, but including them is harmless).
+
+    ``net_weights`` optionally upweights specific nets (e.g. signal-flow-
+    chain internal nets, Issue 3) by a multiplier; nets absent from the
+    dict use weight 1.0.
     """
     ref_map = {c.ref: c for c in model.components}
     total = 0.0
     for net in model.nets:
         if exclude_nets and net.name in exclude_nets:
             continue
-        total += hpwl_net(net, ref_map)
+        w = net_weights.get(net.name, 1.0) if net_weights else 1.0
+        total += hpwl_net(net, ref_map, weight=w)
     return total
 
 
@@ -120,6 +128,7 @@ def evaluate(
     beta: float = 25.0,
     gamma: float = 8.0,
     include_power: bool = True,
+    net_weights: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """Total placement cost.
 
@@ -129,10 +138,12 @@ def evaluate(
         gamma: Boundary penalty weight.
         include_power: Whether to include power/ground nets in HPWL.
             Default True — required for cap-IC coupling.
+        net_weights: Optional per-net HPWL multipliers (e.g. signal-flow-chain
+            internal nets from Issue 3).  Nets absent from the dict use 1.0.
 
     Returns dict with hpwl, overlap, boundary, and total components.
     """
-    h = total_hpwl(model, include_power=include_power)
+    h = total_hpwl(model, include_power=include_power, net_weights=net_weights)
     o = total_macro_overlap(macros)
     b = total_boundary(model)
     return {

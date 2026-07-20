@@ -19,6 +19,31 @@ _RE_VERTICAL_THT = re.compile(r'Vertical|THT', re.IGNORECASE)
 _RE_HORIZONTAL = re.compile(r'Horizontal|Angled|Side', re.IGNORECASE)
 
 
+def rotated_bbox_offset(
+    bbox_offset_x: float,
+    bbox_offset_y: float,
+    rotation: float,
+) -> tuple[float, float]:
+    """World-space (dx, dy) from a component's KiCad origin to its bbox center.
+
+    Matches ``Component.bbox`` / ``bbox_at`` exactly: KiCad uses clockwise-
+    positive rotation, so ``sin_a = -sin(rad)``.  This is the single source
+    of truth for "where is the visible body relative to the origin" — every
+    call site that needs to position a component by its body (not its pin-1
+    origin) should go through here or through ``Component.set_bbox_center``
+    rather than reimplementing the rotation math.
+
+    Returns the offset you add to the origin to get the bbox center, or
+    subtract from a target bbox-center to get the origin.
+    """
+    rad = math.radians(rotation)
+    cos_a = math.cos(rad)
+    sin_a = -math.sin(rad)  # KiCad clockwise-positive
+    dx = bbox_offset_x * cos_a - bbox_offset_y * sin_a
+    dy = bbox_offset_x * sin_a + bbox_offset_y * cos_a
+    return (dx, dy)
+
+
 @dataclass
 class Pad:
     """A single pad on a component footprint."""
@@ -160,6 +185,25 @@ class Component:
         cx = x + self.bbox_offset_x * cos_a - self.bbox_offset_y * sin_a
         cy = y + self.bbox_offset_x * sin_a + self.bbox_offset_y * cos_a
         return (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+
+    def set_bbox_center(self, cx: float, cy: float, rotation: float) -> None:
+        """Position this component so its bbox center — not its KiCad origin —
+        lands at ``(cx, cy)`` at the given rotation.
+
+        This is the bbox-space placement primitive geometry code should use
+        whenever the intent is "put this component's visible body here."
+        Setting ``.x``/``.y`` directly only does the right thing when the
+        origin happens to coincide with the bbox center (``bbox_offset`` ≈ 0),
+        which is false for most connectors (pin headers, edge-mount SMA, …).
+
+        Rotation is applied first (the origin→bbox-center offset depends on
+        it), then the origin is placed at ``(cx, cy) − rotated_offset`` so
+        the bbox center — courtyard margin included — is exactly ``(cx, cy)``.
+        """
+        self.set_rotation(rotation)  # offset depends on rotation; set first
+        dx, dy = rotated_bbox_offset(self.bbox_offset_x, self.bbox_offset_y, rotation)
+        self.x = cx - dx
+        self.y = cy - dy
 
     @property
     def _is_rotated_90(self) -> bool:

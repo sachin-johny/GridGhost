@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Phase 4.4 — Extended quantitative benchmark harness for GridGhost.
 
-Extends tests/measure_placement.py with the KPI table from the brief's
-Phase 4.4:
+Reports the KPI table from the brief's Phase 4.4 against the legacy
+placement pipeline (in-process):
 
   | Metric                                  | What it tells you                       |
   |-----------------------------------------|-----------------------------------------|

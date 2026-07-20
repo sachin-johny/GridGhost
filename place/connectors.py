@@ -323,17 +323,29 @@ def _resolve_corners(
                 ox = min(a[2], b[2]) - max(a[0], b[0])
                 oy = min(a[3], b[3]) - max(a[1], b[1])
 
+                # Push in bbox-center space via set_bbox_center so the BODY
+                # (not the origin) moves and stays clamped inside the board.
                 for comp, edge, other in [(c1, e1, c2), (c2, e2, c1)]:
+                    cb = comp.bbox
+                    bcx = (cb[0] + cb[2]) / 2
+                    bcy = (cb[1] + cb[3]) / 2
+                    ob = other.bbox
                     if edge in ("top", "bottom"):
-                        push = (ox + gap) * (1 if comp.x > other.x else -1)
-                        new_x = comp.x + push
-                        comp.x = max(board.x_min + comp.effective_width / 2,
-                                     min(new_x, board.x_max - comp.effective_width / 2))
+                        sign = 1.0 if bcx > (ob[0] + ob[2]) / 2 else -1.0
+                        new_bcx = max(
+                            board.x_min + comp.effective_width / 2,
+                            min(bcx + (ox + gap) * sign,
+                                board.x_max - comp.effective_width / 2),
+                        )
+                        comp.set_bbox_center(new_bcx, bcy, comp.rotation)
                     else:
-                        push = (oy + gap) * (1 if comp.y > other.y else -1)
-                        new_y = comp.y + push
-                        comp.y = max(board.y_min + comp.effective_height / 2,
-                                     min(new_y, board.y_max - comp.effective_height / 2))
+                        sign = 1.0 if bcy > (ob[1] + ob[3]) / 2 else -1.0
+                        new_bcy = max(
+                            board.y_min + comp.effective_height / 2,
+                            min(bcy + (oy + gap) * sign,
+                                board.y_max - comp.effective_height / 2),
+                        )
+                        comp.set_bbox_center(bcx, new_bcy, comp.rotation)
 
                 resolved = False
 
@@ -593,19 +605,32 @@ def _place_on_edge(
         rot = _compute_connector_rotation(conn, edge)
         conn.set_rotation(rot)
 
-        # Center along edge at start_offset + ext/2 + accumulated
+        # Along-edge bbox-center position. ``ext`` already includes
+        # ``mating_margin``, so centering on ``start_offset + ext/2`` leaves
+        # ``mating_margin/2`` clearance to each slot boundary — adjacent
+        # connector *bodies* end up ``mating_margin`` apart (plus ``gap``).
         center_offset = start_offset + ext / 2
         start_offset += ext + gap
 
+        # Perpendicular: edge connectors OVERHANG the board edge — the body
+        # extends OUTSIDE the outline and only the pad/lead area sits inside.
+        # Place the bbox so its inward face is ``mating_margin`` inside the
+        # board (pads on the board), letting the body overhang past the edge.
+        # This is why connectors consume almost no interior room: their
+        # inside footprint is just the pad depth, not the full body. Position
+        # via set_bbox_center so the BODY lands here, not the origin (pin
+        # headers / edge-mount SMAs have origin ≠ bbox center).
         if edge == "bottom":
-            conn.x = board.x_min + margin + center_offset
-            conn.y = board.y_max - margin - mating_margin / 2
+            target_cx = board.x_min + margin + center_offset
+            target_cy = board.y_max - mating_margin + conn.effective_height / 2
         elif edge == "top":
-            conn.x = board.x_min + margin + center_offset
-            conn.y = board.y_min + margin + mating_margin / 2
+            target_cx = board.x_min + margin + center_offset
+            target_cy = board.y_min + mating_margin - conn.effective_height / 2
         elif edge == "left":
-            conn.x = board.x_min + margin + mating_margin / 2
-            conn.y = board.y_min + margin + center_offset
+            target_cx = board.x_min + mating_margin - conn.effective_width / 2
+            target_cy = board.y_min + margin + center_offset
         elif edge == "right":
-            conn.x = board.x_max - margin - mating_margin / 2
-            conn.y = board.y_min + margin + center_offset
+            target_cx = board.x_max - mating_margin + conn.effective_width / 2
+            target_cy = board.y_min + margin + center_offset
+
+        conn.set_bbox_center(target_cx, target_cy, rot)

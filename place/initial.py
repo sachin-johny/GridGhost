@@ -1,20 +1,24 @@
-"""Net-aware initial interior placement.
+"""Macro interior placement — Phase A (space-filling) + Phase B (bounded nudge).
 
-Cluster macros by net connectivity (reusing engine/net_clustering),
-then shelf-pack each cluster around a target point computed from the
-cluster's attractors:
+Issue 1 of PLACEMENT_FIX_PLAN.md splits interior seeding into two
+independently-testable phases instead of one blended formula that had to be
+simultaneously space-filling and connectivity-aware (and collapsed to the
+board center whenever a high-fan-out net like GND dominated the average):
 
-- If the cluster shares nets with fixed components or edge connectors,
-  the target is a blend of the attractor centroid and a unique grid
-  cell. Blending prevents multiple clusters that share a connector
-  from piling on the same point — each gets pulled toward the I/O it
-  talks to, but also keeps a unique home in the grid.
-- Clusters with no attractor fall back to the grid cell alone.
+  * **Phase A — space-filling seed (connectivity-blind positioning).**
+    Cluster macros by net connectivity (connected macros share a shelf-pack
+    block), order the *clusters* by descending max-member height for
+    shelf-pack area efficiency, then shelf-pack the blocks to FILL the
+    interior — rows are spread vertically and blocks within a row are spread
+    horizontally so the whole interior is used.  No attractor logic at all:
+    worst case (zero useful connectivity signal) still yields a well-spread
+    layout, not a collapsed clump.
 
-Each cluster is shelf-packed with slack proportional to macro size
-(``gap = max(min_gap, max_macro_dim * gap_factor)``), so SA has room
-to make moves that actually improve cost instead of being jammed
-against a neighbor from the start.
+  * **Phase B — bounded connectivity nudge** (``place.cluster.compute_attractor_nudges``).
+    A small, per-net-centroid, clique-net-weighted (``1/(k-1)``), capped
+    nudge toward genuinely informative attractors.  Bounded by construction
+    so it can only pull a cluster part-way off its Phase-A home — SA + the
+    legalizer do the real fine-grained HPWL optimization from there.
 """
 
 from __future__ import annotations
@@ -22,11 +26,244 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-from engine.net_clustering import cluster_components
+from place.cluster import (
+    order_macros_by_connectivity,
+    collect_attractor_positions,
+    compute_attractor_nudges,
+)
 
 if TYPE_CHECKING:
     from models.board_model import BoardModel, BoardOutline
     from models.macro import Macro
+
+
+def _macro_w(m: "Macro") -> float:
+    return m.bbox[2] - m.bbox[0]
+
+
+def _macro_h(m: "Macro") -> float:
+    return m.bbox[3] - m.bbox[1]
+
+
+def _clamp_macros_to_bounds(
+    macros: list["Macro"],
+    bounds: tuple[float, float, float, float],
+) -> None:
+    """Best-effort translate every macro so its bbox sits inside ``bounds``.
+
+    Unlike the legalizer's ``boundary_clamp`` (which *rejects* a move that
+    leaves the bbox out of bounds — leaving over-dense macros OOB), this
+    forces macros in unconditionally so SA starts from a legal pose:
+    macros that fit are clamped to the nearest in-bounds position; macros
+    bigger than the bounds (a 62-macro board in a 49×48mm interior) are
+    *centered* so the overflow is symmetric and minimal.  The overlaps this
+    creates are exactly what the legalizer's push-apart is for — but no
+    macro starts outside the board, which is the regression this prevents.
+    """
+    x_min, y_min, x_max, y_max = bounds
+    bw = x_max - x_min
+    bh = y_max - y_min
+    for m in macros:
+        bx1, by1, bx2, by2 = m.bbox
+        mw = bx2 - bx1
+        mh = by2 - by1
+        if mw <= bw:
+            if bx1 < x_min:
+                dx = x_min - bx1
+            elif bx2 > x_max:
+                dx = x_max - bx2
+            else:
+                dx = 0.0
+        else:
+            dx = (x_min + x_max) / 2 - (bx1 + bx2) / 2  # center oversized
+        if mh <= bh:
+            if by1 < y_min:
+                dy = y_min - by1
+            elif by2 > y_max:
+                dy = y_max - by2
+            else:
+                dy = 0.0
+        else:
+            dy = (y_min + y_max) / 2 - (by1 + by2) / 2  # center oversized
+        if abs(dx) > 1e-9 or abs(dy) > 1e-9:
+            m.translate(dx, dy)  # bounds=None → always applies; followers follow
+
+
+def _pack_cluster_block(
+    cluster_macros: list["Macro"],
+    min_gap: float,
+    gap_factor: float,
+) -> tuple[list[tuple["Macro", float, float]], float, float]:
+    """Shelf-pack one cluster's macros into a block anchored at (0, 0).
+
+    Returns ``(layout, block_w, block_h)`` where ``layout`` is a list of
+    ``(macro, origin_rel_x, origin_rel_y)`` — the leader *origin* position
+    relative to the block's top-left corner.  Macros are sorted by descending
+    height for tidy rows; per-macro gap scales with macro size so SA has room.
+
+    Origin-vs-bbox note: ``origin_rel`` is derived from each macro's current
+    bbox (``leader.x - bbox_left``), the macro-level equivalent of
+    ``Component.set_bbox_center``.  Macros are placed at rotation 0, which
+    matches their parse-time rotation, so the offset is consistent.  The
+    legalizer clamps anything that spills.
+    """
+    if not cluster_macros:
+        return [], 0.0, 0.0
+
+    sorted_macros = sorted(cluster_macros, key=lambda m: -_macro_h(m))
+    total_area = sum(_macro_w(m) * _macro_h(m) for m in sorted_macros)
+    target_width = max(math.sqrt(total_area) * 1.3, 10.0)
+
+    rows: list[tuple[list[tuple["Macro", float, float, float, float]], float]] = []
+    current_row: list[tuple["Macro", float, float, float, float]] = []
+    cursor_x = 0.0
+    row_height = 0.0
+    for m in sorted_macros:
+        mw, mh = _macro_w(m), _macro_h(m)
+        g = max(min_gap, max(mw, mh) * gap_factor)
+        if cursor_x + mw > target_width and current_row:
+            rows.append((current_row, row_height))
+            current_row = []
+            cursor_x = 0.0
+            row_height = 0.0
+        # cursor_x is this macro's bbox-left offset within the row
+        current_row.append((m, mw, mh, g, cursor_x))
+        cursor_x += mw + g
+        row_height = max(row_height, mh)
+    if current_row:
+        rows.append((current_row, row_height))
+
+    inter_row_gap = min_gap
+    layout: list[tuple["Macro", float, float]] = []
+    block_w = 0.0
+    cur_y = 0.0
+    for row_items, rh in rows:
+        row_w = 0.0
+        for m, mw, mh, g, bx_left_rel in row_items:
+            bx1, by1, _, _ = m.bbox
+            lox = m.leader.x - bx1  # leader origin offset from macro bbox-left
+            loy = m.leader.y - by1  # leader origin offset from macro bbox-top
+            layout.append((m, bx_left_rel + lox, cur_y + loy))
+            row_w = max(row_w, bx_left_rel + mw)
+        block_w = max(block_w, row_w)
+        cur_y += rh + inter_row_gap
+    block_h = max(0.0, cur_y - inter_row_gap) if rows else 0.0
+    return layout, block_w, block_h
+
+
+def place_interior_phase_a(
+    model: "BoardModel",
+    macros: list["Macro"],
+    interior_bbox: tuple[float, float, float, float],
+    *,
+    min_gap: float = 2.5,
+    gap_factor: float = 0.5,
+) -> list[list["Macro"]]:
+    """Phase A: height-ordered shelf-pack of net-clusters to fill the interior.
+
+    Returns the cluster list (for Phase B).  Macros are placed at rotation 0
+    with no bounds — initial placement accepts any position; the legalizer
+    clamps.  This is the connectivity-blind space-filling baseline.
+    """
+    if not macros:
+        return []
+
+    x_min, y_min, x_max, y_max = interior_bbox
+    interior_w = x_max - x_min
+    interior_h = y_max - y_min
+
+    clusters = order_macros_by_connectivity(model, macros)
+
+    # Pack each cluster into a block.
+    blocks: list[dict] = []
+    for cl in clusters:
+        layout, w, h = _pack_cluster_block(cl, min_gap, gap_factor)
+        blocks.append({"layout": layout, "w": w, "h": h, "cluster": cl})
+
+    # Shelf-pack blocks into rows (height-sorted for area efficiency).
+    blocks.sort(key=lambda b: -b["h"])
+    rows: list[tuple[list[dict], float]] = []
+    cur_row: list[dict] = []
+    cur_w = 0.0
+    row_h = 0.0
+    for b in blocks:
+        if cur_row and cur_w + b["w"] > max(interior_w, 1.0):
+            rows.append((cur_row, row_h))
+            cur_row = []
+            cur_w = 0.0
+            row_h = 0.0
+        cur_row.append(b)
+        cur_w += b["w"] + min_gap
+        row_h = max(row_h, b["h"])
+    if cur_row:
+        rows.append((cur_row, row_h))
+
+    # Spread rows vertically to fill the interior height; center the stack.
+    n_rows = len(rows)
+    total_row_h = sum(rh for _, rh in rows)
+    v_slack = max(0.0, interior_h - total_row_h) / max(1, n_rows - 1) if n_rows > 1 else 0.0
+    total_with_v = total_row_h + v_slack * max(0, n_rows - 1)
+    cur_y = y_min + max(0.0, interior_h - total_with_v) / 2
+
+    for row_blocks, rh in rows:
+        # Spread blocks horizontally to fill the interior width; center the row.
+        n_in_row = len(row_blocks)
+        total_bw = sum(b["w"] for b in row_blocks)
+        h_slack = max(0.0, interior_w - total_bw) / max(1, n_in_row - 1) if n_in_row > 1 else 0.0
+        total_with_h = total_bw + h_slack * max(0, n_in_row - 1)
+        cur_x = x_min + max(0.0, interior_w - total_with_h) / 2
+
+        for b in row_blocks:
+            for m, rx, ry in b["layout"]:
+                m.set_pose(cur_x + rx, cur_y + ry, 0.0)
+            cur_x += b["w"] + h_slack
+        cur_y += rh + v_slack
+
+    # Best-effort clamp into the interior so SA starts in-bounds. On sparse
+    # boards this is a no-op (the spread already fits); on over-dense boards
+    # it pulls edge macros in and centers oversized ones, preventing the OOB
+    # regression at the cost of overlaps the legalizer then resolves.
+    _clamp_macros_to_bounds(macros, interior_bbox)
+
+    return clusters
+
+
+def apply_connectivity_nudges(
+    model: "BoardModel",
+    clusters: list[list["Macro"]],
+    interior_bbox: tuple[float, float, float, float],
+    *,
+    nudge_fraction: float = 0.25,
+    verbose: bool = False,
+) -> float:
+    """Phase B: apply bounded, per-net-weighted connectivity nudges.
+
+    Returns the mean cluster displacement (mm) — printed by the pipeline so a
+    future collapse regression shows up in the log instead of needing an SVG.
+    """
+    if not clusters:
+        return 0.0
+
+    x_min, y_min, x_max, y_max = interior_bbox
+    # Cap nudge at ~one grid cell (interior / n_clusters) per the plan.
+    grid_cell = min(x_max - x_min, y_max - y_min) / max(1, len(clusters))
+    attractor_positions = collect_attractor_positions(model)
+    nudges = compute_attractor_nudges(
+        model, clusters, attractor_positions,
+        nudge_fraction=nudge_fraction, max_nudge_mm=grid_cell,
+    )
+
+    total_disp = 0.0
+    for idx, (dx, dy) in nudges.items():
+        for m in clusters[idx]:
+            m.translate(dx, dy)  # bounds=None → always applies; followers follow
+        total_disp += math.hypot(dx, dy)
+
+    avg = total_disp / len(clusters)
+    if verbose:
+        print(f"  Phase B (connectivity nudge): {len(nudges)}/{len(clusters)} clusters "
+              f"moved, avg displacement={avg:.2f}mm (cap {grid_cell:.1f}mm)")
+    return avg
 
 
 def place_interior_clustered(
@@ -36,215 +273,20 @@ def place_interior_clustered(
     *,
     min_gap: float = 2.5,
     gap_factor: float = 0.5,
-    attractor_pull: float = 0.6,
+    # Accepted for backward compatibility; the old global attractor_pull
+    # constant is replaced by per-net weighting in compute_attractor_nudges.
+    attractor_pull: float | None = None,
 ) -> None:
-    """Cluster-aware shelf-pack with connector-attractor pull.
+    """Cluster-aware interior placement (Phase A + Phase B).
 
-    Steps:
-      1. ``cluster_components(model)`` groups all movable components by
-         net connectivity.
-      2. Each cluster is mapped to its leader macros (cap followers
-         stay with their leaders — they're not separate macros).
-      3. For each cluster, compute a target point as a blend between:
-         - the centroid of fixed/placed-connector components sharing
-           nets with the cluster (the attractor), and
-         - a unique grid cell in ``interior_bbox``.
-         ``attractor_pull`` ∈ [0, 1] sets the blend: 1.0 fully pulled
-         to attractor (risks pile-up when clusters share attractors),
-         0.0 fully on grid cells (no net awareness). Default 0.6.
-      4. Shelf-pack the cluster's macros around its target with
-         proportional slack so SA has room to move.
+    Thin wrapper kept for callers that want one call.  The pipeline calls
+    ``place_interior_phase_a`` and ``apply_connectivity_nudges`` directly so
+    the two phases show up as separate steps in verbose output.
     """
-    if not macros:
-        return
-
-    x_min, y_min, x_max, y_max = interior_bbox
-
-    # Map ref → macro (leaders only). Cap followers are part of their
-    # leader's macro; they should NOT appear as separate clusters.
-    ref_to_macro: dict[str, "Macro"] = {m.leader.ref: m for m in macros}
-
-    # Group macros by net cluster.
-    macro_clusters: list[list["Macro"]] = []
-    seen: set[str] = set()
-    for cluster_refs in cluster_components(model):
-        group: list["Macro"] = []
-        for ref in cluster_refs:
-            m = ref_to_macro.get(ref)
-            if m is None or m.leader.ref in seen:
-                continue
-            group.append(m)
-            seen.add(m.leader.ref)
-        if group:
-            macro_clusters.append(group)
-
-    # Safety net: any macro that didn't surface in a cluster goes last.
-    orphans = [m for m in macros if m.leader.ref not in seen]
-    if orphans:
-        macro_clusters.append(orphans)
-
-    # Grid fallback layout for clusters (also used as the "home" cell
-    # that gets blended with the attractor).
-    n_clusters = len(macro_clusters)
-    cols = max(1, int(math.ceil(math.sqrt(n_clusters))))
-    rows = max(1, int(math.ceil(n_clusters / cols)))
-    region_w = (x_max - x_min) / cols
-    region_h = (y_max - y_min) / rows
-
-    attractor_positions = _collect_attractor_positions(model)
-
-    for idx, cluster_macros in enumerate(macro_clusters):
-        col = idx % cols
-        row = idx // cols
-        grid_cx = x_min + (col + 0.5) * region_w
-        grid_cy = y_min + (row + 0.5) * region_h
-
-        attractors = _cluster_attractors(model, cluster_macros, attractor_positions)
-        if attractors:
-            ax = sum(p[0] for p in attractors) / len(attractors)
-            ay = sum(p[1] for p in attractors) / len(attractors)
-            cx = ax * attractor_pull + grid_cx * (1.0 - attractor_pull)
-            cy = ay * attractor_pull + grid_cy * (1.0 - attractor_pull)
-        else:
-            cx, cy = grid_cx, grid_cy
-
-        # Clamp to interior so the cluster center stays in-bounds; the
-        # shelf-packer will still let macros spill if the cluster is
-        # bigger than the interior (legalizer will mop up).
-        pad = 1.0
-        cx = max(x_min + pad, min(x_max - pad, cx))
-        cy = max(y_min + pad, min(y_max - pad, cy))
-
-        _shelf_pack_around_point(
-            cluster_macros, cx, cy, interior_bbox,
-            min_gap=min_gap, gap_factor=gap_factor,
-        )
-
-
-def _shelf_pack_around_point(
-    macros: list["Macro"],
-    cx: float,
-    cy: float,
-    interior_bbox: tuple[float, float, float, float],
-    *,
-    min_gap: float,
-    gap_factor: float,
-) -> None:
-    """Shelf-pack macros centered on (cx, cy).
-
-    Same row-major mechanic as a top-left shelf-pack, but:
-      - Sorted within cluster by descending height for tidy rows.
-      - Per-macro gap = ``max(min_gap, max_macro_dim * gap_factor)`` —
-        bigger macros get more breathing room.
-      - Block is centered on (cx, cy) instead of starting at the
-        top-left corner of the interior.
-    """
-    if not macros:
-        return
-
-    x_min, y_min, x_max, y_max = interior_bbox
-    sorted_macros = sorted(macros, key=lambda m: -(m.bbox[3] - m.bbox[1]))
-
-    # Target row width: ~sqrt of cluster area * 1.3 for slack. Clamped
-    # to interior width so single-cluster boards don't sprawl off-edge.
-    total_area = sum(
-        (m.bbox[2] - m.bbox[0]) * (m.bbox[3] - m.bbox[1])
-        for m in sorted_macros
+    clusters = place_interior_phase_a(
+        model, macros, interior_bbox, min_gap=min_gap, gap_factor=gap_factor,
     )
-    target_width = min(x_max - x_min, max(math.sqrt(total_area) * 1.3, 10.0))
-
-    def gap_for(m: "Macro") -> float:
-        bx1, by1, bx2, by2 = m.bbox
-        return max(min_gap, max(bx2 - bx1, by2 - by1) * gap_factor)
-
-    # First pass: build rows of (macro, width, height, gap).
-    rows: list[tuple[list[tuple["Macro", float, float, float]], float]] = []
-    current_row: list[tuple["Macro", float, float, float]] = []
-    cursor_x = 0.0
-    row_height = 0.0
-    for m in sorted_macros:
-        bx1, by1, bx2, by2 = m.bbox
-        mw = bx2 - bx1
-        mh = by2 - by1
-        g = gap_for(m)
-
-        if cursor_x + mw > target_width and current_row:
-            rows.append((current_row, row_height))
-            current_row = []
-            cursor_x = 0.0
-            row_height = 0.0
-
-        current_row.append((m, mw, mh, g))
-        cursor_x += mw + g
-        row_height = max(row_height, mh)
-    if current_row:
-        rows.append((current_row, row_height))
-
-    # Compute total block height (with inter-row gap = min_gap).
-    inter_row_gap = min_gap
-    total_h = sum(rh for _, rh in rows) + inter_row_gap * max(0, len(rows) - 1)
-
-    # Second pass: place each row centered horizontally on cx; stack
-    # rows vertically centered on cy.
-    cur_y = cy - total_h / 2
-    for row, rh in rows:
-        # Row width = sum of macro widths + inter-macro gaps.
-        row_width = sum(w + g for _, w, _, g in row) - (row[-1][3] if row else 0.0)
-        cur_x = cx - row_width / 2
-
-        for m, mw, mh, g in row:
-            bx1, by1, _, _ = m.bbox
-            lox = m.leader.x - bx1
-            loy = m.leader.y - by1
-            target_x = cur_x + lox
-            target_y = cur_y + loy
-            # No bounds here — initial placement must accept any position;
-            # legalizer will clamp. Bounds-rejecting would crash on dense boards.
-            m.set_pose(target_x, target_y, 0.0)
-            cur_x += mw + g
-
-        cur_y += rh + inter_row_gap
-
-
-def _collect_attractor_positions(
-    model: "BoardModel",
-) -> dict[str, list[tuple[float, float]]]:
-    """Map net name → list of (x, y) attractor positions for that net.
-
-    Attractors are components that are either fixed (e.g., pre-placed
-    mounting holes or fixed ICs) OR already-placed connectors. We use
-    the model's current state at call time — so if the pipeline places
-    connectors before calling us, those positions count.
-    """
-    out: dict[str, list[tuple[float, float]]] = {}
-    for net in model.nets:
-        for ref in net.component_refs:
-            comp = model.get_component(ref)
-            if comp is None:
-                continue
-            if getattr(comp, "is_fixed", False) or comp.component_type == "connector":
-                out.setdefault(net.name, []).append((comp.x, comp.y))
-    return out
-
-
-def _cluster_attractors(
-    model: "BoardModel",
-    cluster_macros: list["Macro"],
-    attractor_positions: dict[str, list[tuple[float, float]]],
-) -> list[tuple[float, float]]:
-    """Collect attractor positions for any net touching this cluster."""
-    attractors: list[tuple[float, float]] = []
-    cluster_refs = {m.leader.ref for m in cluster_macros}
-    # Include cap followers — they're part of the cluster's connectivity too.
-    for m in cluster_macros:
-        for f in m.followers:
-            cluster_refs.add(f.ref)
-
-    for net in model.nets:
-        if not any(r in cluster_refs for r in net.component_refs):
-            continue
-        attractors.extend(attractor_positions.get(net.name, []))
-    return attractors
+    apply_connectivity_nudges(model, clusters, interior_bbox)
 
 
 def compute_interior_bbox(

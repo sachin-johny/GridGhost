@@ -62,6 +62,7 @@ def _calibrate_initial_temp(
     alpha: float,
     beta: float,
     gamma: float,
+    net_weights: dict[str, float] | None = None,
     rng: random.Random | None = None,
 ) -> float:
     """Estimate an initial temperature by sampling random moves.
@@ -83,7 +84,8 @@ def _calibrate_initial_temp(
         rng = random
 
     positive_deltas: list[float] = []
-    base = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma)
+    base = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma,
+                    net_weights=net_weights)
 
     for _ in range(n_samples):
         m = rng.choice(macros)
@@ -92,7 +94,8 @@ def _calibrate_initial_temp(
         snap = m._snapshot()
         if not m.translate(dx, dy, bounds=bounds):
             continue
-        new_cost = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma)
+        new_cost = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma,
+                            net_weights=net_weights)
         delta_overlap = new_cost["overlap"] - base["overlap"]
         m._restore(snap)
         # Skip overlap-penalty samples: they're noise for HPWL calibration.
@@ -128,6 +131,7 @@ def run_macro_sa(
     displace_prob: float = 0.15,
     seed: int = 42,
     verbose: bool = False,
+    net_weights: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """Run macro-aware simulated annealing.
 
@@ -150,14 +154,15 @@ def run_macro_sa(
 
     rng = random.Random(seed)
 
-    initial = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma)
+    initial = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma,
+                       net_weights=net_weights)
     initial_total = initial["total"]
     best_total = initial_total
     best_snapshot = _snapshot_positions(model)
 
     T0 = _calibrate_initial_temp(
         model, macros, bounds, n_samples=80, window_mm=initial_window_mm,
-        alpha=alpha, beta=beta, gamma=gamma, rng=rng,
+        alpha=alpha, beta=beta, gamma=gamma, net_weights=net_weights, rng=rng,
     )
     T0 = max(T0, 1.0)
     T_min = max(T0 * 1e-4, 1e-6)
@@ -254,7 +259,8 @@ def run_macro_sa(
                     other._restore(swap_partner_snap)
                     continue
 
-            new_cost = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma)
+            new_cost = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma,
+                                net_weights=net_weights)
             new_total = new_cost["total"]
             delta = new_total - current_total
 
@@ -283,7 +289,8 @@ def run_macro_sa(
     for m in macros:
         m.apply_offsets()
 
-    final = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma)
+    final = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma,
+                     net_weights=net_weights)
     if verbose:
         print(
             f"  SA done: initial={initial_total:.2f}, final={final['total']:.2f} "
