@@ -13,7 +13,7 @@ from models.board_model import Component, BoardOutline
 from models.macro import (
     Macro,
     find_cap_offset,
-    MAX_CAP_IC_DISTANCE_MM,
+    MAX_CAP_IC_GAP_MM,
 )
 
 passed = 0
@@ -75,14 +75,69 @@ def test_with_caps_finds_overlap_free_slots():
     assert not c1.overlaps(c2), "C1 and C2 overlap"
 
 
-def test_fan_offset_respects_max_distance():
+def test_fan_offset_does_not_overlap_leader():
+    """The cap's edge-to-edge gap to the leader is the real constraint.
+
+    A cap must never overlap its leader, and the gap (cap near edge to
+    leader near edge) must stay within MAX_CAP_IC_GAP_MM. The offset is
+    ``leader_half + cap_half + spacing``, so the gap equals ``spacing``
+    for cardinal slots (and is larger for diagonals).
+    """
     leader = _ic(x=50, y=50, w=10, h=10)
     cap = _cap("C1")
     offset = find_cap_offset(leader, cap, others=[leader])
-    dist = math.hypot(*offset)
-    assert dist <= MAX_CAP_IC_DISTANCE_MM, (
-        f"Offset {offset} distance {dist:.2f} exceeds max {MAX_CAP_IC_DISTANCE_MM}"
+    # Place the cap at the returned offset and verify no leader overlap.
+    cap.x = leader.x + offset[0]
+    cap.y = leader.y + offset[1]
+    assert not cap.overlaps(leader), (
+        f"Cap at offset {offset} overlaps leader"
     )
+    # Cardinal/diagonal gap >= 0 by construction; the ceiling is the
+    # largest candidate spacing.
+    spacing = min(
+        abs(offset[0]) - leader.effective_width / 2 - cap.effective_width / 2,
+        abs(offset[1]) - leader.effective_height / 2 - cap.effective_height / 2,
+    )
+    assert spacing <= MAX_CAP_IC_GAP_MM + 1e-9, (
+        f"Gap {spacing:.2f} exceeds max {MAX_CAP_IC_GAP_MM}"
+    )
+
+
+def test_fan_offset_handles_large_ic_without_overlap():
+    """Regression test for the test4 U30 cluster (root cause).
+
+    A large IC (ESP32-sized: 11mm body + 0.8mm courtyard = 12.6mm
+    effective) has ``leader_half + cap_half = 6.3 + 1.7 = 8.0mm``. The
+    old center-to-center 8mm cap rejected EVERY fan slot for such an IC
+    and collapsed every cap onto a last-resort slot inside the leader,
+    producing a complete pairwise-overlap cluster. The fix constrains by
+    edge-gap instead, so caps place cleanly just outside the body. This
+    test would have caught the original bug.
+    """
+    # 11mm body, 0.8mm courtyard each side -> 12.6mm effective (like U30).
+    leader = Component(
+        ref="U30", x=50.0, y=50.0, width=11.0, height=11.0,
+        courtyard_margin=0.8, component_type="ic",
+    )
+    # 7 caps (U30's decoupling count). 1.8x0.9 body + 0.8 courtyard.
+    caps = [
+        Component(
+            ref=f"C{i}", x=0.0, y=0.0, width=1.8, height=0.9,
+            courtyard_margin=0.8, component_type="capacitor",
+        )
+        for i in range(7)
+    ]
+    m = Macro.with_caps(leader, caps)
+
+    # No cap may overlap the leader.
+    for c in caps:
+        assert not c.overlaps(leader), f"{c.ref} overlaps leader {leader.ref}"
+    # No pair of caps may overlap each other.
+    for i in range(len(caps)):
+        for j in range(i + 1, len(caps)):
+            assert not caps[i].overlaps(caps[j]), (
+                f"{caps[i].ref} overlaps {caps[j].ref}"
+            )
 
 
 def test_translate_moves_leader_and_followers_rigidly():
@@ -186,7 +241,8 @@ def main():
     run("alone has no followers", test_alone_has_no_followers)
     run("with_caps assigns followers", test_with_caps_assigns_followers)
     run("with_caps finds overlap-free slots", test_with_caps_finds_overlap_free_slots)
-    run("fan offset respects MAX_CAP_IC_DISTANCE", test_fan_offset_respects_max_distance)
+    run("fan offset respects cap-IC gap", test_fan_offset_does_not_overlap_leader)
+    run("large IC places caps without overlap (U30 regression)", test_fan_offset_handles_large_ic_without_overlap)
     run("translate moves rigidly", test_translate_moves_leader_and_followers_rigidly)
     run("translate reverts on bounds violation", test_translate_reverts_on_bounds_violation)
     run("set_pose rotates followers", test_set_pose_rotates_followers_around_leader)

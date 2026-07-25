@@ -21,7 +21,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-from models.macro import Macro, MAX_CAP_IC_DISTANCE_MM
+from models.macro import Macro
 
 if TYPE_CHECKING:
     from models.board_model import BoardModel, BoardOutline
@@ -687,24 +687,32 @@ def legalize(
                 by1 < ky_min - 1e-6 or by2 > ky_max + 1e-6):
                 failed += 1
 
-    cap_ic_violations = 0
+    # Cap-IC invariant: a follower must never overlap its own leader.
+    # Macros are rigid bodies, so this geometry is fixed at construction
+    # (find_cap_offset places every cap gap-spaced off the leader body)
+    # and cannot be disturbed by SA or this legalizer — they move the
+    # whole macro as one unit. This count is therefore an assertion that
+    # construction was correct, not a distance check. (An earlier version
+    # counted center-to-center distances > 8mm as "violations", which
+    # fired on every cap of any IC larger than ~9mm — a false positive
+    # that obscured the real bug; see models/macro.py.)
+    cap_ic_overlaps = 0
     for m in macros:
         if not m.followers:
             continue
         for f in m.followers:
-            d = math.hypot(f.x - m.leader.x, f.y - m.leader.y)
-            if d > MAX_CAP_IC_DISTANCE_MM + 1e-6:
-                cap_ic_violations += 1
+            if f.overlaps(m.leader):
+                cap_ic_overlaps += 1
 
     if verbose:
         print(
             f"  Legalize: {residual} residual overlaps, "
-            f"{failed} boundary failures, {cap_ic_violations} cap-IC distance violations"
+            f"{failed} boundary failures, {cap_ic_overlaps} cap-IC overlaps"
         )
 
     return {
         "residual_overlaps": residual,
         "boundary_failures": failed,
-        "cap_ic_violations": cap_ic_violations,
+        "cap_ic_overlaps": cap_ic_overlaps,
         "expanded_bounds": bounds,
     }

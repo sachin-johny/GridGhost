@@ -6,12 +6,23 @@ a single rectangle for overlap checks. Followers (typically decoupling
 caps) have a fixed offset in leader-local coords; the leader's current
 rotation is applied to those offsets to compute follower positions.
 
-HARD RULE: a follower's center-to-leader-center distance is fixed at
-macro construction (computed from the chosen fan-slot offset). Because
-followers move rigidly with the leader, that distance can NEVER grow
-at runtime. The MAX_CAP_IC_DISTANCE_MM constant is the upper bound
-the construction-time fan search respects; the legalizer's alternate-
-slot search (Commit 2) also respects it.
+HARD RULE: a follower's gap to its leader body is fixed at macro
+construction (the chosen fan-slot ``spacing``). Because followers move
+rigidly with the leader, that gap can NEVER change at runtime. The
+construction-time fan search bounds the edge-to-edge gap by
+``MAX_CAP_IC_GAP_MM`` (the largest entry in ``_FAN_SPACINGS``); the
+legalizer asserts the invariant (no follower overlaps its leader).
+
+Why edge-gap, not center-to-center distance: decoupling effectiveness is
+governed by trace length from the cap to the IC pin, which is ~the
+edge-to-edge gap — NOT the center-to-center distance. An earlier version
+capped the center-to-center distance at 8mm, which is dimensionally wrong
+for large ICs: for any IC whose effective half-extent + cap half-extent
+exceeds 8mm (e.g. a 12.6mm ESP32: 6.3 + 1.7 = 8.0), every fan slot was
+rejected and find_cap_offset collapsed every cap onto the last-resort
+slot *inside* the leader, producing a complete pairwise-overlap cluster
+(the test4 U30 cluster: 28 overlaps from 7 caps). See
+tests/debug/diag_u30_macro.py.
 """
 
 from __future__ import annotations
@@ -24,7 +35,10 @@ if TYPE_CHECKING:
     from models.board_model import Component
 
 
-MAX_CAP_IC_DISTANCE_MM = 8.0
+# Max edge-to-edge gap (mm) between a decoupling cap body and its IC body.
+# _FAN_SPACINGS are the candidate gaps; its largest entry is the ceiling.
+# See module docstring for why this is a gap, not a center-to-center distance.
+MAX_CAP_IC_GAP_MM = 4.0
 
 _FAN_SPACINGS = (0.5, 1.0, 2.0, 3.0, 4.0)
 _FAN_DIRS = (
@@ -50,21 +64,35 @@ def find_cap_offset(
 
     Returns an offset (dx, dy) in leader-local coords at leader
     rotation=0. The fan search tries 8 directions at increasing
-    spacings; the first slot within MAX_CAP_IC_DISTANCE_MM that
-    doesn't overlap the leader or any component in ``others`` is
-    returned.
+    edge-to-edge spacings (``_FAN_SPACINGS``); the first slot whose gap
+    to the leader is within ``MAX_CAP_IC_GAP_MM`` and that doesn't
+    overlap the leader or any component in ``others`` is returned.
+
+    The slot's offset is ``leader_half + cap_half + spacing`` along each
+    axis, so the cap's near edge sits exactly ``spacing`` mm from the
+    leader's near edge (cardinal slots) — or farther (diagonals push the
+    cap out on both axes). For any ``spacing >= 0`` this can NEVER
+    overlap the leader; the ``cap.overlaps(leader)`` check below is a
+    defensive guard, not the primary constraint.
+
+    The constraint is on this edge-to-edge GAP, not on the center-to-
+    center distance. The old center-distance cap (8mm) was
+    dimensionally wrong for large ICs: it rejected every slot once
+    ``leader_half + cap_half`` exceeded 8mm, collapsing all caps onto a
+    last-resort slot inside the leader. See the module docstring.
 
     ``others`` is typically the macro's already-placed followers — we
     want the new cap to avoid overlapping its sibling caps. We do NOT
     check against other components in the model because at macro-
     construction time everything is still at parse positions and the
-    "overlap-free" check would almost always fail, producing a >8mm
-    fallback offset. The legalizer's push-apart will resolve macro-
+    "overlap-free" check would almost always fail, producing a large-
+    gap fallback offset. The legalizer's push-apart will resolve macro-
     vs-macro overlaps after SA.
 
-    If no slot within MAX_CAP_IC_DISTANCE_MM is free of siblings,
-    falls back to the largest diagonal spacing within the limit; this
-    keeps the cap near its IC even at the cost of a sibling overlap.
+    If no slot is free of siblings, falls back to the first leader-clear
+    slot found (smallest gap). This keeps the cap near its IC at the cost
+    of a sibling overlap — but only in the pathological case of more
+    caps than directions×spacings (40+ caps on one IC).
     """
     leader_w = leader.effective_width
     leader_h = leader.effective_height
@@ -81,21 +109,22 @@ def find_cap_offset(
 
     try:
         for spacing in _FAN_SPACINGS:
+            # Spacings are ascending; once we pass the gap ceiling, no
+            # later (larger) spacing can qualify either.
+            if spacing > MAX_CAP_IC_GAP_MM:
+                break
             for dx_dir, dy_dir in _FAN_DIRS:
                 offset_x = dx_dir * (leader_w / 2 + cap_w / 2 + spacing)
                 offset_y = dy_dir * (leader_h / 2 + cap_h / 2 + spacing)
-
-                # Reject offsets exceeding the hard cap-IC distance.
-                dist = math.hypot(offset_x, offset_y)
-                if dist > MAX_CAP_IC_DISTANCE_MM:
-                    continue
 
                 cap_x = leader.x + offset_x * cos_r - offset_y * sin_r
                 cap_y = leader.y + offset_x * sin_r + offset_y * cos_r
                 cap.x = cap_x
                 cap.y = cap_y
 
-                # Reject slots where cap overlaps the leader's courtyard.
+                # Defensive: a cardinal/diagonal slot at spacing >= 0 can
+                # never overlap the leader by construction. Kept to guard
+                # against future _FAN_DIRS edits that break that property.
                 if cap.overlaps(leader):
                     continue
 
@@ -112,9 +141,12 @@ def find_cap_offset(
     if fallback is not None:
         return fallback
 
-    # Absolute last resort: a diagonal slot just under the limit.
-    s = MAX_CAP_IC_DISTANCE_MM / math.sqrt(2)
-    return (s, s)
+    # Absolute last resort (only if every fan slot overlaps a sibling):
+    # a cardinal slot at the max gap. By construction (offset >=
+    # leader_half + cap_half) this never overlaps the leader. Unlike the
+    # old ``(MAX/sqrt(2), MAX/sqrt(2))`` fallback, this scales with the
+    # actual leader size instead of landing inside a large IC.
+    return (leader_w / 2 + cap_w / 2 + _FAN_SPACINGS[-1], 0.0)
 
 
 @dataclass

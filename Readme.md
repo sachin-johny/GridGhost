@@ -8,7 +8,7 @@
 
 ## Features
 
-- **Macro abstraction** — an IC + its assigned decoupling caps form one `Macro` that moves rigidly through every stage of the pipeline. Caps rotate around the IC, translate with it, and stay within `MAX_CAP_IC_DISTANCE_MM = 8.0` mm of the leader — automatically, because the offset is fixed at construction time.
+- **Macro abstraction** — an IC + its assigned decoupling caps form one `Macro` that moves rigidly through every stage of the pipeline. Caps rotate around the IC, translate with it, and stay within `MAX_CAP_IC_GAP_MM = 4.0` mm **edge-to-edge gap** of the leader — automatically, because the offset is fixed at construction time.
 - **Cap classification + assignment** — caps are classified as *decoupling*, *bulk*, or *coupling* before IC assignment. Decoupling caps are distributed round-robin across ICs (one cap → exactly one IC) based on shared power rails and physical proximity.
 - **Net-aware initial placement** — clusters components by net connectivity (reusing `engine/net_clustering`), then shelf-packs each cluster around the centroid of the fixed components + placed connectors it shares nets with. Per-macro gap is proportional to macro size (`max(min_gap, max_dim * 0.5)`), giving SA room to move.
 - **Connector-attractor pull** — connectors are placed on the perimeter *first*, so interior placement can use their positions as attractors. Interior macros connected to a given connector get pulled toward it (`attractor_pull` blends with grid-cell fallback to prevent pile-up).
@@ -127,12 +127,12 @@ Total Cost = α · HPWL + β · Overlap + γ · Boundary
 A `Macro` is the atomic unit of placement. Construction:
 
 1. **Leader**: a component (typically an IC) that's free to move.
-2. **Followers**: caps assigned to that IC. Each follower has a *fixed offset* in leader-local coordinates, chosen at construction time by `find_cap_offset` — an 8-direction fan search at increasing spacings (0.5–4.0 mm) that:
+2. **Followers**: caps assigned to that IC. Each follower has a *fixed offset* in leader-local coordinates, chosen at construction time by `find_cap_offset` — an 8-direction fan search at increasing edge-to-edge spacings (0.5–4.0 mm) that:
    - Rejects slots where the cap overlaps the leader or any already-placed sibling.
-   - Rejects slots beyond `MAX_CAP_IC_DISTANCE_MM = 8.0` mm.
-   - Falls back to the largest diagonal spacing within the limit if no slot is sibling-free.
+   - Bounds the cap's **edge-to-edge gap** to the leader by `MAX_CAP_IC_GAP_MM = 4.0` mm (the spacing itself). The gap — not the center-to-center distance — is what governs decoupling effectiveness; center-distance is size-dependent and broke every cap on ICs larger than ~9 mm.
+   - Falls back to the first leader-clear slot (smallest gap) if no slot is sibling-free.
 
-Because offsets are fixed, the cap-IC distance can **never grow at runtime** — translating or rotating the leader applies the same rigid transform to followers. The `<8 mm` rule is enforced by construction.
+Because offsets are fixed, the cap-IC gap can **never grow at runtime** — translating or rotating the leader applies the same rigid transform to followers. The gap is enforced by construction.
 
 Move operators and the legalizer all operate on macros as opaque rigid bodies. Caps never get separated from their IC.
 
@@ -157,7 +157,7 @@ GridGhost/
 ├── models/
 │   ├── board_model.py             # BoardModel, Component, Net, Pad, BoardOutline
 │   └── macro.py                   # Macro: leader + rigid followers
-│                                  # find_cap_offset; MAX_CAP_IC_DISTANCE_MM = 8.0
+│                                  # find_cap_offset; MAX_CAP_IC_GAP_MM = 4.0 (edge-to-edge)
 │
 ├── parsers/
 │   ├── kicad_parser.py            # S-expression .kicad_pcb parser
@@ -270,7 +270,7 @@ python -m pytest tests/test_phase1.py
 ```
 
 The macro-first pipeline is verified by 30 tests across `test_macro.py`, `test_assign_caps.py`, and `test_cost.py`, covering:
-- **Macro model**: rigid translation, bounds revert, rotation propagation, `MAX_CAP_IC_DISTANCE_MM` enforcement, bbox union, overlap detection
+- **Macro model**: rigid translation, bounds revert, rotation propagation, `MAX_CAP_IC_GAP_MM` (edge-to-edge cap-IC gap) enforcement, bbox union, overlap detection
 - **Cap assignment**: power-net detection, single-IC assignment, round-robin distribution, determinism
 - **Cost**: HPWL (2-pin, 3-pin, with/without power), macro overlap area, boundary, edge-connector exclusion, evaluate() returns all components
 

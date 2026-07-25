@@ -4,7 +4,7 @@ Three cap classes:
 
 - **Decoupling** — small value (<=1uF) on a non-GND power rail shared with
   at least one IC. These become macro followers and stay within
-  ``MAX_CAP_IC_DISTANCE_MM`` of their leader.
+  ``MAX_CAP_IC_GAP_MM`` (edge-to-edge) of their leader.
 
 - **Bulk** — large value (>1uF) OR on a power rail that no IC shares.
   These are rail-level filters (regulator output, board input rail, etc.)
