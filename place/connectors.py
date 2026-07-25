@@ -570,6 +570,80 @@ def place_connectors_perimeter(
     _resolve_corners(connectors, comp_edge, board, margin, gap)
 
 
+def _pad_perpendicular_extent(conn: "Component", edge: str) -> tuple[float, float]:
+    """Return (inward_pad_ahead, outward_pad_ahead) perpendicular to the edge.
+
+    Both values are distances from the BBOX CENTER (not the component
+    origin) to the corresponding extreme pad, measured along the edge's
+    perpendicular axis. The bbox center is the right reference because
+    ``set_bbox_center`` positions the body by its bbox center, and the
+    pad-vs-edge relationship we care about is "how far past the bbox
+    center do the pads reach" — that's what determines overhang when the
+    bbox center is placed on the board edge.
+
+    * ``inward_pad_ahead`` > 0  → inward-most pad is AHEAD of bbox center
+      (toward board interior).
+    * ``outward_pad_ahead`` > 0 → outward-most pad is AHEAD of bbox center
+      (toward board edge / outside).
+
+    For connectors whose body center sits between the pads (typical
+    pin-header / SMA): pads straddle the bbox center, so
+    ``inward_pad_ahead > 0`` and ``outward_pad_ahead < 0``. For end-mating
+    connectors (BarrelJack, USB, RJ45) all pads sit at one end so the
+    outward value is the bbox half-extent (the body center is well behind
+    the pads).
+
+    Used by ``_place_on_edge`` to position the body so the OUTWARD-most
+    pad lands at ``mating_margin`` inside the board (pads never overhang).
+    The body still overhangs naturally — only the mechanical shell extends
+    past the edge.
+    """
+    # Bbox center in board frame
+    bx1, by1, bx2, by2 = conn.bbox
+    bcx = (bx1 + bx2) / 2
+    bcy = (by1 + by2) / 2
+
+    if not conn.pads:
+        # An edge connector with no pads is malformed — every real
+        # connector has pads. Falling back to body half-extent (the
+        # pre-fix behavior) silently produces a wrong pose: the body
+        # ends up entirely inside the board with no overhang, defeating
+        # the pad-driven design. Raise so malformed footprints are
+        # caught at placement time instead of producing silently-wrong
+        # layouts.
+        raise ValueError(
+            f"edge connector {conn.ref!r} ({conn.footprint}) has no pads; "
+            f"pad-driven overhang placement cannot proceed. Check the "
+            f"footprint definition in the .kicad_pcb file."
+        )
+
+    pad_abs = [p.absolute_pos(conn.x, conn.y, conn.rotation) for p in conn.pads]
+
+    if edge == "bottom":
+        # Inward = -y. Pads at lower y are more inward.
+        pad_ys = [p[1] for p in pad_abs]
+        inward_y = min(pad_ys)
+        outward_y = max(pad_ys)
+        return (bcy - inward_y, outward_y - bcy)
+    if edge == "top":
+        # Inward = +y. Pads at higher y are more inward.
+        pad_ys = [p[1] for p in pad_abs]
+        inward_y = max(pad_ys)
+        outward_y = min(pad_ys)
+        return (inward_y - bcy, bcy - outward_y)
+    if edge == "left":
+        # Inward = +x.
+        pad_xs = [p[0] for p in pad_abs]
+        inward_x = max(pad_xs)
+        outward_x = min(pad_xs)
+        return (inward_x - bcx, bcx - outward_x)
+    # right edge: inward = -x.
+    pad_xs = [p[0] for p in pad_abs]
+    inward_x = min(pad_xs)
+    outward_x = max(pad_xs)
+    return (bcx - inward_x, outward_x - bcx)
+
+
 def _place_on_edge(
     conns: list["Component"],
     edge: str,
@@ -578,7 +652,26 @@ def _place_on_edge(
     min_gap: float,
     mating_margin: float,
 ) -> None:
-    """Place connectors along a single edge, evenly spaced (order preserved)."""
+    """Place connectors along a single edge, evenly spaced (order preserved).
+
+    Perpendicular placement is **pad-driven**: the body is translated so
+    that BOTH the inward-most AND outward-most pads land inside the board.
+    The body itself overhangs past the edge by however much its mechanical
+    shell extends beyond the pads — exactly the "pads inside, body outside"
+    pose.
+
+    Specifically, we translate the bbox center so that:
+      * the OUTWARD-most pad sits at ``mating_margin`` inside the board
+        (i.e. pads never overhang — they're all solderable), AND
+      * if there's room, the inward-most pad sits at ``pad_depth + mating_margin``
+        inside (so the connector sits flush against the edge, not buried
+        deep in the interior).
+
+    For connectors where pads span the full body depth (TerminalBlock,
+    PinHeader_Horizontal), this means the entire body sits inside the
+    board. For end-mating connectors (BarrelJack, SMA edge-mount), only
+    the mechanical flange overhangs.
+    """
     if not conns:
         return
 
@@ -605,32 +698,52 @@ def _place_on_edge(
         rot = _compute_connector_rotation(conn, edge)
         conn.set_rotation(rot)
 
-        # Along-edge bbox-center position. ``ext`` already includes
-        # ``mating_margin``, so centering on ``start_offset + ext/2`` leaves
-        # ``mating_margin/2`` clearance to each slot boundary — adjacent
-        # connector *bodies* end up ``mating_margin`` apart (plus ``gap``).
+        # Along-edge bbox-center position
         center_offset = start_offset + ext / 2
         start_offset += ext + gap
 
-        # Perpendicular: edge connectors OVERHANG the board edge — the body
-        # extends OUTSIDE the outline and only the pad/lead area sits inside.
-        # Place the bbox so its inward face is ``mating_margin`` inside the
-        # board (pads on the board), letting the body overhang past the edge.
-        # This is why connectors consume almost no interior room: their
-        # inside footprint is just the pad depth, not the full body. Position
-        # via set_bbox_center so the BODY lands here, not the origin (pin
-        # headers / edge-mount SMAs have origin ≠ bbox center).
+        # ─── Perpendicular: PAD-DRIVEN overhang ───────────────────────
+        # Goal: place the body so the OUTWARD-most pad sits at
+        # ``mating_margin`` inside the board. Pads never overhang.
+        #
+        # Strategy:
+        #   1. Place the BBOX CENTER at the board edge (perpendicular coord).
+        #   2. Measure how far the OUTWARD-most pad sits AHEAD of the bbox
+        #      center (positive = toward edge = currently outside the board).
+        #   3. Translate the bbox center INWARD by ``outward_pad_ahead + mating_margin``
+        #      so the outward-most pad ends up at ``mating_margin`` inside.
+
+        # 1. Initial bbox-center = on the board edge.
         if edge == "bottom":
             target_cx = board.x_min + margin + center_offset
-            target_cy = board.y_max - mating_margin + conn.effective_height / 2
+            target_cy = board.y_max
         elif edge == "top":
             target_cx = board.x_min + margin + center_offset
-            target_cy = board.y_min + mating_margin - conn.effective_height / 2
+            target_cy = board.y_min
         elif edge == "left":
-            target_cx = board.x_min + mating_margin - conn.effective_width / 2
+            target_cx = board.x_min
             target_cy = board.y_min + margin + center_offset
-        elif edge == "right":
-            target_cx = board.x_max - mating_margin + conn.effective_width / 2
+        else:  # right
+            target_cx = board.x_max
             target_cy = board.y_min + margin + center_offset
 
         conn.set_bbox_center(target_cx, target_cy, rot)
+
+        # 2. Measure pad geometry
+        inward_ahead, outward_ahead = _pad_perpendicular_extent(conn, edge)
+        # The outward-most pad currently sits at:
+        #   edge ± outward_ahead  (board frame)
+        # We want it at:
+        #   edge ∓ mating_margin
+        # So shift the bbox center inward by ``outward_ahead + mating_margin``.
+        shift = outward_ahead + mating_margin
+        if abs(shift) > 1e-6:
+            if edge == "bottom":
+                target_cy -= shift  # inward = -y
+            elif edge == "top":
+                target_cy += shift  # inward = +y
+            elif edge == "left":
+                target_cx += shift  # inward = +x
+            else:  # right
+                target_cx -= shift  # inward = -x
+            conn.set_bbox_center(target_cx, target_cy, rot)

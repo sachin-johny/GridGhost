@@ -23,7 +23,7 @@ from place.initial import (
     apply_connectivity_nudges,
     compute_interior_bbox,
 )
-from place.legalizer import legalize as legalize_macros
+from place.legalizer import legalize as legalize_macros, expand_bounds_to_fit
 from place.sa import run_macro_sa
 
 if TYPE_CHECKING:
@@ -144,6 +144,12 @@ def place_v2(
         )
         for m in connector_macros:
             m.apply_offsets()
+        # Mark connector macros as FIXED — the legalizer treats them as
+        # immovable obstacles so interior macros get pushed out of the
+        # connector zone instead of overlapping them. This is the fix
+        # for the test6 macro-connector collision regression.
+        for m in connector_macros:
+            m.is_fixed = True
     else:
         connector_reserve = 0.0
 
@@ -151,6 +157,28 @@ def place_v2(
     interior_bbox = compute_interior_bbox(
         interior_macros, model.board, margin, connector_reserve=connector_reserve,
     )
+
+    # If macros are too dense for the interior, expand the bounds BEFORE
+    # Phase A so the shelf-packer distributes them across the full expanded
+    # area (not crammed into the tight original bbox). This is the same
+    # expansion the legalizer would do later, but doing it here means SA
+    # starts from a well-spread pose instead of a tight cluster.
+    expanded_interior = expand_bounds_to_fit(
+        interior_macros, interior_bbox,
+        extra_padding=1.0, target_density=0.55,
+    )
+    if expanded_interior != interior_bbox:
+        if verbose:
+            iw = interior_bbox[2] - interior_bbox[0]
+            ih = interior_bbox[3] - interior_bbox[1]
+            ew = expanded_interior[2] - expanded_interior[0]
+            eh = expanded_interior[3] - expanded_interior[1]
+            print(
+                f"  Pre-Phase-A bounds expansion: {iw:.1f}×{ih:.1f} -> "
+                f"{ew:.1f}×{eh:.1f}mm (density target 55%)"
+            )
+        interior_bbox = expanded_interior
+
     # Phase A: height-ordered shelf-pack of net-clusters to fill the interior
     # (connectivity-blind positioning — uses the board, doesn't collapse).
     clusters = place_interior_phase_a(model, interior_macros, interior_bbox)
@@ -180,7 +208,9 @@ def place_v2(
               f"boundary={cost_init['boundary']:.1f})")
 
     # ─── Phase 4: SA on interior macros (connectors stay put) ────────
-    # Bounds = interior_bbox so SA doesn't push into connector zone
+    # Bounds = interior_bbox (possibly already expanded in Phase 3) so SA
+    # doesn't push into the connector zone. SA distributes macros across
+    # the full expanded area.
     sa_bounds = interior_bbox
     sa_result = run_macro_sa(
         model, interior_macros, sa_bounds,
@@ -197,9 +227,91 @@ def place_v2(
         model.board.x_min, model.board.y_min,
         model.board.x_max, model.board.y_max,
     )
+    # Per-macro edge keepout: ICs/MCUs/regulators get extra edge clearance
+    # from the BOARD OUTLINE — DFM rule a human designer always applies,
+    # keeps silicon away from the board edge where it's harder to route,
+    # harder to rework, and more exposed to mechanical stress.
+    #
+    # ROOT-CAUSE FIX (B1): the legalizer runs on `sa_bounds` (the interior
+    # bbox), which is already inset from the board outline by `margin +
+    # connector_reserve`. Applying the full keepout on top of `sa_bounds`
+    # double-counts the inset and pushes ICs 15-20mm from the true board
+    # edge on dense boards, causing overlap regressions.
+    #
+    # The fix has two parts:
+    #   1. Subtract the interior-bbox inset from the keepout in the
+    #      callback. If the keepout is smaller than the inset, the macro
+    #      is already far enough from the board edge — effective keepout
+    #      is 0.
+    #   2. Density-scale the keepout using the INTERIOR-BBOX density
+    #      (the actual packing pressure the legalizer faces), not the
+    #      board-level density that `edge_keepout_extra_for` uses. On
+    #      dense boards (interior density > 40%) the keepout is scaled
+    #      down proportionally — the DFM rule is a nice-to-have, not a
+    #      hard constraint, and on packed boards it's better to have a
+    #      routable placement with ICs slightly close to the edge than
+    #      an un-routable one with ICs in the "right" place.
+    board = model.board
+    inset_left   = sa_bounds[0] - board.x_min
+    inset_right  = board.x_max - sa_bounds[2]
+    inset_top    = sa_bounds[1] - board.y_min
+    inset_bottom = board.y_max - sa_bounds[3]
+    min_inset = min(inset_left, inset_right, inset_top, inset_bottom)
+
+    # Compute interior-bbox density for keepout scaling. This is the
+    # density the legalizer actually faces — board-level density
+    # (component_area / board_area) understates the packing pressure
+    # because it includes the margin ring and connector reserve.
+    sa_bounds_area = (sa_bounds[2] - sa_bounds[0]) * (sa_bounds[3] - sa_bounds[1])
+    interior_macro_area = sum(
+        max(0.0, m.bbox[2] - m.bbox[0]) * max(0.0, m.bbox[3] - m.bbox[1])
+        for m in interior_macros
+    )
+    interior_density = interior_macro_area / sa_bounds_area if sa_bounds_area > 0 else 0.0
+
+    # Density scaling: full keepout below 35% interior density (plenty of
+    # room), scale down to 20% at 55% density (packed — barely any room).
+    # This is more aggressive than `edge_keepout_extra_for`'s board-level
+    # scaling because the interior density is the relevant metric.
+    if interior_density <= 0.35:
+        keepout_scale = 1.0
+    elif interior_density >= 0.55:
+        keepout_scale = 0.2
+    else:
+        keepout_scale = 1.0 - 0.8 * (interior_density - 0.35) / 0.20
+
+    try:
+        from engine.cost_state import edge_keepout_extra_for
+
+        def _keepout_cb(macro: "Macro") -> float:
+            raw = edge_keepout_extra_for(macro.leader, model=model)
+            # Apply interior-density scaling (root-cause fix for dense boards
+            # where the full keepout causes overlap regressions).
+            scaled = raw * keepout_scale
+            # Subtract the interior inset so the keepout is measured
+            # from the BOARD OUTLINE, not the interior bbox. Clamp at 0
+            # — if the inset already exceeds the keepout, no extra
+            # push is needed.
+            return max(0.0, scaled - min_inset)
+    except Exception:
+        _keepout_cb = None
+
+    # Pass sa_bounds (already expanded if needed) so legalizer doesn't
+    # re-expand; the bounds are already at target density. The per-macro
+    # keepout callback handles the board-edge clearance correctly (see
+    # comment above) by subtracting the interior-bbox inset.
+    #
+    # Pass interior_macros + connector_macros to the legalizer so it can
+    # resolve macro-connector overlaps. Connector macros are marked
+    # is_fixed=True (Phase 2 above) so the legalizer treats them as
+    # immovable obstacles — interior macros get pushed out of the
+    # connector zone instead of overlapping them. This is the fix for
+    # the test6 macro-connector collision regression.
     legal_stats = legalize_macros(
-        model, interior_macros, sa_bounds,
+        model, interior_macros + connector_macros, sa_bounds,
         grid_mm=grid_mm, verbose=verbose,
+        expand_to_fit=False,  # already expanded above
+        per_macro_keepout=_keepout_cb,
     )
 
     # Final cost (all macros including connectors)

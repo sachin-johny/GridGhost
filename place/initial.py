@@ -181,13 +181,60 @@ def place_interior_phase_a(
         blocks.append({"layout": layout, "w": w, "h": h, "cluster": cl})
 
     # Shelf-pack blocks into rows (height-sorted for area efficiency).
+    # Target a number of rows that fills the interior HEIGHT, not just the
+    # width. Without this, a board with 6 tall blocks (47mm each) on a
+    # 115mm-tall interior ends up with 1 row of 6 blocks + 1 row of 2
+    # small blocks — 47mm used, 68mm of vertical emptiness.
+    #
+    # The target row height is based on the MEDIAN block height (not
+    # interior_h / n_target_rows) because the blocks have a fixed height
+    # distribution — a 47mm-tall IC macro can't shrink to fit a 38mm
+    # target row. Using the median ensures the target is achievable:
+    # roughly half the blocks fit in one row, the other half trigger a
+    # new row. This naturally produces 2-3 rows for typical IC+cap
+    # macro sets instead of 1 mega-row.
+    #
+    # DISABLE on dense boards (macro density > 50%): no vertical slack
+    # to spread into, and forcing extra rows creates overlaps the
+    # legalizer can't resolve.
     blocks.sort(key=lambda b: -b["h"])
+    n_blocks = len(blocks)
+    total_block_area = sum(b["w"] * b["h"] for b in blocks)
+    interior_area = max(interior_w * interior_h, 1.0)
+    density = total_block_area / interior_area
+    height_overflow_enabled = density < 0.50
+
+    if n_blocks > 0 and height_overflow_enabled:
+        # Target row height = median block height × 1.5 (allow 2 rows of
+        # median-height blocks per target row, so small blocks don't
+        # trigger premature row breaks but tall blocks do).
+        #
+        # Use the TRUE median: for even n, average the two middle values
+        # (sorted_heights[n//2 - 1] + sorted_heights[n//2]) / 2.
+        # The previous sorted_heights[n // 2] picked the upper median
+        # for even n, biasing target_row_h upward by one rank and
+        # triggering premature row breaks on small even-count boards.
+        sorted_heights = sorted(b["h"] for b in blocks)
+        if n_blocks % 2 == 1:
+            median_h = sorted_heights[n_blocks // 2]
+        else:
+            median_h = (sorted_heights[n_blocks // 2 - 1]
+                        + sorted_heights[n_blocks // 2]) / 2.0
+        target_row_h = max(median_h * 1.5, 1.0)
+    else:
+        target_row_h = math.inf  # never trigger height_overflow
+
     rows: list[tuple[list[dict], float]] = []
     cur_row: list[dict] = []
     cur_w = 0.0
     row_h = 0.0
     for b in blocks:
-        if cur_row and cur_w + b["w"] > max(interior_w, 1.0):
+        width_overflow = cur_row and cur_w + b["w"] > max(interior_w, 1.0)
+        height_overflow = (
+            cur_row and row_h >= target_row_h
+            and b["h"] > 0.5 * target_row_h
+        )
+        if width_overflow or height_overflow:
             rows.append((cur_row, row_h))
             cur_row = []
             cur_w = 0.0

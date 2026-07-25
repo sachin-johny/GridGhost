@@ -125,20 +125,49 @@ def test_edge_groups_centered_and_flush(stem):
             f"{stem} edge={edge} group off-center by {abs(group_mid - true_mid):.2f}mm"
         )
 
-        # Perpendicular: edge connectors OVERHANG — the inward bbox face sits
-        # ``mating_margin`` inside the board (pads on the board), body extends
-        # outward past the outline. Assert the inward face position.
+        # Perpendicular: PAD-DRIVEN overhang (post-patch-evaluation).
+        #
+        # The patch-evaluation branch changed edge-connector placement
+        # from "inward bbox face at mating_margin" to "outward-most PAD
+        # at mating_margin". This is mechanically correct: pads must be
+        # solderable (always inside the board); the body's pad-side
+        # flange may extend further inward, and the mechanical shell
+        # may overhang past the edge.
+        #
+        # For end-mating connectors (SMA edge-mount, BarrelJack, USB),
+        # the outward-most pad sits at one extreme of the bbox; for
+        # face-mating connectors (PinHeader_Horizontal, TerminalBlock)
+        # the pads straddle the bbox center. In both cases, the
+        # outward-most pad should land at `mating_margin` inside the
+        # board edge.
+        #
+        # The pre-patch test asserted on the bbox face, which was the
+        # pre-patch placement strategy. That test was a stale contract
+        # — the patch fixed the underlying bug (connectors sitting too
+        # deep) and the test had to be updated to match.
         for c in comps:
-            bx1, by1, bx2, by2 = c.bbox
+            if not c.pads:
+                # Skip padless connectors — they're malformed and the
+                # patch raises ValueError on them in _pad_perpendicular_extent.
+                continue
+            pad_abs = [p.absolute_pos(c.x, c.y, c.rotation) for p in c.pads]
             if edge == "bottom":
-                inward, expected = by1, board.y_max - mating_margin
+                # Outward = +y (toward board.y_max).
+                outward_pad_y = max(p[1] for p in pad_abs)
+                got, expected = outward_pad_y, board.y_max - mating_margin
             elif edge == "top":
-                inward, expected = by2, board.y_min + mating_margin
+                # Outward = -y (toward board.y_min).
+                outward_pad_y = min(p[1] for p in pad_abs)
+                got, expected = outward_pad_y, board.y_min + mating_margin
             elif edge == "right":
-                inward, expected = bx1, board.x_max - mating_margin
+                # Outward = +x (toward board.x_max).
+                outward_pad_x = max(p[0] for p in pad_abs)
+                got, expected = outward_pad_x, board.x_max - mating_margin
             else:  # left
-                inward, expected = bx2, board.x_min + mating_margin
-            assert abs(inward - expected) < 0.5, (
-                f"{stem} {c.ref} edge={edge} inward face {inward:.2f} "
-                f"!= {expected:.2f} (diff {abs(inward - expected):.2f}mm)"
+                # Outward = -x (toward board.x_min).
+                outward_pad_x = min(p[0] for p in pad_abs)
+                got, expected = outward_pad_x, board.x_min + mating_margin
+            assert abs(got - expected) < 0.5, (
+                f"{stem} {c.ref} edge={edge} outward-most pad {got:.2f} "
+                f"!= {expected:.2f} (diff {abs(got - expected):.2f}mm)"
             )

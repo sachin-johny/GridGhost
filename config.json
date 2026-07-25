@@ -64,10 +64,10 @@
         "force_dt_cooling": 0.8,
         "shelf_packing_spacing": 0.5,
         "edge_keepout_extra": {
-            "ic": 5.0,
-            "mcu": 5.0,
-            "regulator": 5.0,
-            "crystal": 3.0
+            "ic": 10.0,
+            "mcu": 10.0,
+            "regulator": 8.0,
+            "crystal": 5.0
         }
     },
     "parser": {

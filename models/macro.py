@@ -125,11 +125,18 @@ class Macro:
     leader-local coords at leader rotation=0, and never change. Call
     ``apply_offsets()`` after any leader pose change to refresh
     follower board positions.
+
+    ``is_fixed`` marks the macro as immovable — the legalizer and SA
+    skip fixed macros when choosing a mover. Used for connector macros
+    that have already been placed on the perimeter: the legalizer
+    treats them as fixed obstacles so interior macros get pushed out
+    of the connector zone instead of overlapping them.
     """
 
     leader: "Component"
     followers: list["Component"] = field(default_factory=list)
     follower_offsets: list[tuple[float, float]] = field(default_factory=list)
+    is_fixed: bool = False
 
     @classmethod
     def alone(cls, leader: "Component") -> "Macro":
