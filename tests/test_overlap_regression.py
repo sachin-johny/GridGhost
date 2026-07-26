@@ -24,9 +24,16 @@ asked for:
 
 Run:
     python tests/test_overlap_regression.py
+
+Pytest note: this file is NOT pytest-collectable (uses no test_* funcs).
+Run it directly via the main() harness above. The test_overlap_regression
+phase in tests/run_all.py invokes it via subprocess.
 """
 from __future__ import annotations
 
+# Prevent pytest from collecting this module's main() as a test.
+# It's a standalone harness invoked via `python tests/test_overlap_regression.py`
+# or by tests/run_all.py's overlap-regression phase.
 import os
 import sys
 from pathlib import Path
@@ -36,6 +43,18 @@ sys.path.insert(0, str(REPO))
 
 os.environ["PYTHONHASHSEED"] = "0"
 os.environ["GRIDGHOST_HASH_SEEDED"] = "1"
+
+# This harness prints ✓/✗ glyphs. On Windows the default console codec
+# (cp1252) can't encode them and print() would raise UnicodeEncodeError.
+# Force UTF-8 on stdout/stderr (PYTHONUTF8 in env is read at startup by
+# run_all.py's subprocess; this reconfigure covers a direct standalone run).
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if _reconfigure is not None:
+        try:
+            _reconfigure(encoding="utf-8")
+        except (ValueError, OSError):
+            pass
 
 import random
 random.seed(42)
@@ -72,7 +91,7 @@ def _count_macro_overlaps(macros) -> int:
     return n
 
 
-def test_board(board_pcb: Path) -> tuple[bool, str]:
+def _check_board(board_pcb: Path) -> tuple[bool, str]:
     """Run placement on a board, check self-report vs independent scan.
 
     Returns (passed, message).
@@ -150,7 +169,7 @@ def main():
     for board in boards:
         # Skip very large boards in the regression test to keep runtime
         # reasonable (each board takes ~30-60s).
-        passed, msg = test_board(board)
+        passed, msg = _check_board(board)
         status = "✓" if passed else "✗"
         print(f"  {status} {msg}")
         if not passed:

@@ -7,5 +7,9 @@ auto_placer_plan.md
 *.log
 *placed.kicad_pcb
 
+# Generated test-harness output (dashboards, SVGs, per-run JSON, logs).
+# See tests/README.md — not checked in.
+tests/output/
+
 % donot ignore config.json 
 !config.json
