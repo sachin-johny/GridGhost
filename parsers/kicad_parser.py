@@ -182,7 +182,16 @@ def _extract_fp_geometry(sexp: list, margin_mm: float = 0.5) -> tuple[float, flo
 # ---------------------------------------------------------------------------
 
 def _infer_component_type(ref: str, footprint: str, value: str) -> str:
-    """Infer component type from reference prefix and footprint name."""
+    """Infer component type from reference prefix and footprint name.
+
+    Mounting holes (Finding 4 fix): footprints whose library prefix is
+    ``MountingHole`` (e.g. ``MountingHole:MountingHole_3.2mm_M3``) or
+    whose reference prefix is ``H`` / ``MH`` / ``HS`` are classified as
+    ``mounting_hole``. The parser then marks these ``is_fixed=True`` and
+    gives them a larger courtyard (1.5mm) so other components keep a
+    real assembly clearance from them — not just the 0.25mm default
+    courtyard that lets resistors sit touching the hole's copper pad.
+    """
     ref_prefix = re.match(r'^([A-Z]+)', ref)
     prefix = ref_prefix.group(1) if ref_prefix else ""
 
@@ -206,6 +215,21 @@ def _infer_component_type(ref: str, footprint: str, value: str) -> str:
 
     # Check footprint hints
     fp_lower = footprint.lower()
+    # Mounting holes — recognized by library prefix or by H/MH/HS ref prefix.
+    # Footprint lib id format is "MountingHole:MountingHole_3.2mm_M3" —
+    # the prefix before ':' is the library name. We check both the prefix
+    # and the bare name so "MountingHole_3.2mm_M3" without a library also
+    # matches.
+    if "mountinghole" in fp_lower.replace(":", " ").replace("_", " "):
+        return "mounting_hole"
+    if prefix in ("H", "MH", "HS"):
+        # H / MH / HS are standard mounting-hole / hole-slot ref prefixes.
+        # Confirm with footprint hint — a stray "H1" inductor should not
+        # be misclassified. If no footprint hint either, trust the ref
+        # prefix (most EDA tools use H exclusively for mounting holes).
+        if "mountinghole" in fp_lower or "hole" in fp_lower or not fp_lower:
+            return "mounting_hole"
+
     if "qfp" in fp_lower or "qfn" in fp_lower or "bga" in fp_lower or "sop" in fp_lower or "soic" in fp_lower:
         return "ic"
     if "crystal" in fp_lower or "xtal" in fp_lower:
@@ -214,6 +238,17 @@ def _infer_component_type(ref: str, footprint: str, value: str) -> str:
         return "connector"
 
     return "generic"
+
+
+# Mounting holes use the same courtyard margin as every other component
+# (parser.bbox_margin, default 0.8mm). An earlier version of this fix
+# expanded the courtyard to 1.5mm for an "extra keepout", but that
+# caused adjacent mounting holes (e.g. test6's H1-H4 stacked 8mm apart
+# vertically) to overlap each other. The is_fixed=True flag alone is
+# sufficient — other components are pushed away from the hole's natural
+# bbox by the legalizer's push-apart pass. A proper "extra clearance
+# around fixed hardware" mechanism (per-macro keepout that OTHER macros
+# must respect) is a Phase 2 improvement.
 
 
 # ---------------------------------------------------------------------------
@@ -439,7 +474,8 @@ def _extract_keepouts_from_edge_cuts(
 def _infer_board_from_components(components: list[Component]) -> BoardOutline:
     """Infer a board outline from placed components when Edge.Cuts is absent.
 
-    Density-aware: when components are tightly packed (density > 0.35),
+    Density-aware: when components are tightly packed (density exceeds
+    the shared target pack density — see ``utils.density.target_pack_density``),
     the board is expanded so that the legalizer has room to push components
     apart without cascading overlaps. For sparse boards, the original 25%
     padding is retained.
@@ -468,7 +504,14 @@ def _infer_board_from_components(components: list[Component]) -> BoardOutline:
 
     default_padding = max(8.0, max(cluster_w, cluster_h) * 0.25)
 
-    TARGET_DENSITY = 0.35
+    # Finding 6 fix: use the shared target_pack_density from utils.density
+    # so the inferred outline matches what the legalizer expects. Previously
+    # this was a hardcoded 0.35, disagreeing with the legalizer's 0.55 —
+    # the inferred outline had more empty space than the legalizer needed,
+    # then the legalizer would not expand (because the bounds were already
+    # sparse enough), but the placement still came out loose.
+    from utils.density import target_pack_density
+    TARGET_DENSITY = target_pack_density()
     needed_area = total_comp_area / TARGET_DENSITY
 
     if needed_area > cluster_area:
@@ -659,8 +702,26 @@ class KiCadParser:
 
         # Determine if fixed. Keep connectors movable so the auto-placer can
         # move them to the board perimeter during edge-aware placement.
+        # Mounting holes (Finding 4 fix): always fixed — their position is
+        # dictated by the enclosure, not the placer. Courtyard margin is
+        # the parser default (same as every other component); see the
+        # comment near MOUNTING_HOLE_COURTYARD_MARGIN_MM for why we don't
+        # expand it.
         comp_type = _infer_component_type(ref, lib_id, value)
         is_fixed = False
+        if comp_type == "mounting_hole":
+            is_fixed = True
+
+        # Finding 8 fix: size- and type-aware courtyard margin.
+        # Previously every component got the flat parser default (0.8mm).
+        # Now small passives get 0.5mm, mid-size ICs get 1.0mm, large ICs
+        # get 1.5mm — IPC-7351 nominal courtyards. This makes "0 overlaps"
+        # actually mean "assembly-safe" rather than "barely touching".
+        # See utils/courtyard.py for the full table.
+        from utils.courtyard import courtyard_margin_for_component
+        courtyard_margin = courtyard_margin_for_component(
+            width=width, height=height, component_type=comp_type,
+        )
 
         comp = Component(
             ref=ref,
@@ -672,7 +733,7 @@ class KiCadParser:
             layer=layer,
             width=width,
             height=height,
-            courtyard_margin=self._bbox_margin,
+            courtyard_margin=courtyard_margin,
             bbox_offset_x=bbox_ox,
             bbox_offset_y=bbox_oy,
             pads=pads,

@@ -42,13 +42,23 @@ def _is_vertical_connector(comp: "Component") -> bool:
     return False  # default to edge-connector for ambiguous cases
 
 
-def build_macros(model: "BoardModel") -> tuple[list[Macro], list[Macro]]:
-    """Build interior macros and connector macros.
+def build_macros(model: "BoardModel") -> tuple[list[Macro], list[Macro], list[Macro]]:
+    """Build interior macros, connector macros, and fixed-obstacle macros.
 
-    Returns ``(interior_macros, connector_macros)``. Interior macros
-    include IC+caps groups and standalone components. Connector macros
-    are empty-shell macros (leader only, no followers) so the legalizer
-    treats them as rectangles.
+    Returns ``(interior_macros, connector_macros, fixed_macros)``.
+
+    - ``interior_macros``: IC+caps groups and standalone movable
+      components. SA operates on these.
+    - ``connector_macros``: edge-connector empty-shell macros. Marked
+      ``is_fixed`` by the caller after perimeter placement so the
+      legalizer treats them as immovable obstacles.
+    - ``fixed_macros`` (Finding 4 fix): macros for components already
+      marked ``is_fixed`` at parse time — currently mounting holes.
+      These are NOT in the interior or connector lists. They're passed
+      to the legalizer as additional immovable obstacles so the
+      push-apart pass pushes movable macros away from them, and to SA's
+      cost function so SA sees the obstacle penalty (SA itself doesn't
+      move them — see ``run_macro_sa``'s fixed-macro filtering).
 
     A cap assigned to an IC is ONLY in that IC's macro — never as a
     standalone macro. This is critical: if a cap were in two macros,
@@ -61,10 +71,12 @@ def build_macros(model: "BoardModel") -> tuple[list[Macro], list[Macro]]:
 
     interior_components: list["Component"] = []
     connectors: list["Component"] = []
+    fixed_components: list["Component"] = []
 
     for c in model.components:
         if c.is_fixed:
-            continue  # Fixed components stay put
+            fixed_components.append(c)  # mounting holes, pre-placed hardware
+            continue
         if c.component_type == "connector" and not _is_vertical_connector(c):
             connectors.append(c)
         else:
@@ -91,7 +103,15 @@ def build_macros(model: "BoardModel") -> tuple[list[Macro], list[Macro]]:
 
     # Connectors become standalone macros for legalizer bbox purposes
     connector_macros = [Macro.alone(c) for c in connectors]
-    return interior_macros, connector_macros
+
+    # Fixed components (mounting holes, pre-placed hardware) become
+    # is_fixed=True macros — the legalizer treats them as immovable
+    # obstacles that movable macros get pushed away from.
+    fixed_macros = [Macro.alone(c) for c in fixed_components]
+    for m in fixed_macros:
+        m.is_fixed = True
+
+    return interior_macros, connector_macros, fixed_macros
 
 
 def place_v2(
@@ -107,21 +127,30 @@ def place_v2(
     connector_mating_margin: float = 5.0,
     seed: int = 42,
     verbose: bool = False,
+    rudy_weight: float = 0.0,
 ) -> dict[str, object]:
     """Run the macro-first placement pipeline.
 
     Returns a dict with cost breakdown before/after SA and legalizer stats.
+
+    Finding 7 fix: ``rudy_weight`` adds RUDY congestion to the SA cost
+    function (default 0 = disabled). When > 0, SA gets gradient signal
+    to spread macros away from routing choke points. The verbose report
+    always shows RUDY (initial + final) so the user can see congestion
+    regardless of whether SA is using it as a cost term.
     """
     # ─── Phase 1: classify → assign → build macros ───────────────────
-    interior_macros, connector_macros = build_macros(model)
+    interior_macros, connector_macros, fixed_macros = build_macros(model)
     if verbose:
         n_caps = sum(len(m.followers) for m in interior_macros)
         n_alone = sum(1 for m in interior_macros if not m.followers)
+        n_fixed = len(fixed_macros)
         print(
             f"  Built {len(interior_macros)} interior macros "
             f"({sum(1 for m in interior_macros if m.followers)} with caps, "
             f"{n_alone} standalone, {n_caps} caps total) + "
             f"{len(connector_macros)} connector macros"
+            + (f" + {n_fixed} fixed obstacle macros" if n_fixed else "")
         )
 
     # ─── Phase 2: connector placement on perimeter ───────────────────
@@ -200,28 +229,48 @@ def place_v2(
               f"{n_chain_nets} net(s) upweighted x{CHAIN_NET_WEIGHT:.1f}")
 
     if verbose:
-        cost_init = evaluate(model, interior_macros + connector_macros,
+        cost_init = evaluate(model, interior_macros + connector_macros + fixed_macros,
                               alpha=alpha, beta=beta, gamma=gamma,
                               net_weights=chain_net_weights)
+        # Finding 7 fix: wire RUDY congestion into the macro-v2 pipeline's
+        # verbose report (was only in the legacy smart_placement path).
+        # RUDY (Rectangular Uniform wire DensitY) estimates routing
+        # congestion by distributing each net's bbox uniformly across the
+        # grid cells it covers. The penalty is non-zero only when peak
+        # congestion exceeds 1.5× the average — i.e. when there's a
+        # routing choke point HPWL alone misses.
+        # See engine/congestion.py for the full implementation.
+        from engine.congestion import rudy_congestion_penalty
+        rudy_penalty_init, rudy_peak_init, rudy_avg_init, _ = rudy_congestion_penalty(model)
         print(f"  After initial: total={cost_init['total']:.2f} "
               f"(hpwl={cost_init['hpwl']:.1f}, overlap={cost_init['overlap']:.1f}, "
               f"boundary={cost_init['boundary']:.1f})")
+        if rudy_penalty_init > 0:
+            print(f"  RUDY: penalty={rudy_penalty_init:.3f} peak={rudy_peak_init:.3f} "
+                  f"avg={rudy_avg_init:.3f} (routing congestion hotspot detected)")
 
-    # ─── Phase 4: SA on interior macros (connectors stay put) ────────
+    # ─── Phase 4: SA on interior macros (connectors + fixed stay put) ──
     # Bounds = interior_bbox (possibly already expanded in Phase 3) so SA
     # doesn't push into the connector zone. SA distributes macros across
     # the full expanded area.
+    #
+    # Fixed macros (mounting holes) are included in the macros list so
+    # the cost function sees their overlap penalty — SA gets gradient
+    # signal to keep movable macros away from them. Macro.translate /
+    # set_pose refuse to move is_fixed macros, so SA's random picks of
+    # fixed macros no-op (a few iterations wasted, no correctness issue).
     sa_bounds = interior_bbox
     sa_result = run_macro_sa(
-        model, interior_macros, sa_bounds,
+        model, interior_macros + fixed_macros, sa_bounds,
         iterations=sa_iterations, reheats=sa_reheats,
         alpha=alpha, beta=beta, gamma=gamma,
         seed=seed, verbose=verbose,
         net_weights=chain_net_weights,
+        rudy_weight=rudy_weight,
     )
 
     # ─── Phase 5: legalize all macros together ───────────────────────
-    all_macros = interior_macros + connector_macros
+    all_macros = interior_macros + connector_macros + fixed_macros
     # Use full board bounds for legalize (connectors can overhang)
     board_bounds = (
         model.board.x_min, model.board.y_min,
@@ -269,21 +318,43 @@ def place_v2(
     )
     interior_density = interior_macro_area / sa_bounds_area if sa_bounds_area > 0 else 0.0
 
-    # Density scaling: full keepout below 35% interior density (plenty of
-    # room), scale down to 20% at 55% density (packed — barely any room).
-    # This is more aggressive than `edge_keepout_extra_for`'s board-level
-    # scaling because the interior density is the relevant metric.
-    if interior_density <= 0.35:
+    # Finding 5 fix: ONE density-adaptive keepout scale, here in the
+    # legalizer callback. Previously this callback applied its own
+    # 1.0→0.2 scaling AND `engine.cost_state.edge_keepout_extra_for`
+    # applied another 1.0→0.3 scaling — the two multiplied, giving
+    # 0.06× at 0.55 density (almost certainly not what either author
+    # intended). Now `edge_keepout_extra_for` returns the BASE value
+    # (no scaling) and ALL density scaling happens here, using the
+    # INTERIOR-BBOX density (the actual packing pressure the legalizer
+    # faces), not the board-level density.
+    #
+    # Finding 6 fix: the density thresholds (0.35 / 0.55) match the
+    # shared target_pack_density (0.55), so the keepout is at full
+    # strength whenever the board is below target density and scales
+    # down to 0.2× only when the board is at-or-above target density
+    # (where there's no room for full keepout without creating overlaps).
+    from utils.density import target_pack_density
+    target_density = target_pack_density()
+    # Below the low-density threshold (target_density - 0.20), keepout is
+    # at full strength. Above target_density, keepout scales to 0.2×
+    # (still a small margin, never fully zero). Linear in between.
+    low_density_threshold = max(0.10, target_density - 0.20)
+    if interior_density <= low_density_threshold:
         keepout_scale = 1.0
-    elif interior_density >= 0.55:
+    elif interior_density >= target_density:
         keepout_scale = 0.2
     else:
-        keepout_scale = 1.0 - 0.8 * (interior_density - 0.35) / 0.20
+        # Linear from 1.0 at low_density_threshold to 0.2 at target_density.
+        span = max(target_density - low_density_threshold, 1e-6)
+        keepout_scale = 1.0 - 0.8 * (interior_density - low_density_threshold) / span
 
     try:
         from engine.cost_state import edge_keepout_extra_for
 
         def _keepout_cb(macro: "Macro") -> float:
+            # Finding 5 fix: edge_keepout_extra_for now returns the BASE
+            # value (no density scaling). All density scaling happens
+            # via keepout_scale above.
             raw = edge_keepout_extra_for(macro.leader, model=model)
             # Apply interior-density scaling (root-cause fix for dense boards
             # where the full keepout causes overlap regressions).
@@ -301,14 +372,15 @@ def place_v2(
     # keepout callback handles the board-edge clearance correctly (see
     # comment above) by subtracting the interior-bbox inset.
     #
-    # Pass interior_macros + connector_macros to the legalizer so it can
-    # resolve macro-connector overlaps. Connector macros are marked
-    # is_fixed=True (Phase 2 above) so the legalizer treats them as
-    # immovable obstacles — interior macros get pushed out of the
-    # connector zone instead of overlapping them. This is the fix for
-    # the test6 macro-connector collision regression.
+    # Pass interior_macros + connector_macros + fixed_macros to the legalizer
+    # so it can resolve macro-connector overlaps AND push interior macros
+    # away from fixed mounting holes. Connector macros and fixed macros are
+    # both marked is_fixed=True so the legalizer treats them as immovable
+    # obstacles — interior macros get pushed out of their zones instead of
+    # overlapping them. This is the fix for the test6 macro-connector /
+    # macro-mounting-hole collision regression (Finding 4).
     legal_stats = legalize_macros(
-        model, interior_macros + connector_macros, sa_bounds,
+        model, interior_macros + connector_macros + fixed_macros, sa_bounds,
         grid_mm=grid_mm, verbose=verbose,
         expand_to_fit=False,  # already expanded above
         per_macro_keepout=_keepout_cb,
@@ -318,11 +390,20 @@ def place_v2(
     final_cost = evaluate(model, all_macros, alpha=alpha, beta=beta, gamma=gamma,
                           net_weights=chain_net_weights)
     if verbose:
+        # Finding 7: report final RUDY so the user can see whether SA +
+        # legalization created or resolved routing choke points.
+        from engine.congestion import rudy_congestion_penalty
+        rudy_penalty_final, rudy_peak_final, rudy_avg_final, _ = rudy_congestion_penalty(model)
         print(
             f"  Final: total={final_cost['total']:.2f} "
             f"(hpwl={final_cost['hpwl']:.1f}, overlap={final_cost['overlap']:.1f}, "
             f"boundary={final_cost['boundary']:.1f})"
         )
+        if rudy_penalty_final > 0:
+            print(f"  RUDY: penalty={rudy_penalty_final:.3f} peak={rudy_peak_final:.3f} "
+                  f"avg={rudy_avg_final:.3f}")
+        elif rudy_penalty_init > 0:
+            print(f"  RUDY: no hotspots remaining (was {rudy_penalty_init:.3f} before SA)")
 
     return {
         "sa_result": sa_result,

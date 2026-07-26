@@ -141,7 +141,7 @@ def _compute_interior_bbox_for_viz(model, margin: float, mating_margin: float = 
 
     Mirrors `place/pipeline.py::place_v2` Phase 2 logic.
     """
-    interior_macros, connector_macros = build_macros(model)
+    interior_macros, connector_macros, _fixed = build_macros(model)
     if connector_macros:
         connector_reserve = min(
             mating_margin,

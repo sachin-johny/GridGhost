@@ -47,6 +47,18 @@ def apply_placement(
 
     Returns:
         Path to the output file
+
+    Edge.Cuts handling (Finding 1 fix):
+        When ``model.user_defined_outline`` is False (i.e. the original
+        .kicad_pcb had no Edge.Cuts geometry and GridGhost inferred the
+        outline from component footprints), the inferred outline is
+        serialized as a real ``gr_rect`` on the ``Edge.Cuts`` layer in
+        the output file. Without this, 5 of 6 test boards ship with no
+        board edge at all — DRC cannot run, no fab house will accept
+        the file, and no panelization is possible. The placer may have
+        auto-expanded the board (legalizer bounds expansion / density
+        target); we always write the FINAL outline the placer used, so
+        the output file's Edge.Cuts matches the placement.
     """
     input_path = Path(input_pcb_path)
     if not input_path.exists():
@@ -68,11 +80,60 @@ def apply_placement(
     # Apply position updates using regex replacement
     text = _apply_footprint_positions(text, comp_map)
 
+    # Write the inferred (possibly auto-expanded) outline to real Edge.Cuts
+    # geometry when the source file had no Edge.Cuts to begin with.
+    if not getattr(model, "user_defined_outline", False):
+        text = _inject_inferred_edge_cuts(text, model)
+
     # Write output
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(text, encoding="utf-8")
 
     return str(output_path)
+
+
+def _inject_inferred_edge_cuts(text: str, model: BoardModel) -> str:
+    """Inject a ``gr_rect`` on ``Edge.Cuts`` reflecting the model's board outline.
+
+    Idempotent: if the file already has any graphic geometry (``gr_rect``,
+    ``gr_line``, ``gr_poly``, ``gr_circle``) on the ``Edge.Cuts`` layer,
+    no new geometry is added. The check is regex-based to distinguish
+    actual geometry from the layer-table definition (every .kicad_pcb
+    has ``("Edge.Cuts" user)`` in its layers table; that's NOT geometry).
+
+    The rect is inserted immediately before the closing ``)`` of the
+    root ``(kicad_pcb ...)`` expression so KiCad parses it as a
+    top-level graphic item.
+    """
+    # Idempotency guard: only skip if there's actual gr_* geometry whose
+    # layer attribute is "Edge.Cuts". The textual "Edge.Cuts" substring
+    # also appears in the layers table definition, which is always present.
+    edge_cuts_geom_re = re.compile(
+        r'\(\s*gr_(?:rect|line|poly|circle)\b[^)]*?'
+        r'\(\s*layer\s+"Edge\.Cuts"\s*\)',
+        re.DOTALL,
+    )
+    if edge_cuts_geom_re.search(text):
+        return text
+
+    board = model.board
+    bx1 = format_kicad_coord(board.x_min)
+    by1 = format_kicad_coord(board.y_min)
+    bx2 = format_kicad_coord(board.x_max)
+    by2 = format_kicad_coord(board.y_max)
+    import uuid
+    tstamp = str(uuid.uuid4())
+    edge_cuts_rect = (
+        f'  (gr_rect (start {bx1} {by1}) (end {bx2} {by2}) '
+        f'(stroke (width 0.1) (type solid)) (fill none) (layer "Edge.Cuts") '
+        f'(tstamp "{tstamp}"))\n'
+    )
+
+    text = text.rstrip()
+    idx = text.rfind(')')
+    if idx < 0:
+        return text + "\n" + edge_cuts_rect
+    return text[:idx] + edge_cuts_rect + text[idx:]
 
 
 def _apply_footprint_positions(text: str, comp_map: dict[str, Component]) -> str:

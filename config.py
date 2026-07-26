@@ -92,6 +92,12 @@ class PlacementConfig:
     edge_keepout_extra: dict[str, float] = field(default_factory=lambda: {
         "ic": 5.0, "mcu": 5.0, "regulator": 5.0, "crystal": 3.0,
     })
+    # Finding 6 fix: single shared target pack density. Used by:
+    #   - kicad_parser._infer_board_from_components (outline inference)
+    #   - place/legalizer.expand_bounds_to_fit (bounds expansion)
+    #   - place/pipeline._keepout_cb (IC edge keepout density scaling)
+    # Default 0.55 = safe 2D packing target for irregular rectangles.
+    target_pack_density: float = 0.55
 
 
 @dataclass

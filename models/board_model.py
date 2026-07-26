@@ -119,6 +119,21 @@ class Component:
         self._update_courtyard_sizes()
         self._dirty = True
         self.is_edge_connector = self._compute_is_edge_connector()
+        # Re-initialise _cos_a/_sin_a from self.rotation. The dataclass
+        # field defaults for _cos_a (1.0) and _sin_a (0.0) are applied
+        # by __init__ AFTER the rotation assignment, overwriting the
+        # values __setattr__ computed. Without this re-init, any
+        # Component constructed with a non-zero rotation has its bbox
+        # computed as if rotation=0 (because bbox uses _cos_a/_sin_a
+        # to rotate bbox_offset_x/y onto the component's local frame).
+        # This bug is invisible for components SA later moves (set_pose
+        # calls set_rotation which fixes _cos_a/_sin_a) but corrupts
+        # the bbox of every rotated component that stays at its parse
+        # position (e.g. fixed mounting holes, edge connectors) and
+        # every component in a freshly re-parsed output file.
+        rad = math.radians(self.rotation)
+        super().__setattr__('_cos_a', math.cos(rad))
+        super().__setattr__('_sin_a', -math.sin(rad))
 
     def __setattr__(self, name: str, value) -> None:
         super().__setattr__(name, value)

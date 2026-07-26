@@ -28,7 +28,7 @@ def measure(board: str, seed: int = 42):
     place_v2(model, seed=seed, verbose=False)
 
     # Rebuild macros to know which components share a macro (intra-macro).
-    interior, connectors = build_macros(model)
+    interior, connectors, _fixed = build_macros(model)
     comp_to_macro_id = {}
     for mid, macro in enumerate(interior + connectors):
         for c in macro.members:

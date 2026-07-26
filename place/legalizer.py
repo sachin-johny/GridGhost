@@ -36,7 +36,7 @@ def expand_bounds_to_fit(
     bounds: tuple[float, float, float, float],
     *,
     extra_padding: float = 1.0,
-    target_density: float = 0.55,
+    target_density: float | None = None,
 ) -> tuple[float, float, float, float]:
     """Grow ``bounds`` just enough that macros can pack without overlap.
 
@@ -65,9 +65,18 @@ def expand_bounds_to_fit(
     Returns the (possibly expanded) bounds. The macro positions are
     not modified — push_apart_overlapping + boundary_clamp will pack
     them into the new bounds.
+
+    Finding 6 fix: ``target_density`` now defaults to the shared
+    ``utils.density.target_pack_density()`` value (0.55) so it agrees
+    with the outline-inference routine. Pass an explicit float to
+    override.
     """
     if not macros:
         return bounds
+
+    if target_density is None:
+        from utils.density import target_pack_density
+        target_density = target_pack_density()
 
     x_min, y_min, x_max, y_max = bounds
     cx = (x_min + x_max) / 2
@@ -398,6 +407,211 @@ def force_spread_overlapping(
     return residual
 
 
+def displace_to_clear_slots(
+    macros: list["Macro"],
+    bounds: tuple[float, float, float, float],
+    *,
+    grid_mm: float = 1.0,
+    max_candidate_slots: int = 400,
+    verbose: bool = False,
+    per_macro_keepout: "callable[[Macro], float] | None" = None,
+) -> int:
+    """Tetris-style global cleanup — jump overlapping macros to the nearest empty slot.
+
+    For each non-fixed macro that overlaps at least one other macro,
+    search a grid of candidate positions across ``bounds`` and jump to
+    the nearest one that clears all overlaps. This is the global
+    recovery the greedy push-apart + force-spread can't do — they only
+    make LOCAL moves (push by overlap depth, spread by net repulsion
+    vector). When a macro is jammed in a corner with 3-4 overlapping
+    neighbors and no local move helps, the only escape is to JUMP to a
+    different region of the board.
+
+    Algorithm:
+      1. Compute the set of "overlapping" macros (non-fixed, ≥1 overlap).
+      2. For each, search a grid of candidate slots (centered on a
+         ``grid_mm`` lattice across the bounds). For each slot, check
+         whether placing the macro there would overlap any other macro
+         AND whether the macro's bbox fits inside the keepout-shrunk
+         bounds (so the subsequent boundary_clamp pass doesn't push it
+         back into overlap). Pick the nearest valid slot.
+      3. Apply the jump. If no valid slot exists in the candidate grid,
+         leave the macro at its current position (it's truly stuck).
+
+    The candidate grid is capped at ``max_candidate_slots`` positions
+    to bound the worst-case O(slots × macros) cost. For a 100×100mm
+    board at 1mm grid, that's 10,000 slots — we cap at 400 and sample
+    sparsely (every ~5mm) to keep the cost reasonable.
+
+    Fixed macros (``is_fixed=True``) are NEVER moved — they're treated
+    as immovable obstacles. Macros that overlap ONLY fixed obstacles
+    are also skipped (no clear slot would resolve the overlap — the
+    fixed obstacle is in the way everywhere).
+
+    If ``per_macro_keepout`` is provided, each macro's candidate slots
+    are filtered to those where the macro's bbox fits inside the
+    keepout-shrunk bounds (bounds inset by ``per_macro_keepout(m)``
+    on each side). This prevents the Tetris cleanup from placing a
+    macro at a slot that ``boundary_clamp`` would later push inward
+    (creating new overlaps).
+
+    Returns the residual overlap count after cleanup.
+    """
+    if not macros:
+        return 0
+
+    x_min, y_min, x_max, y_max = bounds
+    bounds_w = x_max - x_min
+    bounds_h = y_max - y_min
+    if bounds_w <= 0 or bounds_h <= 0:
+        return _count_residual_overlaps(macros)
+
+    # Build a sparse candidate-slot grid. Aim for ~max_candidate_slots
+    # evenly-spaced positions across the bounds. The slot step is
+    # max(grid_mm, ceil(bounds_dim / sqrt(max_slots))).
+    import math
+    target_slots_per_axis = max(2, int(math.sqrt(max_candidate_slots)))
+    step_x = max(grid_mm, bounds_w / target_slots_per_axis)
+    step_y = max(grid_mm, bounds_h / target_slots_per_axis)
+
+    # Snap step to grid_mm multiple for grid-consistent candidate positions.
+    step_x = max(math.ceil(step_x / grid_mm) * grid_mm, grid_mm)
+    step_y = max(math.ceil(step_y / grid_mm) * grid_mm, grid_mm)
+
+    candidate_x = []
+    x = x_min + step_x / 2
+    while x < x_max - step_x / 2 + 1e-9:
+        candidate_x.append(x)
+        x += step_x
+    candidate_y = []
+    y = y_min + step_y / 2
+    while y < y_max - step_y / 2 + 1e-9:
+        candidate_y.append(y)
+        y += step_y
+
+    if not candidate_x or not candidate_y:
+        return _count_residual_overlaps(macros)
+
+    def _overlaps_at(m: "Macro", new_x: float, new_y: float,
+                     others: list["Macro"], keepout: float = 0.0) -> bool:
+        """Would macro ``m`` overlap any other macro if its leader were at (new_x, new_y)?
+
+        Also checks that the macro's bbox fits inside the keepout-shrunk
+        bounds (bounds inset by ``keepout`` on each side). If it doesn't
+        fit, returns True (treats it as an "overlap" so the slot is
+        rejected).
+
+        Computes the macro's bbox at the proposed new leader position
+        (preserving current rotation) WITHOUT modifying the macro, then
+        checks pairwise overlap with every other macro.
+        """
+        snap = m._snapshot()
+        dx = new_x - m.leader.x
+        dy = new_y - m.leader.y
+        m.leader.x += dx
+        m.leader.y += dy
+        m.apply_offsets()
+        try:
+            # Keepout-shrunk bounds check first — if the macro's bbox
+            # doesn't fit, reject this slot (subsequent boundary_clamp
+            # would push it inward, creating new overlaps).
+            if keepout > 0:
+                kx_min = x_min + keepout
+                ky_min = y_min + keepout
+                kx_max = x_max - keepout
+                ky_max = y_max - keepout
+                for c in m.members:
+                    cx1, cy1, cx2, cy2 = c.bbox
+                    if (cx1 < kx_min - 1e-6 or cy1 < ky_min - 1e-6 or
+                        cx2 > kx_max + 1e-6 or cy2 > ky_max + 1e-6):
+                        return True  # treat as overlap → reject slot
+            for o in others:
+                if o is m:
+                    continue
+                if m.overlaps(o):
+                    return True
+            return False
+        finally:
+            m._restore(snap)
+
+    # Identify overlapping macros (non-fixed, with at least one non-fixed
+    # overlapping neighbor). Macros that overlap ONLY fixed obstacles
+    # can't be helped by jumping — the fixed obstacle is in the way.
+    def _has_movable_overlap(m: "Macro") -> bool:
+        for o in macros:
+            if o is m:
+                continue
+            if not m.overlaps(o):
+                continue
+            if not o.is_fixed:
+                return True
+        return False
+
+    overlapping_macros = [m for m in macros
+                          if not m.is_fixed and _has_movable_overlap(m)]
+
+    if not overlapping_macros:
+        return _count_residual_overlaps(macros)
+
+    # Sort by overlap count (most-overlapping first — biggest win per jump).
+    def _overlap_count(m: "Macro") -> int:
+        return sum(1 for o in macros if o is not m and m.overlaps(o))
+    overlapping_macros.sort(key=lambda m: -_overlap_count(m))
+
+    if verbose:
+        print(f"  Tetris: {len(overlapping_macros)} macros with overlaps, "
+              f"searching {len(candidate_x) * len(candidate_y)} candidate slots")
+
+    jumps_made = 0
+    for m in overlapping_macros:
+        if _overlap_count(m) == 0:
+            continue  # already resolved by a previous jump
+
+        cur_x, cur_y = m.leader.x, m.leader.y
+        # Per-macro keepout — slots where the macro's bbox pokes into
+        # the keepout zone are rejected (would cause boundary_clamp to
+        # push it back into overlap).
+        ke = per_macro_keepout(m) if per_macro_keepout else 0.0
+
+        # Search candidate slots in order of increasing distance from
+        # current position. Bail out at the first clear slot.
+        slots = []
+        for sx in candidate_x:
+            for sy in candidate_y:
+                d2 = (sx - cur_x) ** 2 + (sy - cur_y) ** 2
+                slots.append((d2, sx, sy))
+        slots.sort(key=lambda t: t[0])
+
+        # Limit how many slots we evaluate per macro — the top-K nearest
+        # are usually enough; if none of them is clear, the macro is
+        # genuinely stuck (board too dense).
+        top_k = min(len(slots), 80)
+        for d2, sx, sy in slots[:top_k]:
+            if not _overlaps_at(m, sx, sy, macros, keepout=ke):
+                # Jump to this slot. Use translate (which respects bounds)
+                # so we don't accidentally place the macro OOB.
+                dx = sx - cur_x
+                dy = sy - cur_y
+                if m.translate(dx, dy, bounds=bounds):
+                    jumps_made += 1
+                    break
+
+    if verbose and jumps_made:
+        print(f"  Tetris: jumped {jumps_made} macros to clear slots")
+
+    return _count_residual_overlaps(macros)
+
+
+def _count_residual_overlaps(macros: list["Macro"]) -> int:
+    """Count pairwise macro overlaps (helper)."""
+    n = 0
+    for i in range(len(macros)):
+        for j in range(i + 1, len(macros)):
+            if macros[i].overlaps(macros[j]):
+                n += 1
+    return n
+
+
 def boundary_clamp(
     macros: list["Macro"],
     bounds: tuple[float, float, float, float],
@@ -477,7 +691,7 @@ def legalize(
     verbose: bool = False,
     expand_to_fit: bool = True,
     extra_padding: float = 1.0,
-    target_density: float = 0.55,
+    target_density: float | None = None,
     per_macro_keepout: "callable[[Macro], float] | None" = None,
 ) -> dict[str, int]:
     """Iterative legalization: snap → (push apart → clamp) repeated.
@@ -487,11 +701,13 @@ def legalize(
     round makes no progress or after ``max_rounds`` iterations.
 
     If ``expand_to_fit`` is True (default) and the macro packing density
-    in the bounds exceeds ``target_density`` (default 0.55), the bounds
-    are uniformly scaled up about their center so density drops to the
-    target. This prevents the OOB-rejection deadlock on over-dense
-    boards (test4: 62 macros in a 49×48mm interior at 65% density).
-    The expanded bounds are reported in the returned dict.
+    in the bounds exceeds the shared ``target_pack_density`` (default
+    0.55; override via ``target_density`` arg or config.json's
+    ``placement.target_pack_density``), the bounds are uniformly scaled
+    up about their center so density drops to the target. This prevents
+    the OOB-rejection deadlock on over-dense boards (test4: 62 macros in
+    a 49×48mm interior at 65% density). The expanded bounds are reported
+    in the returned dict.
 
     If ``per_macro_keepout`` is provided, it is called with each macro
     and must return an extra edge keepout (mm) for that macro. Used to
@@ -501,6 +717,9 @@ def legalize(
     Returns a dict with overlap count, boundary-failure count, cap-IC
     distance violation count, and the (possibly expanded) bounds.
     """
+    if target_density is None:
+        from utils.density import target_pack_density
+        target_density = target_pack_density()
     if expand_to_fit:
         expanded = expand_bounds_to_fit(
             macros, bounds,
@@ -686,6 +905,56 @@ def legalize(
             if (bx1 < kx_min - 1e-6 or bx2 > kx_max + 1e-6 or
                 by1 < ky_min - 1e-6 or by2 > ky_max + 1e-6):
                 failed += 1
+
+    # ─── Tetris-style "displace to nearest empty slot" cleanup (Finding 3 fix) ──
+    # The greedy push-apart + force-spread above are LOCAL heuristics.
+    # They get stuck in local minima: a macro surrounded by overlapping
+    # neighbors can't move in any direction without creating a new
+    # overlap, even when there's plenty of empty space elsewhere in the
+    # bounds. The user's evaluation report called this out:
+    #
+    #   "Greedy pairwise push-apart legalizer has no global recovery for
+    #    chained overlaps... even after my fix to #2, test4 still has 7
+    #    unresolved overlaps (all small, ≤3.6 mm², mostly test points
+    #    and passives)."
+    #
+    # This pass takes a GLOBAL view: for each overlapping macro, search
+    # a grid of candidate slots across the bounds, find the nearest one
+    # that's clear of all other macros, and jump there. This is the
+    # "Tetris" cleanup the user's plan mentioned — not a full row-based
+    # legalizer like abacus, but a global escape from local minima that
+    # the greedy passes can't reach.
+    #
+    # Only runs if there are still residual overlaps after force-spread
+    # and the keepout enforcement pass. Skips macros whose overlaps are
+    # exclusively with fixed obstacles (no clear slot would help).
+    if residual > 0:
+        new_residual = displace_to_clear_slots(
+            macros, bounds, grid_mm=grid_mm, verbose=verbose,
+            per_macro_keepout=per_macro_keepout,
+        )
+        if new_residual < residual:
+            if verbose:
+                print(
+                    f"  Tetris cleanup: {residual} -> {new_residual} "
+                    f"overlaps (−{residual - new_residual})"
+                )
+            residual = new_residual
+        # Re-clamp to bounds (Tetris jumps stay in-bounds by construction,
+        # but the slot search uses a sparse grid — a macro might end up
+        # at a position where its bbox pokes slightly past bounds).
+        # DO NOT re-run push_apart here — it would undo the Tetris jumps
+        # (push_apart is a LOCAL heuristic that can push a carefully-
+        # placed macro back into an overlap the Tetris cleanup just
+        # resolved). Just clamp and recount.
+        failed = boundary_clamp(macros, bounds, per_macro_keepout=per_macro_keepout)
+        # CRITICAL: boundary_clamp can create NEW overlaps (it pushes
+        # macros inside bounds, which might overlap others). Recount
+        # the residual so the legalizer's self-report matches the
+        # actual state. Without this recount, the legalizer silently
+        # underreports overlaps — exactly the kind of discrepancy
+        # the user's evaluation flagged as "Finding 1/2 effect".
+        residual = _count_residual_overlaps(macros)
 
     # Cap-IC invariant: a follower must never overlap its own leader.
     # Macros are rigid bodies, so this geometry is fixed at construction

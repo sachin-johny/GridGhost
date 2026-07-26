@@ -256,7 +256,16 @@ class Macro:
 
         Returns True if applied. If any member's bbox would cross
         ``bounds``, the move is reverted and False is returned.
+
+        Fixed macros refuse to move — returns False immediately. This
+        is a defensive guard: callers (SA, legalizer) should already
+        exclude fixed macros from the candidate pool, but a fixed
+        macro slipping through (e.g. SA picking one at random when
+        fixed obstacles are in the macros list for cost-evaluation
+        purposes) shouldn't silently corrupt placement.
         """
+        if self.is_fixed:
+            return False
         snap = self._snapshot()
         self.leader.x += dx
         self.leader.y += dy
@@ -273,7 +282,13 @@ class Macro:
         rotation: float,
         bounds: Optional[tuple[float, float, float, float]] = None,
     ) -> bool:
-        """Set leader pose; followers rotate around leader center."""
+        """Set leader pose; followers rotate around leader center.
+
+        Fixed macros refuse to move — returns False immediately. Same
+        defensive guard as ``translate``.
+        """
+        if self.is_fixed:
+            return False
         snap = self._snapshot()
         self.leader.x = x
         self.leader.y = y

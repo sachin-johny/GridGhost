@@ -63,46 +63,29 @@ def edge_keepout_extra_for(comp, model=None) -> float:
     Returns 0.0 for passives/connectors/generic — they only get the base
     `margin`. ICs/MCUs/regulators get the base `margin` PLUS this extra.
 
-    The extra is DENSITY-ADAPTIVE when ``model`` is provided: on dense
-    boards there isn't room for a full 5mm extra keepout without creating
-    overlaps, so the extra is scaled down proportionally. On sparse boards
-    (density < 0.20) the full extra applies; on dense boards (density >
-    0.45) the extra is scaled to 20% of the base. This prevents the
-    keepout from causing overlap regressions on packed boards while still
-    keeping ICs away from edges when there's room.
+    Finding 5 fix (density scaling consolidation):
+    This function returns the BASE keepout extra (no density scaling).
+    Density scaling is the caller's responsibility — e.g. the macro-v2
+    legalizer's `_keepout_cb` in `place/pipeline.py` applies a single
+    density-adaptive scale factor based on INTERIOR-BBOX density (the
+    actual packing pressure the legalizer faces), not the board-level
+    density this function used to use.
 
-    When ``model`` is None (e.g. called from a context without model
-    access), the full base extra is returned — the caller should pass the
-    model whenever possible to get the density-adaptive scaling.
+    Why the change: previously this function applied its own 1.0→0.3
+    scaling (board-density based) AND the macro legalizer's callback
+    applied another 1.0→0.2 scaling (interior-density based). The two
+    multiplied, giving 0.06× at 0.55 density — almost certainly not what
+    either author intended. Now there's ONE density scaling, in the
+    legalizer callback, using the density metric that actually reflects
+    packing pressure.
+
+    The ``model`` argument is retained for backwards compatibility but
+    no longer affects the return value. Callers that previously relied
+    on the density scaling here should apply their own scaling at the
+    call site (see `place/pipeline.py:_keepout_cb` for an example).
     """
     t = getattr(comp, 'component_type', '') or ''
-    base = _load_edge_keepout_table().get(t, 0.0)
-    if base <= 0.0:
-        return 0.0
-    if model is None:
-        return base
-    try:
-        board = model.board
-        board_area = max(1.0, board.width * board.height)
-        comp_area = sum(
-            c.effective_width * c.effective_height
-            for c in model.components
-            if not c.is_fixed
-        )
-        density = comp_area / board_area
-        # Scale: full extra below 0.35 density (sparse — plenty of room),
-        # linearly toward 0.3 above 0.55 (very dense — barely any room).
-        # Previous thresholds (0.20/0.45) were too aggressive — a 26%-dense
-        # board was already being scaled down when it has plenty of room.
-        if density <= 0.35:
-            scale = 1.0
-        elif density >= 0.55:
-            scale = 0.3  # never fully zero — always keep a small margin
-        else:
-            scale = 1.0 - 0.7 * (density - 0.35) / 0.20
-        return base * scale
-    except Exception:
-        return base
+    return _load_edge_keepout_table().get(t, 0.0)
 
 # Density-equality penalty (Gini coefficient on a 10x10 cell-occupancy grid).
 # Penalizes inequality of cell-occupancy — 0 when components are uniformly

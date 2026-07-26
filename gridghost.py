@@ -52,8 +52,16 @@ from config import load_config, Config
 ALGORITHMS = ("force-directed", "grid")
 
 
-def _ensure_board_capacity(model: BoardModel, target_density: float = 0.35) -> None:
-    """Expand board if component density exceeds target."""
+def _ensure_board_capacity(model: BoardModel, target_density: float | None = None) -> None:
+    """Expand board if component density exceeds target.
+
+    Finding 6 fix: ``target_density`` defaults to the shared
+    ``utils.density.target_pack_density()`` value (0.55) so this
+    routine agrees with the outline-inference and legalizer routines.
+    """
+    if target_density is None:
+        from utils.density import target_pack_density
+        target_density = target_pack_density()
     if getattr(model, 'user_defined_outline', False):
         # Respect user-drawn Edge.Cuts — warn but don't expand
         board = model.board
@@ -154,7 +162,8 @@ def cmd_place(args) -> None:
     print_component_table(model)
 
     # Step 1.5: Ensure board is large enough for component density
-    _ensure_board_capacity(model, target_density=0.35)
+    # (Finding 6: target_density defaults to shared 0.55 inside _ensure_board_capacity)
+    _ensure_board_capacity(model)
 
     # Step 2: Select board profile
     print("Step 2: Selecting board profile...")
@@ -194,14 +203,33 @@ def cmd_place(args) -> None:
         from place.pipeline import place_v2
         print("  Algorithm: macro-v2 (rigid cap-IC macros)")
         margin = args.margin if args.margin is not None else pcfg.margin
+
+        # SA iteration budget — Finding 2 fix.
+        # The previous code did `cfg.annealer.max_iterations // 2`, which
+        # silently ran SA at 10% of place_v2's own default (1500) and as
+        # a flat constant regardless of board size. The macro-v2 SA cost
+        # is O(iterations × macros); on dense boards the budget must
+        # scale with macro count or SA plateaus before convergence and
+        # leaves residual overlaps (test6: 9→1, test5: 3→1 just from
+        # fixing this).
+        #
+        # Override with --sa-iterations N if you want manual control.
+        if args.sa_iterations is not None:
+            sa_iters = args.sa_iterations
+        else:
+            n_macros = sum(1 for c in model.components if not c.is_fixed)
+            sa_iters = max(1500, 25 * n_macros)
+        print(f"  SA iterations: {sa_iters} (macro_count={sum(1 for c in model.components if not c.is_fixed)})")
+
         place_v2(
             model,
             margin=margin,
             grid_mm=cfg.legalization.grid_mm,
-            sa_iterations=cfg.annealer.max_iterations // 2,
+            sa_iterations=sa_iters,
             sa_reheats=cfg.annealer.reheat_count,
             seed=seed,
             verbose=True,
+            rudy_weight=getattr(args, "rudy_weight", 0.0) or 0.0,
         )
     elif algorithm == "force-directed":
         print("  Algorithm: force-directed (attractive + repulsive forces)")
@@ -614,6 +642,10 @@ def main():
                          help="Use the macro-first placement pipeline (rigid cap-IC macros). Default: on. Use --no-macro-v2 for the legacy grid pipeline.")
     p_place.add_argument("--seed", type=int, default=42,
                          help="Random seed for SA/placement determinism (default: 42; use --seed 0 for non-deterministic)")
+    p_place.add_argument("--rudy-weight", type=float, default=0.0,
+                         help="RUDY congestion penalty weight in SA cost function (default: 0 = disabled). "
+                              "When > 0, SA gets gradient signal to spread macros away from routing choke points. "
+                              "The verbose report always shows RUDY regardless of this setting.")
 
     # profiles
     subparsers.add_parser("profiles", help="List available board profiles")

@@ -129,6 +129,8 @@ def evaluate(
     gamma: float = 8.0,
     include_power: bool = True,
     net_weights: dict[str, float] | None = None,
+    rudy_weight: float = 0.0,
+    rudy_penalty: float | None = None,
 ) -> dict[str, float]:
     """Total placement cost.
 
@@ -140,15 +142,36 @@ def evaluate(
             Default True — required for cap-IC coupling.
         net_weights: Optional per-net HPWL multipliers (e.g. signal-flow-chain
             internal nets from Issue 3).  Nets absent from the dict use 1.0.
+        rudy_weight: RUDY congestion penalty weight (default 0 = disabled).
+            When > 0, the RUDY penalty is added to the total cost so SA
+            gets gradient signal to spread components away from routing
+            choke points. Finding 7 fix — the legacy smart_placement path
+            had RUDY wired in; the macro-v2 path didn't.
+        rudy_penalty: Pre-computed RUDY penalty (avoids re-computing the
+            RUDY map on every cost evaluation). If None and rudy_weight >
+            0, the penalty is computed here (slower). Callers that
+            evaluate cost in a tight SA loop should pre-compute the
+            penalty every N steps and pass it in.
 
-    Returns dict with hpwl, overlap, boundary, and total components.
+    Returns dict with hpwl, overlap, boundary, rudy, and total components.
     """
     h = total_hpwl(model, include_power=include_power, net_weights=net_weights)
     o = total_macro_overlap(macros)
     b = total_boundary(model)
+    r = 0.0
+    if rudy_weight > 0:
+        if rudy_penalty is None:
+            try:
+                from engine.congestion import rudy_congestion_penalty
+                r, _peak, _avg, _overflow = rudy_congestion_penalty(model)
+            except Exception:
+                r = 0.0
+        else:
+            r = rudy_penalty
     return {
         "hpwl": h,
         "overlap": o,
         "boundary": b,
-        "total": alpha * h + beta * o + gamma * b,
+        "rudy": r,
+        "total": alpha * h + beta * o + gamma * b + rudy_weight * r,
     }

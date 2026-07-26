@@ -132,6 +132,8 @@ def run_macro_sa(
     seed: int = 42,
     verbose: bool = False,
     net_weights: dict[str, float] | None = None,
+    rudy_weight: float = 0.0,
+    rudy_recompute_every: int = 50,
 ) -> dict[str, float]:
     """Run macro-aware simulated annealing.
 
@@ -148,14 +150,37 @@ def run_macro_sa(
         try to push the neighbor to a clear slot adjacent to the
         picked macro. Helps SA escape jammed configurations where
         pure translate can't make room.
+
+    Finding 7 fix: ``rudy_weight`` adds RUDY congestion to the cost
+    function (default 0 = disabled, matching previous behavior). When
+    > 0, the RUDY penalty is recomputed every ``rudy_recompute_every``
+    steps and passed to ``evaluate`` as a pre-computed penalty (avoids
+    re-computing the RUDY map on every cost evaluation — that would
+    dominate SA runtime). Boards with routing choke points get
+    gradient signal to spread macros away from congested cells.
     """
     if not macros:
         return {"initial_total": 0.0, "final_total": 0.0}
 
     rng = random.Random(seed)
 
+    # Finding 7: RUDY penalty cache. Recomputed every rudy_recompute_every
+    # steps. rudy_weight=0 (default) disables RUDY in SA — matching
+    # previous behavior — but the verbose report in place/pipeline.py
+    # still shows RUDY so the user can see congestion.
+    rudy_penalty_cache: float | None = None
+    if rudy_weight > 0:
+        try:
+            from engine.congestion import rudy_congestion_penalty
+            rudy_penalty_cache, _peak, _avg, _overflow = rudy_congestion_penalty(model)
+        except Exception:
+            rudy_penalty_cache = 0.0
+        if verbose:
+            print(f"  SA: RUDY enabled (weight={rudy_weight}, initial penalty={rudy_penalty_cache:.3f})")
+
     initial = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma,
-                       net_weights=net_weights)
+                       net_weights=net_weights,
+                       rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache)
     initial_total = initial["total"]
     best_total = initial_total
     best_snapshot = _snapshot_positions(model)
@@ -260,7 +285,8 @@ def run_macro_sa(
                     continue
 
             new_cost = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma,
-                                net_weights=net_weights)
+                                net_weights=net_weights,
+                                rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache)
             new_total = new_cost["total"]
             delta = new_total - current_total
 
@@ -280,6 +306,18 @@ def run_macro_sa(
 
             T *= cooling
 
+            # Finding 7: periodically recompute the RUDY penalty so SA's
+            # cost reflects the current routing congestion (not a stale
+            # snapshot from the start of the reheat round). The recompute
+            # is O(nets × cells) — doing it every step would dominate
+            # SA runtime, so we batch it every rudy_recompute_every steps.
+            if rudy_weight > 0 and (it + 1) % rudy_recompute_every == 0:
+                try:
+                    from engine.congestion import rudy_congestion_penalty
+                    rudy_penalty_cache, _peak, _avg, _overflow = rudy_congestion_penalty(model)
+                except Exception:
+                    pass
+
         if verbose:
             print(f"  SA reheat {reheat_round}: T={T:.4f}, current={current_total:.2f}, best={best_total:.2f}")
 
@@ -290,7 +328,8 @@ def run_macro_sa(
         m.apply_offsets()
 
     final = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma,
-                     net_weights=net_weights)
+                     net_weights=net_weights,
+                     rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache)
     if verbose:
         print(
             f"  SA done: initial={initial_total:.2f}, final={final['total']:.2f} "
