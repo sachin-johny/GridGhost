@@ -208,6 +208,45 @@ def place_v2(
             )
         interior_bbox = expanded_interior
 
+        # ROOT-CAUSE FIX (test4 OOB regression): grow the auto-inferred
+        # board outline to contain the expanded interior.
+        #
+        # _ensure_board_capacity (Step 1.5) sizes model.board by *board-level
+        # effective-area* density (target_pack_density = 0.55), but the
+        # expansion just above sizes the *interior* by *courtyard-aware macro
+        # area* at the same 0.55. For dense small boards the courtyard-aware
+        # interior overshoots the effective-area board, so the legalizer
+        # (which clamps to sa_bounds = expanded interior) can leave components
+        # beyond model.board. Because the output Edge.Cuts is generated from
+        # model.board (see _inject_inferred_edge_cuts), those components then
+        # overhang the board edge in the written file.
+        #
+        # The missing piece is the feedback loop: once the interior has been
+        # forced bigger to fit the macros, the inferred board must follow.
+        # Growing it here makes the written outline always cover the
+        # placement — and incidentally makes the legalizer's keepout inset
+        # math (Phase 5, min_inset) well-defined again. User-drawn outlines
+        # (model.user_defined_outline, set when the source had Edge.Cuts) are
+        # respected and never grown.
+        if not getattr(model, "user_defined_outline", False):
+            b = model.board
+            new_xmin = min(b.x_min, expanded_interior[0])
+            new_ymin = min(b.y_min, expanded_interior[1])
+            new_xmax = max(b.x_max, expanded_interior[2])
+            new_ymax = max(b.y_max, expanded_interior[3])
+            if (new_xmin, new_ymin, new_xmax, new_ymax) != (
+                b.x_min, b.y_min, b.x_max, b.y_max,
+            ):
+                from models.board_model import BoardOutline
+                old_w, old_h = b.width, b.height
+                model.board = BoardOutline(new_xmin, new_ymin, new_xmax, new_ymax)
+                if verbose:
+                    print(
+                        f"  Board grown to contain expanded interior: "
+                        f"{old_w:.1f}×{old_h:.1f} -> "
+                        f"{model.board.width:.1f}×{model.board.height:.1f}mm"
+                    )
+
     # Phase A: height-ordered shelf-pack of net-clusters to fill the interior
     # (connectivity-blind positioning — uses the board, doesn't collapse).
     clusters = place_interior_phase_a(model, interior_macros, interior_bbox)
