@@ -221,15 +221,22 @@ def cmd_place(args) -> None:
             sa_iters = max(1500, 25 * n_macros)
         print(f"  SA iterations: {sa_iters} (macro_count={sum(1 for c in model.components if not c.is_fixed)})")
 
-        place_v2(
+        grid_mm = args.grid_mm if args.grid_mm is not None else cfg.legalization.grid_mm
+        place_v2_result = place_v2(
             model,
             margin=margin,
-            grid_mm=cfg.legalization.grid_mm,
+            grid_mm=grid_mm,
             sa_iterations=sa_iters,
             sa_reheats=cfg.annealer.reheat_count,
+            alpha=args.alpha,
+            beta=args.beta,
+            gamma=args.gamma,
+            connector_mating_margin=args.connector_mating_margin,
             seed=seed,
-            verbose=True,
+            verbose=getattr(args, "verbose", False),
             rudy_weight=getattr(args, "rudy_weight", 0.0) or 0.0,
+            use_abacus=(getattr(args, "legalizer", "heuristic") == "abacus"),
+            use_sa_polish=(getattr(args, "legalizer", "heuristic") == "sa_polish"),
         )
     elif algorithm == "force-directed":
         print("  Algorithm: force-directed (attractive + repulsive forces)")
@@ -256,6 +263,21 @@ def cmd_place(args) -> None:
     if getattr(args, "macro_v2", False):
         # Macro-v2 pipeline does its own SA + legalize. Skip the legacy
         # post-processing (Steps 4.5–7.7) and go straight to saving.
+        legal_stats = place_v2_result.get("legal_stats", {})
+        residual_overlaps = legal_stats.get("residual_overlaps", 0)
+        boundary_failures = legal_stats.get("boundary_failures", 0)
+        placement_invalid = residual_overlaps > 0 or boundary_failures > 0
+        if placement_invalid:
+            print(
+                f"\n  WARNING: legalizer could not produce a valid placement — "
+                f"{residual_overlaps} overlapping footprint pair(s), "
+                f"{boundary_failures} out-of-bounds footprint(s) remain.\n"
+                f"  The written board is NOT physically valid as placed. Try "
+                f"--sa-iterations with a larger value, a lower --beta board "
+                f"density, or manually resolve the flagged components in "
+                f"KiCad before fabrication."
+            )
+
         print("\nStep 8: Saving results (macro-v2 pipeline — skipping legacy SA/legalize)")
         model_json = args.input.replace(".kicad_pcb", "_placed_model.json")
         model.to_json(model_json)
@@ -273,9 +295,14 @@ def cmd_place(args) -> None:
             print("  [DRY RUN] Not writing PCB file")
 
         print(f"\n{'#' * 60}")
-        print(f"  Placement Complete! (macro-v2)")
+        if placement_invalid:
+            print(f"  Placement FINISHED WITH ERRORS (macro-v2)")
+        else:
+            print(f"  Placement Complete! (macro-v2)")
         print(f"  Components placed: {len([c for c in model.components if not c.is_fixed])}")
         print(f"{'#' * 60}\n")
+        if placement_invalid:
+            sys.exit(1)
         return
 
     # Step 4.5: Pre-place decoupling caps adjacent to their ICs.
@@ -646,6 +673,41 @@ def main():
                          help="RUDY congestion penalty weight in SA cost function (default: 0 = disabled). "
                               "When > 0, SA gets gradient signal to spread macros away from routing choke points. "
                               "The verbose report always shows RUDY regardless of this setting.")
+    # --- macro-v2-only knobs (previously documented in README but never
+    # registered as CLI args; place_v2() always accepted them). ---
+    p_place.add_argument("--grid-mm", type=float, default=None,
+                         help="Legalization grid pitch in mm for the macro-v2 pipeline (default: 1.0)")
+    p_place.add_argument("--alpha", type=float, default=1.0,
+                         help="HPWL weight in the macro-v2 cost function (default: 1.0)")
+    p_place.add_argument("--beta", type=float, default=25.0,
+                         help="Overlap penalty weight in the macro-v2 cost function (default: 25.0)")
+    p_place.add_argument("--gamma", type=float, default=8.0,
+                         help="Boundary penalty weight in the macro-v2 cost function (default: 8.0)")
+    p_place.add_argument("--connector-mating-margin", type=float, default=5.0,
+                         help="Edge offset (mm) for perimeter connectors in the macro-v2 pipeline (default: 5.0)")
+    p_place.add_argument("-v", "--verbose", action="store_true",
+                         help="Print per-stage cost breakdown (macro-v2 pipeline). "
+                              "Legacy pipeline always prints verbose output regardless of this flag.")
+    p_place.add_argument("--legalizer", choices=["abacus", "heuristic", "sa_polish"], default="heuristic",
+                         help="Macro-v2 overlap-resolution strategy (default: heuristic). "
+                              "'abacus' bridges macro-v2's rigid Macro objects into the "
+                              "legacy row-based Abacus DP legalizer (place/abacus_bridge.py). "
+                              "Measured on the bundled test boards it is WORSE than the "
+                              "default on every board (more residual overlaps on 2/6, "
+                              "10-30%% worse HPWL on all 6) — its row-binning model assumes "
+                              "roughly uniform component heights, which doesn't hold once "
+                              "small passives and large IC+cap macros share one row grid, "
+                              "and it discards a large fraction of SA's Y-optimization doing "
+                              "so (see place/abacus_bridge.py docstring). Kept available for "
+                              "comparison/further work, not because it currently wins. "
+                              "'sa_polish' runs a staged overlap-weighted simulated-"
+                              "annealing pass (beta ramp + overlap-biased move selection, "
+                              "place/sa_polish.py) instead of greedy push-apart/force-"
+                              "spread. Better than the first two attempts: wins outright "
+                              "on 3/6 boards (better HPWL, still overlap-free), near-ties "
+                              "on 1/6, but still doesn't beat the heuristic on the board "
+                              "this was built to fix (test6: same overlap count, worse "
+                              "area). See place/sa_polish.py docstring for the numbers.")
 
     # profiles
     subparsers.add_parser("profiles", help="List available board profiles")

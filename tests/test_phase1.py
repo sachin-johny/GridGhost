@@ -1724,8 +1724,6 @@ def test_barrel_jack_faces_outward():
     pcb_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             'tests', 'test_pcbs', 'test6.kicad_pcb')
     if not os.path.exists(pcb_path):
-        pcb_path = '/home/z/my-project/GridGhost/tests/test_pcbs/test6.kicad_pcb'
-    if not os.path.exists(pcb_path):
         return  # skip if test PCB not available
 
     from parsers.kicad_parser import KiCadParser

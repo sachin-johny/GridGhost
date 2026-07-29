@@ -21,6 +21,7 @@ import random
 from typing import TYPE_CHECKING
 
 from cost.cost import evaluate
+from cost.incremental import IncrementalCostTracker
 
 if TYPE_CHECKING:
     from models.board_model import BoardModel
@@ -134,6 +135,8 @@ def run_macro_sa(
     net_weights: dict[str, float] | None = None,
     rudy_weight: float = 0.0,
     rudy_recompute_every: int = 50,
+    bias_overlapping: bool = False,
+    bias_overlap_prob: float = 0.6,
 ) -> dict[str, float]:
     """Run macro-aware simulated annealing.
 
@@ -158,6 +161,17 @@ def run_macro_sa(
     re-computing the RUDY map on every cost evaluation — that would
     dominate SA runtime). Boards with routing choke points get
     gradient signal to spread macros away from congested cells.
+
+    ``bias_overlapping`` (default False — opt-in, doesn't affect the
+    main placement pipeline unless explicitly requested): with
+    probability ``bias_overlap_prob`` each iteration, pick the macro to
+    move from a currently-overlapping pair (via the incremental cost
+    tracker's live overlap-pair cache) instead of uniformly at random.
+    On a mostly-legal board with a handful of overlapping macros,
+    uniform selection spends most iterations moving macros that were
+    never part of the problem; this concentrates search on the ones
+    actually in conflict. Falls back to uniform selection whenever
+    there's nothing currently overlapping or the tracker isn't active.
     """
     if not macros:
         return {"initial_total": 0.0, "final_total": 0.0}
@@ -197,6 +211,39 @@ def run_macro_sa(
 
     current_total = initial_total
 
+    # _calibrate_initial_temp always reverts every sample move, so the
+    # model/macros are back in their pre-calibration state here — safe
+    # to build the incremental tracker's cache from current positions.
+    #
+    # rudy_weight's contribution is intentionally NOT part of the
+    # tracker (it's recomputed wholesale every rudy_recompute_every
+    # steps anyway, see below) — it's added on top of the tracker's
+    # hpwl/overlap/boundary total for the accept/reject decision, same
+    # as the non-incremental cost.evaluate() does.
+    tracker = IncrementalCostTracker(
+        model, macros, alpha=alpha, beta=beta, gamma=gamma, net_weights=net_weights,
+    )
+    # Sanity: the tracker's from-cache total must agree with the
+    # from-scratch evaluate() above (excluding the rudy term, which
+    # the tracker doesn't carry). Cheap to check once; catches macro/
+    # model mismatches (e.g. a macro whose members aren't all in
+    # model.components) immediately instead of silently drifting.
+    tracker_initial = tracker.total()
+    if abs(tracker_initial["total"] - (initial_total - rudy_weight * (rudy_penalty_cache or 0.0))) > 1e-3:
+        # Fall back to full recompute every iteration rather than trust
+        # a tracker that disagrees with ground truth — correctness over
+        # speed if the two ever diverge (e.g. a future macro field the
+        # tracker doesn't know about).
+        tracker = None
+        if verbose:
+            print("  SA: incremental cost tracker disagreed with evaluate() at init — "
+                  "falling back to full recompute per iteration.")
+
+    # macro identity -> index, used to look up the index of a macro
+    # object handed back by _find_overlapping_neighbor / swap partner
+    # selection without an O(n) linear scan every time.
+    macro_index = {id(mac): i for i, mac in enumerate(macros)}
+
     for reheat_round in range(reheats + 1):
         T_start = T0 * (reheat_ratio ** reheat_round)
         T_start = max(T_start, T_min)
@@ -204,7 +251,14 @@ def run_macro_sa(
         T = T_start
 
         for it in range(iterations):
-            m_idx = rng.randrange(len(macros))
+            m_idx = None
+            if bias_overlapping and tracker is not None and rng.random() < bias_overlap_prob:
+                pairs = tracker.overlapping_pairs()
+                if pairs:
+                    pair = pairs[rng.randrange(len(pairs))]
+                    m_idx = pair[rng.randrange(2)]
+            if m_idx is None:
+                m_idx = rng.randrange(len(macros))
             m = macros[m_idx]
 
             # Pick move type. Probabilities are cumulative thresholds
@@ -228,6 +282,9 @@ def run_macro_sa(
             swap_partner_snap = None
             displaced = None
             displaced_snap = None
+            # Macro indices actually moved by this iteration — feeds the
+            # incremental tracker so it only recomputes what changed.
+            touched_indices = [m_idx]
 
             if move == "translate":
                 dx = rng.uniform(-window, window)
@@ -267,6 +324,9 @@ def run_macro_sa(
                         if not ok:
                             continue
                         move = "translate"
+                    else:
+                        # Only the neighbor actually moved — m stayed put.
+                        touched_indices = [macro_index[id(neighbor)]]
             else:  # swap
                 other_idx = rng.randrange(len(macros))
                 if other_idx == m_idx:
@@ -283,21 +343,30 @@ def run_macro_sa(
                     m._restore(snap)
                     other._restore(swap_partner_snap)
                     continue
+                touched_indices = [m_idx, other_idx]
 
-            new_cost = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma,
-                                net_weights=net_weights,
-                                rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache)
-            new_total = new_cost["total"]
+            if tracker is not None:
+                proposed = tracker.propose(touched_indices)
+                new_total = proposed["total"] + rudy_weight * (rudy_penalty_cache or 0.0)
+            else:
+                new_cost = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma,
+                                    net_weights=net_weights,
+                                    rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache)
+                new_total = new_cost["total"]
             delta = new_total - current_total
 
             if delta <= 0 or rng.random() < math.exp(-delta / max(T, 1e-9)):
                 # Accept
                 current_total = new_total
+                if tracker is not None:
+                    tracker.commit()
                 if new_total < best_total:
                     best_total = new_total
                     best_snapshot = _snapshot_positions(model)
             else:
                 # Reject — revert all touched macros.
+                if tracker is not None:
+                    tracker.discard()
                 m._restore(snap)
                 if move == "swap" and swap_partner is not None:
                     swap_partner._restore(swap_partner_snap)

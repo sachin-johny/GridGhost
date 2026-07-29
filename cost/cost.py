@@ -128,6 +128,7 @@ def evaluate(
     beta: float = 25.0,
     gamma: float = 8.0,
     include_power: bool = True,
+    exclude_nets: set[str] | None = None,
     net_weights: dict[str, float] | None = None,
     rudy_weight: float = 0.0,
     rudy_penalty: float | None = None,
@@ -140,6 +141,12 @@ def evaluate(
         gamma: Boundary penalty weight.
         include_power: Whether to include power/ground nets in HPWL.
             Default True — required for cap-IC coupling.
+        exclude_nets: Optional set of net names to drop from HPWL
+            entirely (e.g. a single global ground net, which is nearly
+            constant and adds no gradient signal but costs an O(n) scan
+            every evaluation). Previously only reachable by calling
+            ``total_hpwl`` directly; now threaded through so pipeline/SA
+            callers can actually use it.
         net_weights: Optional per-net HPWL multipliers (e.g. signal-flow-chain
             internal nets from Issue 3).  Nets absent from the dict use 1.0.
         rudy_weight: RUDY congestion penalty weight (default 0 = disabled).
@@ -155,7 +162,8 @@ def evaluate(
 
     Returns dict with hpwl, overlap, boundary, rudy, and total components.
     """
-    h = total_hpwl(model, include_power=include_power, net_weights=net_weights)
+    h = total_hpwl(model, include_power=include_power, exclude_nets=exclude_nets,
+                    net_weights=net_weights)
     o = total_macro_overlap(macros)
     b = total_boundary(model)
     r = 0.0

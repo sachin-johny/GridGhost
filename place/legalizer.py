@@ -1,19 +1,44 @@
-"""Single-pass legalizer.
+"""Multi-pass greedy legalizer.
 
-Three steps:
-1. Grid snap macro leaders to ``grid_mm`` (followers stay at their
-   fixed offsets relative to the leader).
-2. Push apart overlapping macros (greedy, macro-aware). Each push is
-   rigid — the whole macro moves, followers come along.
-3. Boundary clamp.
+NOTE: earlier revisions of this module described this as a "single
+pass" legalizer with "no spread pass ... no brute-force safety net".
+That was true of the first version and is no longer true — real
+boards broke it, and passes were added incrementally to chase down
+residual overlaps. Documenting the actual pipeline honestly:
 
-The <8mm cap-IC distance is preserved automatically because macros
-are rigid throughout. If push-apart or boundary clamping can't place
-a macro without breaking it, the legalizer reports the failure and
-leaves the macro at the best available position.
+1. ``expand_bounds_to_fit`` — if macro packing density exceeds the
+   target, grow the placement bounds so there's room to legalize at
+   all (see the ``legalize()`` docstring).
+2. ``grid_snap`` — snap macro leaders to ``grid_mm`` (followers stay
+   at their fixed offsets relative to the leader).
+3. ``push_apart_overlapping`` — greedy pairwise macro-macro overlap
+   repair, iterated with ``boundary_clamp`` for up to ``max_rounds``
+   rounds (clamp can reintroduce overlaps push-apart just fixed, and
+   vice versa).
+4. ``force_spread_overlapping`` — a global net-repulsion pass, run
+   only when push-apart plateaus with room still available in the
+   bounds (push-apart is a local heuristic and gets stuck when a
+   macro is boxed in by 3-4 neighbors even with free space elsewhere).
+5. Per-macro keepout enforcement — nudges ICs/MCUs that are inside
+   their extra edge keepout zone (but inside global bounds) further
+   toward center.
+6. ``displace_to_clear_slots`` ("Tetris" pass) — a global candidate-
+   slot search for macros still overlapping after all of the above.
 
-There is no spread pass, no abacus DP, no reheat rounds, no "brute-
-force safety net". The SA + this legalize pass is the whole story.
+This legalizer is a stack of greedy heuristics, not a legalizer with
+a correctness guarantee (unlike, e.g., a row-based DP legalizer such
+as Abacus). It CAN and DOES leave residual overlaps on dense/irregular
+boards — ``legalize()`` reports ``residual_overlaps`` /
+``boundary_failures`` explicitly for this reason, and callers should
+treat a non-zero count as a placement that needs manual cleanup, not
+a soft warning to ignore. See ``gridghost.py`` for how the CLI now
+surfaces this as a hard warning + non-zero exit code.
+
+The <8mm cap-IC distance (edge-to-edge gap; see ``models/macro.py``)
+IS guaranteed regardless of legalizer outcome, because it's enforced
+at Macro construction time and macros only ever move as rigid bodies
+— no pass in this file can break that invariant, only the ICs'/caps'
+position relative to *other* macros.
 """
 
 from __future__ import annotations
@@ -25,6 +50,10 @@ from models.macro import Macro
 
 if TYPE_CHECKING:
     from models.board_model import BoardModel, BoardOutline
+
+
+from place.abacus_bridge import abacus_legalize_macros
+from place.sa_polish import sa_polish_legalize
 
 
 def _snap_to_grid(value: float, grid_mm: float) -> float:
@@ -693,12 +722,42 @@ def legalize(
     extra_padding: float = 1.0,
     target_density: float | None = None,
     per_macro_keepout: "callable[[Macro], float] | None" = None,
+    use_abacus: bool = False,
+    use_sa_polish: bool = False,
 ) -> dict[str, int]:
     """Iterative legalization: snap → (push apart → clamp) repeated.
 
     Each round repairs the overlaps created by the previous clamp, then
     clamps the resulting positions back inside bounds. Stops when a
     round makes no progress or after ``max_rounds`` iterations.
+
+    Three overlap-resolution strategies, mutually exclusive
+    (``use_abacus`` is checked first, then ``use_sa_polish``, else the
+    original greedy heuristic stack runs):
+
+    - Default (both False): push-apart / force-spread — pure greedy
+      descent. Gets stuck in local minima (a macro boxed in by 3-4
+      overlapping neighbors can't move anywhere without making its OWN
+      overlap count temporarily worse, even when that's the only path
+      to a better configuration one move later).
+    - ``use_abacus=True``: bridges macro-v2 onto the legacy row-based
+      Abacus DP legalizer (``place/abacus_bridge.py``). MEASURED
+      WORSE than the default on every bundled test board — see that
+      module's docstring. Kept for comparison, not because it wins.
+    - ``use_sa_polish=True``: runs a staged, overlap-weighted
+      simulated-annealing pass (``place/sa_polish.py``, beta ramp +
+      overlap-biased move selection) instead of greedy descent. SA's
+      accept-temporarily-worse-moves criterion is the local-minima
+      escape greedy descent lacks. MEASURED: the best of the three
+      strategies tried — wins outright on 3/6 boards (better HPWL,
+      still overlap-free), near-ties on 1/6 — but still doesn't beat
+      the heuristic on the board this was built to fix (test6: same
+      overlap count, worse area). See ``place/sa_polish.py`` docstring.
+
+    Whichever strategy runs, keepout enforcement and the Tetris
+    "displace to clear slot" fallback further down still run — none of
+    these three has a hard zero-overlap guarantee on an arbitrarily
+    dense or irregular board.
 
     If ``expand_to_fit`` is True (default) and the macro packing density
     in the bounds exceeds the shared ``target_pack_density`` (default
@@ -741,74 +800,88 @@ def legalize(
 
     grid_snap(macros, grid_mm, bounds)
 
-    residual = push_apart_overlapping(macros, bounds, max_passes=max_push_passes)
-    failed = boundary_clamp(macros, bounds, per_macro_keepout=per_macro_keepout)
-
-    # Iterate: clamp creates overlaps, push-apart fixes them but may push
-    # something back OOB, clamp fixes that, etc. Continue until stable.
-    for round_idx in range(max_rounds):
-        new_residual = push_apart_overlapping(macros, bounds, max_passes=max_push_passes)
-        new_failed = boundary_clamp(macros, bounds, per_macro_keepout=per_macro_keepout)
-        if new_residual == residual and new_failed == failed:
-            # No progress this round.
-            residual, failed = new_residual, new_failed
-            break
-        residual, failed = new_residual, new_failed
-        if residual == 0 and failed == 0:
-            break
-
-    # One last push-apart to clean up overlaps introduced by the final clamp.
-    if failed > 0:
+    if use_abacus:
+        abacus_legalize_macros(model, macros, bounds, grid_mm=grid_mm, verbose=verbose)
+        failed = boundary_clamp(macros, bounds, per_macro_keepout=per_macro_keepout)
+        residual = _count_residual_overlaps(macros)
+        if residual > 0 and verbose:
+            print(f"  Abacus: {residual} residual overlap(s) after row DP + boundary clamp")
+    elif use_sa_polish:
+        polish_stats = sa_polish_legalize(
+            model, macros, bounds, grid_mm=grid_mm, verbose=verbose,
+            per_macro_keepout=per_macro_keepout,
+        )
+        failed = boundary_clamp(macros, bounds, per_macro_keepout=per_macro_keepout)
+        residual = _count_residual_overlaps(macros)
+    else:
         residual = push_apart_overlapping(macros, bounds, max_passes=max_push_passes)
+        failed = boundary_clamp(macros, bounds, per_macro_keepout=per_macro_keepout)
 
-    # ─── Force-directed spread pass (root-cause fix for greedy local minima) ──
-    # The greedy push-apart above gets stuck in local minima: a macro
-    # surrounded by 3-4 overlapping neighbors can't move in any direction
-    # without creating a new overlap, even when there's plenty of empty
-    # space elsewhere in the bounds. This is why test6 (39% density) and
-    # th_sensor (38% density) had 16+ residual overlaps despite having
-    # plenty of room.
-    #
-    # The force-directed spread pass takes a global view: for each
-    # overlapping macro, compute the NET repulsion vector from ALL
-    # overlapping neighbors and move along it. The move is accepted if
-    # it reduces the macro's overlap count — not requiring zero new
-    # overlaps, just net improvement. This escapes local minima.
-    #
-    # Gate: only run if (a) there are residual overlaps AND (b) the
-    # density is below the target (room exists). On over-dense boards
-    # (density > target) the bounds expansion above already ran and the
-    # force-spread won't help — the issue is genuine lack of room, not
-    # a local minimum.
-    if residual > 0:
-        bounds_area = (bounds[2] - bounds[0]) * (bounds[3] - bounds[1])
-        if bounds_area > 0:
-            total_macro_area = sum(
-                max(0.0, m.bbox[2] - m.bbox[0]) * max(0.0, m.bbox[3] - m.bbox[1])
-                for m in macros if not m.is_fixed
-            )
-            current_density = total_macro_area / bounds_area
-            if current_density < target_density:
-                if verbose:
-                    print(
-                        f"  Force-spread: {residual} residual overlaps at "
-                        f"{current_density:.0%} density (room available) — "
-                        f"running force-directed spread"
-                    )
-                spread_residual = force_spread_overlapping(
-                    macros, bounds, max_passes=50, step_size=2.0,
+        # Iterate: clamp creates overlaps, push-apart fixes them but may push
+        # something back OOB, clamp fixes that, etc. Continue until stable.
+        for round_idx in range(max_rounds):
+            new_residual = push_apart_overlapping(macros, bounds, max_passes=max_push_passes)
+            new_failed = boundary_clamp(macros, bounds, per_macro_keepout=per_macro_keepout)
+            if new_residual == residual and new_failed == failed:
+                # No progress this round.
+                residual, failed = new_residual, new_failed
+                break
+            residual, failed = new_residual, new_failed
+            if residual == 0 and failed == 0:
+                break
+
+        # One last push-apart to clean up overlaps introduced by the final clamp.
+        if failed > 0:
+            residual = push_apart_overlapping(macros, bounds, max_passes=max_push_passes)
+
+        # ─── Force-directed spread pass (root-cause fix for greedy local minima) ──
+        # The greedy push-apart above gets stuck in local minima: a macro
+        # surrounded by 3-4 overlapping neighbors can't move in any direction
+        # without creating a new overlap, even when there's plenty of empty
+        # space elsewhere in the bounds. This is why test6 (39% density) and
+        # th_sensor (38% density) had 16+ residual overlaps despite having
+        # plenty of room.
+        #
+        # The force-directed spread pass takes a global view: for each
+        # overlapping macro, compute the NET repulsion vector from ALL
+        # overlapping neighbors and move along it. The move is accepted if
+        # it reduces the macro's overlap count — not requiring zero new
+        # overlaps, just net improvement. This escapes local minima.
+        #
+        # Gate: only run if (a) there are residual overlaps AND (b) the
+        # density is below the target (room exists). On over-dense boards
+        # (density > target) the bounds expansion above already ran and the
+        # force-spread won't help — the issue is genuine lack of room, not
+        # a local minimum.
+        if residual > 0:
+            bounds_area = (bounds[2] - bounds[0]) * (bounds[3] - bounds[1])
+            if bounds_area > 0:
+                total_macro_area = sum(
+                    max(0.0, m.bbox[2] - m.bbox[0]) * max(0.0, m.bbox[3] - m.bbox[1])
+                    for m in macros if not m.is_fixed
                 )
-                if verbose and spread_residual < residual:
-                    print(
-                        f"  Force-spread: {residual} -> {spread_residual} "
-                        f"overlaps (−{residual - spread_residual})"
+                current_density = total_macro_area / bounds_area
+                if current_density < target_density:
+                    if verbose:
+                        print(
+                            f"  Force-spread: {residual} residual overlaps at "
+                            f"{current_density:.0%} density (room available) — "
+                            f"running force-directed spread"
+                        )
+                    spread_residual = force_spread_overlapping(
+                        macros, bounds, max_passes=50, step_size=2.0,
                     )
-                residual = spread_residual
-                # Re-clamp after force-spread (it may have pushed macros OOB)
-                failed = boundary_clamp(macros, bounds, per_macro_keepout=per_macro_keepout)
-                # One more push-apart to clean up any overlaps the
-                # boundary_clamp re-introduced.
-                residual = push_apart_overlapping(macros, bounds, max_passes=max_push_passes)
+                    if verbose and spread_residual < residual:
+                        print(
+                            f"  Force-spread: {residual} -> {spread_residual} "
+                            f"overlaps (−{residual - spread_residual})"
+                        )
+                    residual = spread_residual
+                    # Re-clamp after force-spread (it may have pushed macros OOB)
+                    failed = boundary_clamp(macros, bounds, per_macro_keepout=per_macro_keepout)
+                    # One more push-apart to clean up any overlaps the
+                    # boundary_clamp re-introduced.
+                    residual = push_apart_overlapping(macros, bounds, max_passes=max_push_passes)
 
     # Final per-macro keepout enforcement: push ICs/MCUs that are still
     # inside the keepout zone (but inside the global bounds) further

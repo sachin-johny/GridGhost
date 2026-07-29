@@ -128,6 +128,8 @@ def place_v2(
     seed: int = 42,
     verbose: bool = False,
     rudy_weight: float = 0.0,
+    use_abacus: bool = False,
+    use_sa_polish: bool = False,
 ) -> dict[str, object]:
     """Run the macro-first placement pipeline.
 
@@ -423,6 +425,8 @@ def place_v2(
         grid_mm=grid_mm, verbose=verbose,
         expand_to_fit=False,  # already expanded above
         per_macro_keepout=_keepout_cb,
+        use_abacus=use_abacus,
+        use_sa_polish=use_sa_polish,
     )
 
     # Final cost (all macros including connectors)
