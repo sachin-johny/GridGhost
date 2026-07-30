@@ -46,6 +46,34 @@ _FAN_DIRS = (
     (1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0),
 )
 
+# Component types whose macros are non-electrical mechanical features.
+# When BOTH macros in a pair are mechanical, their bboxes may legitimately
+# overlap (KiCad places M3 mounting-hole pad+via stacks on 8mm grid spacing;
+# their 6.5mm pads with bbox_margin=0.8 produce 8.1mm bboxes → 0.2mm false
+# overlap that the legalizer cannot resolve because they're fixed). Reporting
+# these as placement overlaps would be a false positive that obscures the
+# real residual-overlap signal — see `Macro.overlaps` for the full rationale.
+_MECHANICAL_COMPONENT_TYPES = frozenset({
+    "mounting_hole",
+    "fiducial",
+    "test_coupon",
+})
+
+
+def _is_overlap_exempt(a: "Macro", b: "Macro") -> bool:
+    """Return True if the (a, b) macro pair is exempt from overlap checks.
+
+    A pair is exempt when BOTH macros' leaders are non-electrical
+    mechanical features (mounting holes, fiducials, test coupons).
+    Such pairs may legitimately have overlapping bboxes (pad stacks
+    around drills) and are never resolvable by the legalizer (they're
+    fixed) — counting them as placement overlaps is a false positive.
+    """
+    a_type = getattr(a.leader, "component_type", "") or ""
+    b_type = getattr(b.leader, "component_type", "") or ""
+    return (a_type in _MECHANICAL_COMPONENT_TYPES
+            and b_type in _MECHANICAL_COMPONENT_TYPES)
+
 
 def _rotate(dx: float, dy: float, rotation_deg: float) -> tuple[float, float]:
     """Apply KiCad CW-positive rotation to a (dx, dy) offset."""
@@ -300,12 +328,34 @@ class Macro:
         return True
 
     def overlaps(self, other: "Macro") -> bool:
-        """Macro-macro bbox overlap test."""
+        """Macro-macro bbox overlap test.
+
+        Mounting-hole / mechanical-feature exemption: when BOTH macros
+        are non-electrical mechanical features (mounting holes, fiducials,
+        test coupons), their bboxes may legitimately overlap because
+        KiCad places these as pad stacks with via rings around a drill —
+        adjacent M3 mounting holes on 8mm spacing have 6.5mm pads whose
+        bboxes (with bbox_margin=0.8) are 8.1mm wide, producing a 0.2mm
+        false overlap that NO legalizer pass can resolve (they're fixed).
+        Reporting these as placement overlaps is a false positive that
+        obscures the real residual-overlap signal. See the discussion of
+        ``component_type == "mounting_hole"`` in ``parsers/kicad_parser.py``.
+        """
+        if _is_overlap_exempt(self, other):
+            return False
         ax1, ay1, ax2, ay2 = self.bbox
         bx1, by1, bx2, by2 = other.bbox
         return not (ax2 <= bx1 or bx2 <= ax1 or ay2 <= by1 or by2 <= ay1)
 
     def overlap_area(self, other: "Macro") -> float:
+        """Intersection area of two macros' bboxes.
+
+        Applies the same mechanical-feature exemption as ``overlaps``:
+        exempt pairs contribute 0 to the overlap area (so SA's overlap
+        cost isn't polluted by mounting-hole pad stacks).
+        """
+        if _is_overlap_exempt(self, other):
+            return 0.0
         ax1, ay1, ax2, ay2 = self.bbox
         bx1, by1, bx2, by2 = other.bbox
         ox1 = max(ax1, bx1)

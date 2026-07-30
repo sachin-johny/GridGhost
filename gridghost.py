@@ -13,21 +13,6 @@ import argparse
 import sys
 import os
 
-# Ensure deterministic hash seed for reproducible placement. Python's
-# hash randomization (PYTHONHASHSEED) changes set/dict iteration order
-# across runs, which propagates through clustering/SA and produces
-# different placements each run. We re-exec with PYTHONHASHSEED=0 if
-# it's not already set. This must happen BEFORE any imports that cache
-# hash values (e.g. engine modules that build sets at import time).
-# Use GRIDGHOST_NO_HASH_SEED=1 to opt out (truly random).
-if (not os.environ.get("PYTHONHASHSEED")
-        and not os.environ.get("GRIDGHOST_NO_HASH_SEED")
-        and os.environ.get("GRIDGHOST_HASH_SEEDED") != "1"):
-    os.environ["PYTHONHASHSEED"] = "0"
-    os.environ["GRIDGHOST_HASH_SEEDED"] = "1"
-    # Re-exec self with the new environment.
-    os.execv(sys.executable, [sys.executable] + sys.argv)
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.board_model import BoardModel

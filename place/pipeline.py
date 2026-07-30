@@ -427,6 +427,7 @@ def place_v2(
         per_macro_keepout=_keepout_cb,
         use_abacus=use_abacus,
         use_sa_polish=use_sa_polish,
+        seed=seed,
     )
 
     # Final cost (all macros including connectors)

@@ -128,7 +128,10 @@ def _detect_crystal_oscillators(
         crystal_nets = ref_nets.get(crystal.ref, set())
         if len(crystal_nets) != 2:
             continue
-        osc_nets = list(crystal_nets)
+        # ``crystal_nets`` is a ``set[str]`` — sort before iterating so
+        # the metadata ``osc_nets`` list and the ``load_caps`` member order
+        # are deterministic across PYTHONHASHSEED values.
+        osc_nets = sorted(crystal_nets)
 
         # Each oscillator net should have exactly one capacitor on it
         # (the load cap), which also connects to a power net (GND).
@@ -136,9 +139,13 @@ def _detect_crystal_oscillators(
         valid = True
         for osc_net in osc_nets:
             refs_on_net = net_refs.get(osc_net, set())
-            # Find capacitors on this oscillator net (excluding the crystal itself)
+            # Find capacitors on this oscillator net (excluding the crystal itself).
+            # ``refs_on_net`` is a ``set[str]`` — sort so that the "first"
+            # cap picked via ``caps_on_net[0]`` below is deterministic when
+            # (incorrectly) more than one cap is present, and so the member
+            # order doesn't drift with PYTHONHASHSEED.
             caps_on_net = [
-                r for r in refs_on_net
+                r for r in sorted(refs_on_net)
                 if r != crystal.ref
                 and getattr(ref_comp.get(r), 'component_type', '') == 'capacitor'
             ]
@@ -162,8 +169,11 @@ def _detect_crystal_oscillators(
             member_refs=load_caps,
             metadata={
                 'osc_nets': osc_nets,
+                # Pick the first IC on the first oscillator net as a metadata
+                # hint.  ``net_refs.get(...)`` returns a ``set[str]`` — sort
+                # it so the chosen ``ic_ref`` is deterministic across runs.
                 'ic_ref': next(
-                    (r for r in net_refs.get(osc_nets[0], set())
+                    (r for r in sorted(net_refs.get(osc_nets[0], set()))
                      if r != crystal.ref and r not in load_caps
                      and getattr(ref_comp.get(r), 'component_type', '') in {'ic', 'mcu', 'regulator'}),
                     None,
@@ -242,14 +252,23 @@ def _detect_regulators(
                 # This rail has no cap — skip it, but don't fail the whole motif.
                 continue
             # Pick the closest cap to the regulator (canonical member).
+            # ``caps_on_rail`` is a ``set[str]``. ``min()`` returns the FIRST
+            # element achieving the minimum key, so without a tiebreaker,
+            # equidistant caps would be chosen by hash-seed-dependent set
+            # iteration order — leaking nondeterminism into motif MEMBERSHIP.
+            # The tuple key (distance, ref) makes ties resolve to the
+            # lexicographically smaller ref, deterministically.
             reg_comp_obj = ref_comp.get(reg.ref)
             if reg_comp_obj is None:
                 valid = False
                 break
             closest_cap = min(
                 caps_on_rail,
-                key=lambda r: _center_distance(reg_comp_obj, ref_comp[r])
-                if ref_comp.get(r) else float('inf'),
+                key=lambda r: (
+                    _center_distance(reg_comp_obj, ref_comp[r])
+                    if ref_comp.get(r) else float('inf'),
+                    r,  # deterministic tiebreaker on equidistant caps
+                ),
             )
             member_caps.append(closest_cap)
 
@@ -319,6 +338,14 @@ def _detect_signal_flow_chains(
 
     Chains can share ICs (e.g. a quad op-amp serves multiple channels) —
     only connectors are marked as used to prevent duplicate chains.
+
+    Determinism: every iteration over a ``set`` returned by ``ref_nets`` /
+    ``net_refs`` MUST be ``sorted()``-wrapped.  These sets hold refs and net
+    names whose iteration order is governed by ``PYTHONHASHSEED``; leaving
+    them unsorted leaks hash-seed noise into BFS traversal order, which in
+    turn flips two downstream first-wins tie-breaks ("first path recorded
+    for each endpoint" and "first endpoint with max ic_count").  See the
+    docstring of the legacy detector's BFS loop below for the exact lines.
     """
     patterns: list[SubcircuitPattern] = []
     connectors = [
@@ -347,10 +374,18 @@ def _detect_signal_flow_chains(
                 continue
 
             # Get signal nets for current component (non-power).
+            # ``curr_nets`` and ``refs_on_net`` are ``set[str]`` — their
+            # iteration order depends on PYTHONHASHSEED.  We MUST sort them
+            # so the BFS tree grows in a fixed order; otherwise the
+            # first-wins ``next_ref not in found_endpoints`` rule below
+            # records different paths for the same endpoint across runs,
+            # and the strict-``>`` tie-break on ``ic_count`` then picks a
+            # different "best" chain.  This was the root cause of the
+            # hash-seed nondeterminism in signal-flow chain detection.
             curr_nets = ref_nets.get(curr_ref, set())
-            for net_name in curr_nets:
+            for net_name in sorted(curr_nets):
                 refs_on_net = net_refs.get(net_name, set())
-                for next_ref in refs_on_net:
+                for next_ref in sorted(refs_on_net):
                     if next_ref in visited:
                         continue
                     next_comp = ref_comp.get(next_ref)
@@ -371,8 +406,14 @@ def _detect_signal_flow_chains(
                         queue.append((next_ref, path + [next_ref], depth + 1))
 
         # Filter: keep chains with ≥ _MIN_CHAIN_ICS ICs, prefer more ICs.
+        # Iterate ``found_endpoints`` in sorted-endpoint order so that the
+        # strict-``>`` tie-break below is deterministic: when two endpoints
+        # tie on ``ic_count``, the lexicographically smaller ``end_ref`` wins.
+        # (Without this, the first-inserted endpoint wins, but insertion
+        # order depends on BFS traversal order, which previously leaked
+        # PYTHONHASHSEED noise via the unsorted set iterations above.)
         best_chain: tuple[str, list[str], int] | None = None  # (end_ref, path, ic_count)
-        for end_ref, chain_path in found_endpoints.items():
+        for end_ref, chain_path in sorted(found_endpoints.items()):
             if end_ref in used_refs:
                 continue
             ic_count = sum(

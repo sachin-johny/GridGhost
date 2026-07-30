@@ -94,6 +94,140 @@ if TYPE_CHECKING:
     from models.macro import Macro
 
 
+def _boundary_clamp_overlap_aware(
+    macros: list["Macro"],
+    bounds: tuple[float, float, float, float],
+    per_macro_keepout=None,
+) -> int:
+    """Like ``boundary_clamp`` but rolls back a macro's translation if it
+    would create a new overlap.
+
+    The plain ``boundary_clamp`` translates each macro independently to
+    pull it inside the per-macro keepout-shrunk bounds — with NO overlap
+    check. When ICs (keepout=5mm) and passives (keepout=0mm) share a
+    region, the clamp can yank an IC inward by up to 5mm and slam it
+    into a previously overlap-free cap, *creating* overlaps that SA had
+    just resolved.
+
+    This variant does the same per-macro translation, but BEFORE
+    accepting the move it checks whether the macro now overlaps any
+    other macro. If yes:
+      1. Try axis-only moves (dx-only or dy-only) — one axis may be
+         safe even when the combined move isn't.
+      2. If neither axis-only move is safe, try pushing the blocking
+         neighbor out of the way (a single push_apart call on just
+         the macro and its blocker), then retry the clamp.
+      3. If still no safe in-bounds position, fall back to the plain
+         clamp for THIS macro only — accept the overlap (the next
+         push_apart round in the caller will try to resolve it) rather
+         than leaving the macro OOB. A macro 0.5mm past the keepout
+         line AND overlapping a neighbor is strictly worse than a macro
+         in-bounds and overlapping — the latter is what push_apart is
+         designed to fix, the former is unfixable by push_apart.
+
+    A macro that stays OOB after this pass (only happens when the macro
+    is bigger than the keepout-shrunk bounds, i.e. genuinely too big
+    for the board) is reported in the failed count.
+    """
+    from place.legalizer import push_apart_overlapping
+
+    x_min, y_min, x_max, y_max = bounds
+    failed = 0
+    for m in macros:
+        if m.is_fixed:
+            continue
+        # Use GLOBAL bounds for the clamp, NOT keepout-shrunk bounds.
+        # The keepout enforcement is handled separately by the keepout
+        # loop in legalize(). This clamp's job is solely to ensure no
+        # macro is physically off the board — a hard placement invalidity.
+        # Using keepout-shrunk bounds here caused `failed` to be non-zero
+        # whenever an IC was inside the global bounds but within its
+        # keepout zone (a soft DFM concern, not a placement invalidity),
+        # which made the CLI exit 1 on valid placements.
+        bx_min = x_min
+        by_min = y_min
+        bx_max = x_max
+        by_max = y_max
+
+        bx1, by1, bx2, by2 = m.bbox
+        dx_left = bx_min - bx1
+        dx_right = bx_max - bx2
+        dy_top = by_min - by1
+        dy_bottom = by_max - by2
+
+        dx = 0.0
+        dy = 0.0
+        if dx_left > 0:
+            dx = dx_left
+        elif dx_right < 0:
+            dx = dx_right
+        if dy_top > 0:
+            dy = dy_top
+        elif dy_bottom < 0:
+            dy = dy_bottom
+
+        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            continue  # already in-bounds
+
+        macro_bounds = bounds
+
+        # Try the full (dx, dy) translation, then axis-only, then
+        # neighbor-push + retry, then fall back to plain clamp.
+        accepted = _try_clamp_no_overlap(m, dx, dy, macros, macro_bounds)
+        if not accepted and abs(dx) > 1e-9:
+            accepted = _try_clamp_no_overlap(m, dx, 0.0, macros, macro_bounds)
+        if not accepted and abs(dy) > 1e-9:
+            accepted = _try_clamp_no_overlap(m, 0.0, dy, macros, macro_bounds)
+
+        if not accepted:
+            # The clamp move would create an overlap on every axis combo.
+            # Try pushing the blocking neighbor out of the way, then retry.
+            # Use a single targeted push_apart pass — it's cheap and only
+            # resolves the immediate blocker, not a global re-optimization.
+            push_apart_overlapping(macros, bounds, max_passes=20)
+            accepted = _try_clamp_no_overlap(m, dx, dy, macros, macro_bounds)
+            if not accepted and abs(dx) > 1e-9:
+                accepted = _try_clamp_no_overlap(m, dx, 0.0, macros, macro_bounds)
+            if not accepted and abs(dy) > 1e-9:
+                accepted = _try_clamp_no_overlap(m, 0.0, dy, macros, macro_bounds)
+
+        if not accepted:
+            # All overlap-aware attempts failed. Leave the macro OOB —
+            # the caller's Tetris pass will jump it to a clear in-bounds
+            # slot. (Tetris now handles OOB macros too — see
+            # displace_to_clear_slots's _is_oob filter.)
+            #
+            # Do NOT fall back to plain clamp here: that would yank the
+            # macro into an overlap, which is the exact bug we're fixing.
+            # An OOB macro is recoverable by Tetris; an overlapping macro
+            # may or may not be recoverable (Tetris might not find a
+            # clear slot, leaving the overlap as residual).
+            failed += 1
+    return failed
+
+
+def _try_clamp_no_overlap(
+    m: "Macro",
+    dx: float,
+    dy: float,
+    macros: list["Macro"],
+    macro_bounds: tuple[float, float, float, float],
+) -> bool:
+    """Try translating ``m`` by (dx, dy); accept only if no new overlap.
+
+    Returns True if the move was accepted, False if it was rolled back
+    (either because ``translate`` rejected it on bounds grounds, or
+    because it created a new overlap).
+    """
+    snap = m._snapshot()
+    if not m.translate(dx, dy, bounds=macro_bounds):
+        return False
+    if any(m.overlaps(o) for o in macros if o is not m):
+        m._restore(snap)
+        return False
+    return True
+
+
 def sa_polish_legalize(
     model: "BoardModel",
     macros: list["Macro"],
@@ -185,11 +319,71 @@ def sa_polish_legalize(
     # probability"). A short, cheap push-apart pass mops that up,
     # starting from SA's already-largely-resolved layout rather than
     # the original packed starting position.
+    #
+    # CRITICAL: when SA reached 0 overlaps, DO NOT run push_apart here.
+    # push_apart is a greedy local heuristic — on a layout SA carefully
+    # balanced at 0 overlaps, it can find a "cheaper axis" push for one
+    # pair that cascades into new overlaps with a third macro. Measured
+    # on th_sensor seed=42: SA finished at 0, push_apart created 1
+    # (TP11↔U7), which boundary_clamp then locked in. The fix is to
+    # skip the greedy cleanup entirely when SA already converged.
     if after_sa > 0:
         push_apart_overlapping(macros, bounds, max_passes=100)
 
-    failed = boundary_clamp(macros, bounds, per_macro_keepout=per_macro_keepout)
+    # Use the overlap-aware boundary clamp: it translates each macro
+    # inside its keepout-shrunk bounds but ROLLS BACK the translation
+    # if it would create a new overlap. The plain boundary_clamp can
+    # yank an IC inward by up to 5mm and slam it into a previously
+    # overlap-free cap, *creating* overlaps that SA had just resolved.
+    # Measured on test4 seed=0: SA finished at 0, plain boundary_clamp
+    # produced 4 (D3↔TP1, C86↔C28, C86↔R3, C80↔U1); the recovery
+    # branch below only fires when residual_after > after_sa, but
+    # `after_sa` was 0 so 4 > 0 fired the recovery — which ran
+    # push_apart + force_spread + push_apart + boundary_clamp AGAIN,
+    # and the second boundary_clamp re-created the same overlaps.
+    # The overlap-aware clamp breaks that loop at the source.
+    failed = _boundary_clamp_overlap_aware(
+        macros, bounds, per_macro_keepout=per_macro_keepout,
+    )
     residual_after = _count_residual_overlaps(macros)
+
+    # If the overlap-aware clamp left macros OOB (failed > 0) or created
+    # overlaps (residual_after > 0), run push_apart + force_spread +
+    # Tetris as recovery. Tetris is especially important here: it jumps
+    # OOB macros to clear in-bounds slots (the overlap-aware clamp
+    # deliberately leaves them OOB rather than overlap, expecting Tetris
+    # to clean up).
+    if failed > 0 or residual_after > 0:
+        push_apart_overlapping(macros, bounds, max_passes=200)
+        new_residual = _count_residual_overlaps(macros)
+        if new_residual > 0:
+            try:
+                from place.legalizer import force_spread_overlapping
+                force_spread_overlapping(macros, bounds, max_passes=50, step_size=2.0)
+                push_apart_overlapping(macros, bounds, max_passes=200)
+            except ImportError:
+                pass
+        # Tetris fallback — jump stuck/OOB macros to the nearest clear
+        # in-bounds slot. SA-polish can leave a macro boxed in by
+        # neighbors the clamp repositioned; push_apart and force_spread
+        # are LOCAL heuristics that can't escape, but Tetris takes a
+        # global view and jumps the macro out. Also handles OOB macros
+        # (see _is_oob in displace_to_clear_slots).
+        try:
+            from place.legalizer import displace_to_clear_slots
+            displace_to_clear_slots(
+                macros, bounds, grid_mm=1.0,
+                per_macro_keepout=per_macro_keepout,
+            )
+        except ImportError:
+            pass
+        # Final clamp — necessary because push_apart/force_spread/Tetris
+        # may have left a macro slightly OOB. Use overlap-aware again
+        # so this final clamp doesn't re-introduce the problem.
+        failed = _boundary_clamp_overlap_aware(
+            macros, bounds, per_macro_keepout=per_macro_keepout,
+        )
+        residual_after = _count_residual_overlaps(macros)
 
     if verbose:
         print(

@@ -41,13 +41,14 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-os.environ["PYTHONHASHSEED"] = "0"
-os.environ["GRIDGHOST_HASH_SEEDED"] = "1"
-
 # This harness prints ✓/✗ glyphs. On Windows the default console codec
 # (cp1252) can't encode them and print() would raise UnicodeEncodeError.
 # Force UTF-8 on stdout/stderr (PYTHONUTF8 in env is read at startup by
 # run_all.py's subprocess; this reconfigure covers a direct standalone run).
+#
+# NOTE: the previous PYTHONHASHSEED=0 crutch has been removed — the
+# engine/subcircuit_patterns.py set-iteration fix makes the codebase
+# deterministic without forcing a hash seed.
 for _stream in (sys.stdout, sys.stderr):
     _reconfigure = getattr(_stream, "reconfigure", None)
     if _reconfigure is not None:

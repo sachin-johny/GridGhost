@@ -23,17 +23,6 @@ from __future__ import annotations
 import os
 import sys
 
-# ─── Determinism: set PYTHONHASHSEED BEFORE any imports that cache hash
-# values (engine modules build sets at import time). Without this, set/dict
-# iteration order changes every run, producing different placements even
-# with seed=42. Mirrors the re-exec mechanism in gridghost.py.
-if (not os.environ.get("PYTHONHASHSEED")
-        and not os.environ.get("GRIDGHOST_NO_HASH_SEED")
-        and os.environ.get("GRIDGHOST_HASH_SEEDED") != "1"):
-    os.environ["PYTHONHASHSEED"] = "0"
-    os.environ["GRIDGHOST_HASH_SEEDED"] = "1"
-    os.execv(sys.executable, [sys.executable] + sys.argv)
-
 import argparse
 import math
 import random

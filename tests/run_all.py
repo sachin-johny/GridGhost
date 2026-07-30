@@ -56,25 +56,18 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-# ─── Determinism: set PYTHONHASHSEED BEFORE any imports that cache hash ──
-# values. Mirrors gridghost.py's re-exec mechanism.
-#
-# Also force UTF-8 mode: this script prints ✓/✗/⚠/→ glyphs, which the
+# Force UTF-8 mode: this script prints ✓/✗/⚠/→ glyphs, which the
 # Windows default console codec (cp1252) cannot encode and would crash on
 # (UnicodeEncodeError). PYTHONUTF8 is read at interpreter startup, so it
-# must be set BEFORE the os.execv re-exec AND in the env of every spawned
-# subprocess — setting it in os.environ here accomplishes both (the
-# execv'd process inherits os.environ, and subprocess.run's
-# env=os.environ.copy() does too). The explicit stdout/stderr reconfigure
-# below additionally covers the current process when the re-exec is
-# skipped (e.g. when PYTHONHASHSEED is already set).
+# must be set BEFORE any imports / subprocess spawning — setting it in
+# os.environ here is inherited by every subprocess.run's
+# env=os.environ.copy(). The explicit stdout/stderr reconfigure below
+# additionally covers the current process.
+#
+# NOTE: the previous PYTHONHASHSEED=0 re-exec crutch has been removed —
+# the engine/subcircuit_patterns.py set-iteration fix makes the codebase
+# deterministic without forcing a hash seed.
 os.environ.setdefault("PYTHONUTF8", "1")
-if (not os.environ.get("PYTHONHASHSEED")
-        and not os.environ.get("GRIDGHOST_NO_HASH_SEED")
-        and os.environ.get("GRIDGHOST_HASH_SEEDED") != "1"):
-    os.environ["PYTHONHASHSEED"] = "0"
-    os.environ["GRIDGHOST_HASH_SEEDED"] = "1"
-    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 for _stream in (sys.stdout, sys.stderr):
     _reconfigure = getattr(_stream, "reconfigure", None)
@@ -460,8 +453,6 @@ def run_cli_smoke(boards: list[Path], output_dir: Path, seed: int = 42) -> dict:
             "--seed", str(seed),
         ]
         env = os.environ.copy()
-        env["PYTHONHASHSEED"] = "0"
-        env["GRIDGHOST_HASH_SEEDED"] = "1"
         try:
             with open(log_path, "w") as f:
                 proc = subprocess.run(
@@ -507,8 +498,6 @@ def run_overlap_regression(output_dir: Path) -> dict:
     log_path = output_dir / "overlap_regression.log"
     cmd = [sys.executable, str(ROOT / "tests" / "test_overlap_regression.py")]
     env = os.environ.copy()
-    env["PYTHONHASHSEED"] = "0"
-    env["GRIDGHOST_HASH_SEEDED"] = "1"
 
     try:
         with open(log_path, "w") as f:
