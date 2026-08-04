@@ -44,43 +44,57 @@ Skips grid re-snapping after (matching the existing push-apart /
 force-spread / Tetris passes, none of which preserve grid alignment
 either — that's an existing, unrelated soft target in this pipeline).
 
-MEASURED RESULT (seed=42, six bundled test boards), final config —
+MEASURED RESULT (seed=42, six bundled test boards), current config —
 staged beta ramp (4 stages, beta 60→800 geometric, window 5mm→0.2mm)
 + overlap-biased move selection, vs. the default greedy heuristic:
 
-    board       heuristic          sa_polish
-    test4       0 ovl, hpwl 1870.8 1 ovl,  hpwl 1823.0 (close, not quite)
-    cbb         0 ovl, hpwl 4095.9 0 ovl,  hpwl 4048.6  <- wins
-    cbbwO       0 ovl, hpwl 4216.7 0 ovl,  hpwl 4165.9  <- wins
-    test5       0 ovl, hpwl  444.8 0 ovl,  hpwl  427.7  <- wins
-    test6       5 ovl, area  8.3   5 ovl,  area 24.2    <- loses
-    th_sensor   0 ovl, hpwl  156.1 0 ovl,  hpwl  156.4  <- near-tie
+    board       heuristic              sa_polish
+    test4       0 ovl, hpwl 2328.9     0 ovl, hpwl 2099.2   <- wins
+    test5       0 ovl, hpwl  461.8     0 ovl, hpwl  476.5   <- loses (slight)
+    test6       0 ovl, hpwl 2547.3     0 ovl, hpwl 2577.1   <- loses (slight)
+    cbb         0 ovl, hpwl 4074.7     0 ovl, hpwl 3981.5   <- wins
+    cbbwO       0 ovl, hpwl 4412.0     0 ovl, hpwl 4254.8   <- wins
+    th_sensor   0 ovl, hpwl  157.0     0 ovl, hpwl  154.2   <- wins (marginal)
 
-Three outright wins (better HPWL, still overlap-free) is a real result
-— a single fixed high beta (the first version tried) never beat the
-heuristic on ANY board; ramping beta instead of fixing it, plus
-spending the move budget on the macros actually in conflict, closed
-most of that gap. But it did NOT solve the board this was originally
-aimed at (test6 — the board with residual overlaps that motivated all
-three attempts in the first place): same overlap COUNT as the
-heuristic, worse overlap AREA/HPWL. Scaling the iteration budget with
-macro count was tried as a follow-up (larger boards get a fixed 4000
-iterations same as small ones, which seemed likely to matter) — it
-did NOT produce a reliable improvement. Three different iteration-
-budget formulas produced three different winners/losers across
-test4/th_sensor with no clear monotonic trend, which is a sign of
+Headline change vs. the numbers this docstring used to carry: BOTH
+legalizers are now overlap-free on every bundled board, including
+test6 — the board whose residual overlaps motivated this module in the
+first place (the old table showed 5 residual overlaps for test6 under
+BOTH strategies). That fix did not come from sa_polish itself: the
+overlap-aware boundary clamp (``_boundary_clamp_overlap_aware`` below,
+commit "overlap-aware boundary clamp...") replaced the plain
+``boundary_clamp`` that used to translate a macro inside its keepout-
+shrunk zone with NO overlap check — yanking an IC onto a neighbor and
+reintroducing overlaps SA had just resolved. It is wired into BOTH the
+heuristic and the sa_polish strategy branches, so the keepout-induced
+overlap regression that once made sa_polish lose test4 (1 residual
+overlap) and lose test6 badly (worse overlap area, 24.2 vs 8.3) no
+longer occurs for either strategy.
+
+With overlaps tied at 0 everywhere, what's left to compare is HPWL:
+sa_polish wins 4/6 (test4, cbb, cbbwO, th_sensor) and loses narrowly
+on 2/6 (test5 ~3%, test6 ~1%) — a net win, not a sweep. Ramping beta
+across stages instead of fixing it high, plus concentrating the move
+budget on the macros actually in conflict, is what closed the gap a
+single fixed high beta (the first version tried, which never beat the
+heuristic on any board) could not.
+
+Scaling the iteration budget with macro count was tried as a separate
+follow-up — it did NOT produce a reliable improvement. Three different
+iteration-budget formulas produced three different winners/losers
+across test4/th_sensor with no clear monotonic trend, a sign of
 fitting stochastic noise on 6 boards rather than a real effect, so the
 fixed iteration count was kept rather than chase that further.
 
-Net honest assessment: this is the best of the three attempts (plain
-greedy, abacus bridge, single-shot SA-polish, staged SA-polish) and
-demonstrates the original diagnosis was right — search strategy, not
-algorithm family, was the lever that mattered. But it's still not a
-strict win: default legalizer stays ``heuristic`` unless/until this
-also closes the gap on the board it was built to fix. Available via
-``--legalizer sa_polish`` for comparison and further work — e.g. a
-proper multi-seed statistical comparison instead of single-seed
-numbers, before trusting any further tuning on top of this.
+Net honest assessment: search strategy (not algorithm family) was the
+lever that mattered, and the shared overlap-aware clamp closed the
+correctness gap this module was built to fix. sa_polish is a net HPWL
+win over the heuristic at seed=42 but not a strict one. It has NOT
+been re-run across multiple seeds: the suite has pre-existing seed
+sensitivity (see ``AGENT_NOTES.md``), so this single-seed result is
+not the multi-seed statistical comparison needed before trusting
+further tuning on top of it. Available via ``--legalizer sa_polish``;
+default legalizer stays ``heuristic`` pending that broader comparison.
 """
 
 from __future__ import annotations

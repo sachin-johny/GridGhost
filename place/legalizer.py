@@ -779,11 +779,12 @@ def legalize(
       simulated-annealing pass (``place/sa_polish.py``, beta ramp +
       overlap-biased move selection) instead of greedy descent. SA's
       accept-temporarily-worse-moves criterion is the local-minima
-      escape greedy descent lacks. MEASURED: the best of the three
-      strategies tried — wins outright on 3/6 boards (better HPWL,
-      still overlap-free), near-ties on 1/6 — but still doesn't beat
-      the heuristic on the board this was built to fix (test6: same
-      overlap count, worse area). See ``place/sa_polish.py`` docstring.
+      escape greedy descent lacks. MEASURED (seed=42, post overlap-aware-
+      clamp fix): overlap-free on every bundled board — the overlap-aware
+      clamp now shared by all three strategies closed the test6 residual-
+      overlap gap this was built to fix. A net HPWL win over the heuristic
+      on 4/6 boards (test4, cbb, cbbwO, th_sensor), narrowly behind on
+      2/6 (test5, test6). See ``place/sa_polish.py`` docstring.
 
     Whichever strategy runs, keepout enforcement and the Tetris
     "displace to clear slot" fallback further down still run — none of
