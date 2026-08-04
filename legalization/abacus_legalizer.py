@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import math
 from models.board_model import BoardModel, Component, BoardOutline
-from engine.group_moves import propagate_ic_delta
 
 
 def abacus_legalize(
@@ -143,8 +142,6 @@ def _hpwl_y_delta_for_comp(
         if old_y_max > old_y_min:
             total_delta += (new_y_max - new_y_min) - (old_y_max - old_y_min)
     return total_delta
-
-
 
 
 def _assign_rows(

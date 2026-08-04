@@ -11,15 +11,11 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from models.board_model import BoardModel
 from engine.cost_state import CostState, OVERLAP_WEIGHT, OVERLAP_COUNT_WEIGHT, BOUNDARY_WEIGHT, CONSTRAINT_WEIGHT
-from engine.moves import (
-    select_move_type, get_moveable_indices,
-    do_translate, do_swap, do_rotate, do_median,
-    revert_move, affected_indices, MoveUndo,
-)
+from engine.moves import select_move_type, get_moveable_indices, do_translate, do_swap, do_rotate, do_median, revert_move, affected_indices
 from engine.congestion import rudy_congestion_penalty, rudy_gradient_for_comp
 from engine.group_moves import get_group_indices, apply_delta_with_clamp
 
@@ -1054,147 +1050,6 @@ def _greedy_swap_refine(
     if cost_state.normalized_cost > best_swap_cost:
         _restore_positions(model, best_positions)
         cost_state._compute_all()
-
-
-def _resolve_overlaps_greedy(
-    model: BoardModel,
-    cost_state: CostState,
-    moveable_indices: list[int],
-    config: SAConfig,
-) -> None:
-    """Force-resolve remaining overlaps after greedy refinement.
-
-    v11: Added overlap-aware moves — check if resolving one overlap
-    creates new overlaps with other components, and choose the move
-    that minimizes total overlap count.
-    """
-    cost_state.update_penalty_scale(1.0)
-    board = model.board
-    directions = [(1, 0), (-1, 0), (0, 1), (0, -1),
-                  (1, 1), (-1, 1), (1, -1), (-1, -1)]
-    nudge_dists = [0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0]
-    moveable_set = set(moveable_indices)
-
-    prev_overlaps = cost_state.overlap_count
-    for outer in range(15):  # max 15 outer iterations
-        overlaps = cost_state.overlap_count
-        if overlaps == 0:
-            break
-
-        # Identify overlapping component pairs
-        overlap_pairs = []
-        for (i, j), penalty in cost_state._pair_overlaps.items():
-            if penalty > 0:
-                overlap_pairs.append((i, j))
-
-        # Sort by overlap area (smallest first — easier to resolve)
-        pair_areas = []
-        for i, j in overlap_pairs:
-            c1 = model.components[i]
-            c2 = model.components[j]
-            area = c1.overlap_area(c2)
-            pair_areas.append((area, i, j))
-        pair_areas.sort()
-
-        for area, i, j in pair_areas:
-            if cost_state.overlap_count == 0:
-                break
-
-            c1 = model.components[i]
-            c2 = model.components[j]
-            c1_movable = i in moveable_set
-            c2_movable = j in moveable_set
-
-            best_overlap = cost_state.overlap_count
-            best_action = None  # ('single', idx, x, y) or ('pair', i, j, x1, y1, x2, y2)
-
-            # Strategy 1: try moving each component individually
-            for idx, is_movable in [(i, c1_movable), (j, c2_movable)]:
-                if not is_movable:
-                    continue
-                comp = model.components[idx]
-                for dx_dir, dy_dir in directions:
-                    for dist in nudge_dists:
-                        old_x, old_y = comp.x, comp.y
-                        comp.x += dx_dir * dist
-                        comp.y += dy_dir * dist
-                        cost_state.incremental_update({idx})
-
-                        if cost_state.overlap_count < best_overlap:
-                            best_overlap = cost_state.overlap_count
-                            best_action = ('single', idx, comp.x, comp.y)
-
-                        comp.x = old_x
-                        comp.y = old_y
-                        cost_state.incremental_update({idx})
-
-            # Strategy 2: push both components apart simultaneously
-            if c1_movable and c2_movable:
-                dx_sign = 1 if c2.x >= c1.x else -1
-                dy_sign = 1 if c2.y >= c1.y else -1
-                for dist in nudge_dists:
-                    old_x1, old_y1 = c1.x, c1.y
-                    old_x2, old_y2 = c2.x, c2.y
-                    c1.x -= dx_sign * dist * 0.5
-                    c1.y -= dy_sign * dist * 0.5
-                    c2.x += dx_sign * dist * 0.5
-                    c2.y += dy_sign * dist * 0.5
-                    cost_state.incremental_update({i, j})
-
-                    if cost_state.overlap_count < best_overlap:
-                        best_overlap = cost_state.overlap_count
-                        best_action = ('pair', i, j, c1.x, c1.y, c2.x, c2.y)
-
-                    c1.x, c1.y = old_x1, old_y1
-                    c2.x, c2.y = old_x2, old_y2
-                    cost_state.incremental_update({i, j})
-
-            # Apply the best overlap-reducing action
-            if best_action is not None and best_overlap < cost_state.overlap_count:
-                if best_action[0] == 'single':
-                    _, idx, nx, ny = best_action
-                    model.components[idx].x = nx
-                    model.components[idx].y = ny
-                    cost_state.incremental_update({idx})
-                elif best_action[0] == 'pair':
-                    _, ci, cj, x1, y1, x2, y2 = best_action
-                    model.components[ci].x = x1
-                    model.components[ci].y = y1
-                    model.components[cj].x = x2
-                    model.components[cj].y = y2
-                    cost_state.incremental_update({ci, cj})
-
-        overlaps_now = cost_state.overlap_count
-        if config.verbose:
-            print(f"    Overlap resolve pass {outer + 1}: overlaps={overlaps_now} "
-                  f"(was {prev_overlaps}, resolved {prev_overlaps - overlaps_now})")
-
-        if overlaps_now >= prev_overlaps:
-            # No progress — break to avoid infinite loop
-            break
-        prev_overlaps = overlaps_now
-
-    # Clamp to board bounds after overlap resolution
-    # v11: Don't blindly clamp — check if clamping creates new overlaps.
-    # Only clamp if it doesn't increase the overlap count.
-    prev_overlaps = cost_state.overlap_count
-    for idx in moveable_indices:
-        comp = model.components[idx]
-        half_w = comp.effective_width / 2.0
-        half_h = comp.effective_height / 2.0
-        new_x = max(board.x_min + half_w, min(comp.x, board.x_max - half_w))
-        new_y = max(board.y_min + half_h, min(comp.y, board.y_max - half_h))
-        if new_x != comp.x or new_y != comp.y:
-            old_x, old_y = comp.x, comp.y
-            comp.x = new_x
-            comp.y = new_y
-            cost_state.incremental_update({idx})
-            # If clamping created new overlaps, undo
-            if cost_state.overlap_count > prev_overlaps:
-                comp.x = old_x
-                comp.y = old_y
-                cost_state.incremental_update({idx})
-    cost_state._compute_all()
 
 
 def simulate_annealing(

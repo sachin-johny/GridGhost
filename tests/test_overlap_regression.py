@@ -34,7 +34,6 @@ from __future__ import annotations
 # Prevent pytest from collecting this module's main() as a test.
 # It's a standalone harness invoked via `python tests/test_overlap_regression.py`
 # or by tests/run_all.py's overlap-regression phase.
-import os
 import sys
 from pathlib import Path
 

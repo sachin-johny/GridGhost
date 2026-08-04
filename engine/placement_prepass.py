@@ -8,7 +8,6 @@ to drag caps into position.
 
 from __future__ import annotations
 
-import math
 
 from models.board_model import BoardModel
 from profiles.board_profiles import ConstraintRule

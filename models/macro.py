@@ -21,8 +21,7 @@ for large ICs: for any IC whose effective half-extent + cap half-extent
 exceeds 8mm (e.g. a 12.6mm ESP32: 6.3 + 1.7 = 8.0), every fan slot was
 rejected and find_cap_offset collapsed every cap onto the last-resort
 slot *inside* the leader, producing a complete pairwise-overlap cluster
-(the test4 U30 cluster: 28 overlaps from 7 caps). See
-tests/debug/diag_u30_macro.py.
+(the test4 U30 cluster: 28 overlaps from 7 caps).
 """
 
 from __future__ import annotations

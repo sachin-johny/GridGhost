@@ -1,33 +1,39 @@
 # GridGhost
 
-External PCB auto-placement optimization engine for KiCad. Separates data extraction from optimization for better performance and flexibility.
+External PCB auto-placement engine for KiCad. Data is extracted from a `.kicad_pcb`
+once, optimized completely outside the editor, then written back.
 
-## Project Status (Current: Phase 6 Complete)
+> See [README.md](README.md) for the full feature list, pipeline diagram, cost
+> function, and macro model. This file is concise context for an AI assistant:
+> current state, where things live, the real CLI, and the load-bearing invariants.
 
-**Last Updated:** 2026-05-07
+## Project Status (Current)
 
-### What Works
-- Full pipeline end-to-end: extraction → net clustering → placement → SA optimization → legalization → result saving
-- KiCad .kicad_pcb parsing and JSON round-trip support
-- HPWL-based placement cost with overlap, boundary, and constraint penalties
-- Grid and force-directed placement with cluster-aware seeding and edge-aware connector handling
-- Simulated Annealing engine (ported from CadMust-Neo): adaptive cooling, reheating, move operators, greedy refinement
-- Rotation-aware component dimensions and bbox computation
-- Incremental cost computation O(k) for SA performance
-- Power net auto-detection and HPWL exclusion
-- 42 tests passing, 0 failures (27 Phase 1 + 15 Phase 6)
-- `th_sensor.kicad_pcb` dry-run: 0 overlaps, 0 out-of-bounds
-- Larger `cbb.kicad_pcb` now completes placement pipeline
+**Last Updated:** 2026-08-04
 
-### Next Improvements (High Priority)
-- Test SA optimization on real boards and compare HPWL with/without SA
-- Tune SA parameters (iterations, reheat, cooling) for different board sizes
-- Polygon boundary support and keepout zones
+- Full pipeline end-to-end: extract → cap classification/assignment → build macros →
+  connector perimeter → net-aware initial placement → macro SA → iterative legalization → save.
+- **Two pipelines coexist** (mid-refactor):
+  - **Macro-first `place_v2`** (`place/pipeline.py`) — **default**. An IC + its decoupling
+    caps move as one rigid `Macro` through every stage. Reached via the `place` command
+    (`--macro-v2` is on by default).
+  - **Legacy grid pipeline** (`engine/smart_placement.py` + `engine/annealer.py`) —
+    retained behind `--no-macro-v2` for A/B comparison. Still functional.
+- **152 tests across 11 files** (`python -m pytest tests/`). `test_phase1.py` (81 tests)
+  covers the legacy engine + data model; the rest cover the macro pipeline. `test_overlap_regression.py`
+  is currently disabled (0 collected).
+- Bundled boards run clean: `th_sensor.kicad_pcb` (0 overlaps, 0 OOB); larger `cbb.kicad_pcb`
+  completes the pipeline.
+
+### Next Improvements
+- Tune SA budget/cooling per board size (iterations already scale as `max(1500, 25×N)`).
+- Polygon board outline + keepout zone support (currently rectangular outlines only).
+- Improve dense-board legalization (residual overlaps on very dense boards).
 
 ### Known Issues
-- Dense boards still benefit from tuning (pipeline works but placement not optimal)
-- Legalization can increase wirelength (small regression accepted for legal placement)
-- SA on very small test boards can cause boundary penalty spikes
+- Dense boards still benefit from SA/legalizer tuning (pipeline runs, placement not always optimal).
+- Legalization can regress wirelength slightly to reach a legal (overlap-free) placement.
+- Abacus legalizer (`--legalizer abacus`) is worse than the default heuristic on every bundled board — kept for comparison only (see `place/abacus_bridge.py` docstring).
 
 ---
 
@@ -36,173 +42,141 @@ External PCB auto-placement optimization engine for KiCad. Separates data extrac
 ```
 KiCad .kicad_pcb
        ↓
-    [parsers] → BoardModel (JSON intermediate)
+  [parsers] → BoardModel (JSON intermediate)
        ↓
-    [profiles] → Board profile selection
+  [assign] → classify + assign decoupling caps to ICs
        ↓
-    [engine] → Optimization (clustering + grid placement)
+  [place/pipeline] → build rigid Macros → connectors → initial → SA → legalize
        ↓
-    [legalization] → Grid snap, overlap resolve, boundary clamp
-       ↓
- Updated .kicad_pcb
+  Updated .kicad_pcb  (+ placed-model JSON + positions JSON)
 ```
 
-**Key Design:** External optimization vs KiCad API integration - data extracted once, optimized completely outside, then applied back.
+**Key design:** external optimization vs KiCad API integration — extract once, optimize
+fully outside, apply back.
 
----
-
-## Directory Structure
+## Directory Structure (current)
 
 ```
 auto_placer/
-├── __init__.py          # Package init, version 0.1.0
-├── gridghost.py        # CLI entry point (place/extract/profiles commands)
-├── models/
-│   └── board_model.py   # Core data models: BoardModel, Component, Net, Pad, BoardOutline
-│                        # All coordinates in mm. bbox/overlaps/effective dimensions included.
-├── parsers/
-│   ├── kicad_parser.py  # S-expression .kicad_pcb parser with net ID→name resolution
-│   └── placement_writer.py  # Write placements back to .kicad_pcb, export positions JSON
-├── engine/
-│   ├── net_clustering.py    # Hypergraph clustering, seed positions, greedy/Louvain
-│   ├── cost_function.py     # HPWL (clique/star), overlap/boundary penalties
-│   ├── cost_state.py        # Incremental cost computation O(k) for SA, power net exclusion
-│   ├── moves.py             # SA move operators: translate, swap, rotate, median
-│   ├── annealer.py          # Simulated Annealing engine with adaptive cooling & reheating
-│   └── grid_placement.py    # Grid, force-directed, and shelf-packing placement algorithms
-├── legalization/
-│   └── legalizer.py         # Grid snap, boundary clamp, overlap resolution
-├── profiles/
-│   └── board_profiles.py    # 5 profiles: mcu_peripheral, power_supply, rf_frontend,
-│                            # mixed_signal, generic (cost weights + constraint rules)
-├── utils/
-│   └── display.py       # CLI formatting utilities
-├── samples/
-│   └── sample_board.py  # Sample MCU peripheral board (18 components, 11 nets)
-├── tests/
-│   └── test_phase1.py   # 42 tests (27 Phase 1 + 15 Phase 6)
-├── CLAUDE.md           # This file - project context for Claude
-├── README.md           # Detailed architecture and design docs
-├── auto_placer_plan.md # Development phases and implementation plan
-└── milestone.md        # Current milestone summary
+├── gridghost.py            # CLI entry point (place / extract / profiles)
+├── config.py / config.json # Typed config + defaults
+├── models/                 # board_model.py (BoardModel, Component, Net, Pad, BoardOutline),
+│                           #   macro.py (Macro: leader + rigid followers)
+├── parsers/                # kicad_parser.py, placement_writer.py
+├── assign/assign_caps.py   # Cap classification (decoupling/bulk/coupling) + IC assignment
+├── cost/                   # cost.py (α·HPWL + β·overlap + γ·boundary), chains.py, incremental.py
+├── place/                  # Macro-first pipeline:
+│                           #   pipeline.py, initial.py, connectors.py, cluster.py,
+│                           #   sa.py, sa_polish.py, legalizer.py, abacus_bridge.py
+├── engine/                 # Shared modules (net_clustering, cost_state, congestion,
+│                           #   constraint_evaluator, group_moves, subcircuit_patterns,
+│                           #   _pure_graph) + legacy-only (cost_function, moves, annealer,
+│                           #   grid_placement, quadratic_placement, placement_prepass, smart_placement)
+├── legalization/           # legalizer.py (component-level), abacus_legalizer.py,
+│                           #   post_legalize.py, spatial_grid.py
+├── profiles/board_profiles.py  # Cost weights + constraint rules per board type
+├── utils/                  # courtyard.py, density.py, display.py
+├── samples/sample_board.py # 18-component MCU peripheral sample board
+└── tests/                  # test_*.py + run_all/dashboard/visualizer harness + test_pcbs/
 ```
 
----
+> `engine/` is split: **shared** modules are imported by both pipelines (clustering,
+> incremental cost, congestion, constraint eval); **legacy-only** modules serve only
+> the `--no-macro-v2` path. Don't assume all of `engine/` is dead — check imports.
 
 ## Core Concepts
 
-### Cost Function
-Total Cost = α·HPWL + β·Overlap + γ·Boundary + δ·Constraints
+### Cost Function (macro pipeline)
+`Total Cost = α·HPWL + β·Overlap + γ·Boundary`
+- **HPWL** — Half-perimeter wirelength over all nets. **Power/ground nets are included**
+  (key change vs legacy) — caps share rails with their IC, so power-net HPWL is the
+  gradient signal keeping caps near their assigned IC during SA.
+- **Overlap** — sum of pairwise macro bbox intersection areas (macros = rigid union bboxes).
+- **Boundary** — linear distance penalty for bboxes outside the outline; edge connectors (intentional overhang) excluded.
 
-- **HPWL**: Half-perimeter wirelength - clique model (≤4 pins), star model (>4 pins)
-- **Overlap**: Component courtyard intersections
-- **Boundary**: Components outside board outline
-- **Constraints**: Decoupling caps near power pins, crystals near MCU, connectors on edges
+The legacy path additionally applies a **δ·Constraints** term via `engine/cost_function.py`
++ `engine/constraint_evaluator.py` (decoupling proximity, crystal-MCU, thermal, etc.).
 
-### Board Profiles
-Cost weights and rule priorities pre-configured per board type:
-
-| Profile | Focus | Key Rules |
-|---------|-------|-----------|
-| `mcu_peripheral` | HPWL | Decoupling ≤0.5mm, crystal proximity |
-| `power_supply` | Thermal | High-current grouping, bulk cap input |
-| `rf_frontend` | Symmetry | Antenna keepout, A/D separation |
-| `mixed_signal` | Partition | Hard analog/digital boundary |
-| `generic` | Balanced | No specific rules |
+### Macro Model
+A `Macro` = a leader component + rigidly-attached follower caps. Follower offsets are fixed
+at construction (`find_cap_offset`, 8-direction fan bounded by `MAX_CAP_IC_GAP_MM = 4.0` mm
+**edge-to-edge** gap). Translating/rotating the leader applies the same rigid transform to
+followers, so the cap-IC gap can never grow at runtime. SA moves and the legalizer treat
+macros as opaque rigid bodies.
 
 ### Component Types
-`ic`, `capacitor`, `resistor`, `connector`, `crystal`, `generic` - affects placement heuristics and spacing.
+`ic`, `capacitor`, `resistor`, `connector`, `crystal`, `generic` — drive placement heuristics,
+spacing, and edge-connector detection (`is_edge_connector`).
 
 ### Coordinate System
-- Internal: millimeters (float)
-- KiCad: nanometers (int) - conversion via `mm * 1e6`
-- Grid: default 0.1mm for legalization
+- Internal: millimeters (float). KiCad file: mm (6 decimals = µm).
+- Legalization grid: default 0.5 mm (`config.json` `legalization.grid_mm`), via `--grid-mm`.
+- Rotation: KiCad clockwise-positive; pad `(at ...)` rotated with `cos/sin` (negated sin for CW).
 
 ---
 
 ## CLI Usage
 
 ```bash
-python gridghost.py place <input.kicad_pcb> [options]
-  -a, --algorithm     # grid (default) | force-directed
-  -p, --profile       # Board profile (default: auto — mcu_peripheral if ICs detected, else generic)
-  -m, --margin        # Board edge margin mm (default: from config, else 5.0)
-  --dry-run           # Don't write PCB file
-  --interactive       # Interactive profile weight tuning
-  --no-sa             # Disable SA (SA is ON by default; auto-disables on ≤6 or ≥50 comps)
-  --sa-iterations N   # Max SA temperature steps (default: from config.json = 300)
-  --sa-reheat N       # Number of SA reheat rounds (default: from config.json = 3)
-
-python gridghost.py extract <input.kicad_pcb> [-o output.json]
+python gridghost.py place <input.kicad_pcb> [options]   # auto-place (macro-v2 default)
+python gridghost.py extract <input.kicad_pcb> [-o out.json]
 python gridghost.py profiles
 ```
 
----
+Key `place` options (defaults come from `config.json`; see README for the full table):
 
-## Key Data Model Details
-
-**Component:** ref, footprint, value, x, y, rotation, layer, width, height, courtyard_margin (0.25mm), pads, nets, is_fixed, component_type
-
-**bbox property:** Returns (x_min, y_min, x_max, y_max) including courtyard
-**overlaps(other):** Boolean check for courtyard intersection
-**overlap_area(other):** Float area of intersection
-
-**BoardModel:** board outline, components list, nets list, source_file
-- Helpers: get_component(), get_net(), nets_for_component(), components_on_net()
-- Serialization: to_json(), from_json(), to_dict(), from_dict()
-- stats(): Summary with overlap counts, out-of-bounds, etc.
-
----
-
-## Testing
-
-**Test File:** `tests/test_phase1.py` - 27 tests covering all Phase 1 functionality
-**Samples:** `samples/sample_board.py` - 18 component MCU peripheral board
-
-**Metrics to Track:**
-- Total wirelength (HPWL)
-- Number of overlaps (pre/post legalization)
-- Constraint violations per rule
-- Out-of-bounds components
-- Visual inspection in KiCad
+| Flag | Default | Notes |
+|------|---------|-------|
+| `-p/--profile` | `auto` | `auto` → `mcu_peripheral` if ICs detected, else `generic` |
+| `-m/--margin` | `5.0` | `placement.margin` |
+| `--grid-mm` | `0.5` | `legalization.grid_mm` |
+| `--sa-iterations` | `max(1500, 25×N)` | scales with macro count |
+| `--sa-reheat` | `3` | `annealer.reheat_count` |
+| `--alpha/--beta/--gamma` | `1.0 / 25.0 / 8.0` | macro-v2 cost weights |
+| `--seed` | `42` | SA/placement RNG seed (`--seed 0` = non-deterministic) |
+| `--rudy-weight` | `0.0` | RUDY congestion penalty in SA cost (0 = off) |
+| `--legalizer` | `heuristic` | one of `heuristic` / `abacus` / `sa_polish` |
+| `--connector-mating-margin` | `5.0` | edge offset for perimeter connectors |
+| `--macro-v2/--no-macro-v2` | on | toggle pipeline (`--no-macro-v2` = legacy grid) |
+| `--dry-run` / `--debug-bbox` / `-v` | off | skip PCB write / draw bboxes / verbose cost |
 
 ---
 
-## Development Phases (Reference)
+## Key Data Model
 
-| Phase | Status | Key Output |
-|-------|--------|------------|
-| 0 | ✅ | Extraction, JSON round-trip |
-| 1 | ✅ | Net clustering + grid placement |
-| 2 | ✅ | HPWL + overlap + boundary cost |
-| 3 | ✅ | Legalization pass |
-| 3.5 | ✅ | Grid snap, overlap resolve |
-| 4 | ✅ | Constraint rules + board profiles |
-| 5 | ✅ | Interactive CLI tuning |
-| 6 | ✅ | SA engine + rotation + incremental cost |
+**Component** — `ref, footprint, value, x, y, rotation, layer, width, height, courtyard_margin`
+(0.25 mm), `pads, nets, is_fixed, component_type`. Properties: `bbox`, `effective_width/height`
+(rotation-aware), `overlaps(other)`, `overlap_area(other)`, `is_edge_connector`.
 
-**Implementation Order:** 0 → 1 → 2 → 3.5 → 4 → 5 → 6
+**Macro** — `leader`, `followers`, `follower_offsets`. Methods: `Macro.alone(leader)`,
+`Macro.with_caps(leader, caps)`, `translate(dx,dy,bounds)`, `set_pose(x,y,rot,bounds)`,
+`apply_offsets()`, `overlaps(other)`, `overlap_area(other)`, `bbox` (union).
+
+**BoardModel** — components, nets, board outline, `source_file`. Helpers: `get_component`,
+`get_net`, `nets_for_component`, `components_on_net`; JSON I/O (`to_json`/`from_json`);
+`stats()` (overlap counts, OOB, etc.).
 
 ---
 
 ## Important Implementation Notes
 
-1. **Legalization is single-pass** - don't call iteratively in optimizer loop, corrupts gradient/energy signals
-2. **Coordinate conversion** - KiCad uses nanometers, internal uses mm. Always convert at boundaries.
-3. **Grid snapping** - Round to nearest grid increment (default 0.1mm): `round(x / grid) * grid`
-4. **Component type consistency** - Always use the `component_type` field, not stale placement model fields
-5. **Edge-aware placement** - Connectors automatically placed near edges if board has connectors
-6. **Cluster seeding** - Net-based clustering provides deterministic seed positions, dramatically improves convergence
-
----
+1. **Legalization is single-pass on the legacy path** — don't call it iteratively inside the
+   optimizer loop; it corrupts the gradient/energy signal. The macro-v2 legalizer iterates
+   push-apart ↔ clamp internally (up to 5 rounds) — call it once.
+2. **Coordinate conversion** — always convert at I/O boundaries; internals are mm.
+3. **Grid snapping** — `round(x / grid) * grid` (default grid 0.5 mm).
+4. **Use `component_type`** — never stale placement-model fields.
+5. **Macros are rigid** — caps follow their leader through every move and the legalizer; the
+   cap-IC edge gap is enforced by construction (`MAX_CAP_IC_GAP_MM`), never recomputed at runtime.
+6. **Determinism** — SA/initial placement respect `--seed` (default 42). Within one Python
+   process runs are reproducible; across processes results can vary because Python's hash
+   seed changes set/dict iteration order (see project memory: SA hash-seed determinism).
+7. **`patches/` stays untracked** — never `git add patches/`; stage only source files.
 
 ## Dependencies
 
 - numpy (vectorized math)
 - Python 3.9+
-- (Future: networkx, scipy, numba/jax for acceleration)
-
----
 
 ## Design References
 

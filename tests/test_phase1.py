@@ -22,38 +22,20 @@ import os
 import sys
 import tempfile
 import glob
-from pathlib import Path
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.board_model import BoardModel, BoardOutline, Component, Net, Pad
 from parsers.kicad_parser import KiCadParser
-from engine.net_clustering import (
-    build_net_hypergraph,
-    cluster_components,
-    assign_cluster_positions,
-    compute_seed_positions,
-)
+from engine.net_clustering import build_net_hypergraph, cluster_components, compute_seed_positions
 from engine.grid_placement import grid_place
-from engine.cost_function import (
-    CostFunction,
-    total_hpwl,
-    total_overlap_penalty,
-    total_boundary_penalty,
-    net_wirelength_hpwl,
-    count_overlaps,
-    count_out_of_bounds,
-)
+from engine.cost_function import CostFunction, total_hpwl, total_overlap_penalty, total_boundary_penalty, net_wirelength_hpwl, count_overlaps
 from legalization.legalizer import legalize
-from profiles.board_profiles import get_profile, list_profiles, BoardProfile, BUILTIN_PROFILES
-from samples.sample_board import SAMPLE_KICAD_PCB, create_sample_board
+from profiles.board_profiles import get_profile, list_profiles
+from samples.sample_board import SAMPLE_KICAD_PCB
 from engine.cost_state import CostState, _is_power_net
-from engine.moves import (
-    select_move_type, get_moveable_indices,
-    do_translate, do_swap, do_rotate, do_median,
-    revert_move, affected_indices, MoveUndo,
-)
+from engine.moves import select_move_type, get_moveable_indices, do_translate, do_swap, do_rotate, do_median, revert_move, affected_indices
 from engine.annealer import simulate_annealing, run_sa, SAConfig
 
 

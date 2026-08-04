@@ -313,29 +313,6 @@ def apply_connectivity_nudges(
     return avg
 
 
-def place_interior_clustered(
-    model: "BoardModel",
-    macros: list["Macro"],
-    interior_bbox: tuple[float, float, float, float],
-    *,
-    min_gap: float = 2.5,
-    gap_factor: float = 0.5,
-    # Accepted for backward compatibility; the old global attractor_pull
-    # constant is replaced by per-net weighting in compute_attractor_nudges.
-    attractor_pull: float | None = None,
-) -> None:
-    """Cluster-aware interior placement (Phase A + Phase B).
-
-    Thin wrapper kept for callers that want one call.  The pipeline calls
-    ``place_interior_phase_a`` and ``apply_connectivity_nudges`` directly so
-    the two phases show up as separate steps in verbose output.
-    """
-    clusters = place_interior_phase_a(
-        model, macros, interior_bbox, min_gap=min_gap, gap_factor=gap_factor,
-    )
-    apply_connectivity_nudges(model, clusters, interior_bbox)
-
-
 def compute_interior_bbox(
     macros: list["Macro"],
     board: "BoardOutline",

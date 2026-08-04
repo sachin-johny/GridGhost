@@ -18,10 +18,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from models.board_model import BoardModel
 from parsers.kicad_parser import KiCadParser
 from parsers.placement_writer import apply_placement, export_positions_json, write_debug_bboxes
-from engine.net_clustering import cluster_components, compute_seed_positions
-from engine.grid_placement import grid_place, force_directed_place
+from engine.net_clustering import cluster_components
+from engine.grid_placement import force_directed_place
 from engine.smart_placement import smart_grid_place, _is_vertical_connector, _compute_interior_bbox
-from engine.cost_function import CostFunction, total_hpwl, count_overlaps, count_out_of_bounds
+from engine.cost_function import CostFunction, count_overlaps
 from engine.annealer import run_sa, SAConfig
 from engine.placement_prepass import preplace_caps_near_ics
 from legalization.legalizer import legalize

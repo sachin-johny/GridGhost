@@ -60,9 +60,3 @@ def target_pack_density() -> float:
     except Exception:
         _TARGET_PACK_DENSITY_CACHE = 0.55
     return _TARGET_PACK_DENSITY_CACHE
-
-
-def reset_cache() -> None:
-    """Reset the cached value. Useful for tests that swap config.json."""
-    global _TARGET_PACK_DENSITY_CACHE
-    _TARGET_PACK_DENSITY_CACHE = None

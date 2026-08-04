@@ -79,16 +79,16 @@ python gridghost.py profiles
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-m`, `--margin` | `5.0` | Board edge margin in mm |
-| `--grid-mm` | `1.0` | Legalization grid pitch in mm |
-| `--sa-iterations` | `1500` | SA iterations per reheat round |
-| `--sa-reheat` | `2` | Number of SA reheat rounds |
+| `-m`, `--margin` | `5.0` | Board edge margin in mm (`config.json` `placement.margin`) |
+| `--grid-mm` | `0.5` | Legalization grid pitch in mm (`config.json` `legalization.grid_mm`) |
+| `--sa-iterations` | `max(1500, 25×N)` | SA iterations; scales with macro count when unset (min 1500) |
+| `--sa-reheat` | `3` | Number of SA reheat rounds (`config.json` `annealer.reheat_count`) |
 | `--alpha` | `1.0` | HPWL weight |
 | `--beta` | `25.0` | Overlap penalty weight |
 | `--gamma` | `8.0` | Boundary penalty weight |
 | `--seed` | `42` | SA RNG seed (deterministic runs) |
 | `--connector-mating-margin` | `5.0` | Edge offset for perimeter connectors |
-| `--macro-v2` / `--no-macro-v2` | on | Toggle macro-first pipeline (default on; legacy pipeline removed in this branch) |
+| `--macro-v2` / `--no-macro-v2` | on | Toggle macro-first pipeline. Default on. `--no-macro-v2` falls back to the legacy grid pipeline (`engine/smart_placement.py`), retained for A/B comparison. |
 | `--dry-run` | off | Don't write PCB output file |
 | `--debug-bbox` | off | Draw bounding boxes on Dwgs.User layer |
 | `-v`, `--verbose` | off | Print per-stage cost breakdown |
@@ -151,8 +151,8 @@ A cap assigned to an IC is **only** in that IC's macro — never as a standalone
 ```text
 GridGhost/
 ├── gridghost.py                   # CLI entry point
-├── config.json                    # Legacy config (still loaded by gridghost.py
-│                                  # for default margin, etc.)
+├── config.py                      # Typed config loader (dataclasses)
+├── config.json                    # Default config (margin, SA, legalization params)
 │
 ├── models/
 │   ├── board_model.py             # BoardModel, Component, Net, Pad, BoardOutline
@@ -168,8 +168,10 @@ GridGhost/
 │                                  # and assign decoupling caps to ICs
 │
 ├── cost/
-│   └── cost.py                    # Single cost function:
-│                                  # α·HPWL (incl. power rails) + β·overlap + γ·boundary
+│   ├── cost.py                    # Macro-v2 cost: α·HPWL (incl. power rails)
+│   │                              # + β·overlap + γ·boundary
+│   ├── chains.py                  # Signal-flow chain grouping for cost/SA
+│   └── incremental.py             # Incremental cost delta for macro SA
 │
 ├── place/
 │   ├── pipeline.py                # 5-stage orchestrator (build → connector →
@@ -177,32 +179,63 @@ GridGhost/
 │   ├── initial.py                 # Net-aware clustered shelf-pack with
 │   │                              # connector-attractor pull
 │   ├── connectors.py              # Perimeter placement with pad-based rotation
+│   ├── cluster.py                 # Net clustering + shelf-pack helpers for initial
 │   ├── sa.py                      # Macro-aware SA (translate / rotate / swap /
 │   │                              # displace-neighbor); calibrated T0
-│   └── legalizer.py               # Grid snap → push-apart → boundary clamp,
-│                                  # iterated up to 5 rounds
+│   ├── sa_polish.py               # Overlap-weighted SA legalizer strategy (--legalizer sa_polish)
+│   ├── legalizer.py               # Grid snap → push-apart → boundary clamp,
+│   │                              # iterated up to 5 rounds
+│   └── abacus_bridge.py           # Adapter from rigid Macros to the row-based
+│                                  # Abacus legalizer (--legalizer abacus)
 │
-├── engine/                        # Legacy pipeline (not used by place_v2 but
-│   ├── net_clustering.py          # still imported: cluster_components is
-│   │                              # reused by place/initial.py
-│   ├── cost_state.py              # Incremental cost (legacy)
-│   ├── moves.py                   # Legacy move operators
-│   ├── annealer.py                # Legacy SA engine
-│   ├── grid_placement.py          # Legacy placement algorithms
-│   └── smart_placement.py         # Legacy 9-phase pipeline
+├── engine/                        # Shared + legacy modules.
+│   ├── net_clustering.py          # Hypergraph clustering — reused by place/cluster.py
+│   ├── cost_state.py              # Incremental cost state — reused by cost/, place/
+│   ├── congestion.py              # RUDY congestion map — reused by cost/, place/sa
+│   ├── constraint_evaluator.py    # Constraint penalty evaluation — reused by cost_state
+│   ├── group_moves.py             # Macro/group move primitives — reused widely
+│   ├── subcircuit_patterns.py     # Subcircuit pattern detection — reused by clustering
+│   ├── _pure_graph.py             # Louvain graph core — reused by net_clustering
+│   ├── cost_function.py           # Legacy cost function (used by --no-macro-v2 path)
+│   ├── moves.py                   # Legacy SA move operators (--no-macro-v2)
+│   ├── annealer.py                # Legacy SA engine (--no-macro-v2)
+│   ├── placement_prepass.py       # Legacy decap pre-place (--no-macro-v2)
+│   ├── grid_placement.py          # Legacy grid / force-directed placement (--no-macro-v2)
+│   ├── quadratic_placement.py     # Legacy quadratic placer (--no-macro-v2)
+│   └── smart_placement.py         # Legacy grid pipeline (--no-macro-v2)
 │
 ├── legalization/
-│   └── legalizer.py               # Legacy component-level legalizer
+│   ├── legalizer.py               # Component-level legalizer (grid snap / push-apart /
+│   │                              # boundary clamp), used by both pipelines
+│   ├── abacus_legalizer.py        # Row-based Abacus DP legalizer
+│   ├── post_legalize.py           # Post-legalization HPWL recovery (cell slide / pair swap)
+│   └── spatial_grid.py            # Spatial hash grid for overlap acceleration
 │
 ├── profiles/
-│   └── board_profiles.py          # Legacy profile system
+│   └── board_profiles.py          # Cost weights + constraint rules per board type
+│
+├── utils/
+│   ├── courtyard.py               # Courtyard/bbox helpers for the parser
+│   ├── density.py                 # Pack-density target + board-area checks
+│   └── display.py                 # CLI formatting (summary, cost, component table)
+│
+├── samples/
+│   └── sample_board.py            # 18-component MCU peripheral sample board
 │
 ├── tests/
-│   ├── test_phase1.py             # 81 tests covering legacy pipeline + data model
-│   ├── test_macro.py              # 10 tests for Macro model (rigid moves, bounds,
-│   │                              # cap distance, bbox union, overlaps)
-│   ├── test_assign_caps.py        # 8 tests for cap classification + assignment
-│   └── test_cost.py               # 12 tests for HPWL / overlap / boundary cost
+│   ├── test_macro.py              # Macro model: rigid moves, bounds, cap gap, bbox
+│   ├── test_assign_caps.py        # Cap classification + IC assignment
+│   ├── test_cost.py               # HPWL / overlap / boundary cost
+│   ├── test_incremental_cost.py   # Incremental cost delta
+│   ├── test_chains.py             # Signal-flow chain grouping
+│   ├── test_connector_placement.py# Perimeter connector placement + rotation
+│   ├── test_placement_spread.py   # Placement spread / coverage
+│   ├── test_abacus_bridge.py      # Macro → Abacus legalizer adapter
+│   ├── test_sa_polish.py          # SA-polish legalizer strategy
+│   ├── test_overlap_regression.py # (currently disabled — 0 collected)
+│   ├── test_phase1.py             # 81 tests: legacy pipeline + data model
+│   ├── run_all.py / dashboard.py / visualizer.py   # Batch run + result dashboard harness
+│   └── test_pcbs/                 # Bundled .kicad_pcb boards + reference JSONs
 │
 ├── patches/                       # (untracked) benchmark scripts + result JSONs
 │
@@ -251,7 +284,7 @@ Central data structure with components, nets, and board outline. Provides lookup
 
 - **Internal**: millimeters (float)
 - **KiCad file**: millimeters (float, 6 decimal places = micrometer precision)
-- **Legalization grid**: configurable, default 1.0 mm via `--grid-mm`
+- **Legalization grid**: configurable, default 0.5 mm via `--grid-mm` (from `config.json`)
 - **Rotation**: KiCad clockwise-positive convention; pad positions use `cos/sin` with negated sin for CW rotation
 
 ## Dependencies
@@ -262,14 +295,20 @@ Central data structure with components, nets, and board outline. Provides lookup
 ## Testing
 
 ```bash
-# Macro + cap-assign + cost tests
-python -m pytest tests/test_macro.py tests/test_assign_caps.py tests/test_cost.py
+# Full suite
+python -m pytest tests/
+
+# Macro-first pipeline tests
+python -m pytest tests/test_macro.py tests/test_assign_caps.py tests/test_cost.py \
+                   tests/test_incremental_cost.py tests/test_chains.py \
+                   tests/test_connector_placement.py tests/test_placement_spread.py \
+                   tests/test_abacus_bridge.py tests/test_sa_polish.py
 
 # Legacy Phase 1 suite (data model, parser, legacy engine)
 python -m pytest tests/test_phase1.py
 ```
 
-The macro-first pipeline is verified by 30 tests across `test_macro.py`, `test_assign_caps.py`, and `test_cost.py`, covering:
+The suite is **152 tests across 11 files** (run `python -m pytest tests/`). Breakdown: `test_phase1.py` (81 — legacy pipeline + data model), `test_cost.py` (12), `test_macro.py` (11), `test_chains.py` (9), `test_connector_placement.py` (10), `test_assign_caps.py` (8), `test_placement_spread.py` (9), `test_sa_polish.py` (5), `test_abacus_bridge.py` (4), `test_incremental_cost.py` (3). `test_overlap_regression.py` is currently disabled (0 collected). The macro-first pipeline is covered by:
 - **Macro model**: rigid translation, bounds revert, rotation propagation, `MAX_CAP_IC_GAP_MM` (edge-to-edge cap-IC gap) enforcement, bbox union, overlap detection
 - **Cap assignment**: power-net detection, single-IC assignment, round-robin distribution, determinism
 - **Cost**: HPWL (2-pin, 3-pin, with/without power), macro overlap area, boundary, edge-connector exclusion, evaluate() returns all components

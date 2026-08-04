@@ -21,7 +21,6 @@ Typical usage:
 from __future__ import annotations
 
 import math
-from collections import defaultdict
 from typing import Dict, List, Set, Tuple, TYPE_CHECKING
 
 from engine.cost_state import _is_power_net

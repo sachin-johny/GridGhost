@@ -23,9 +23,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
 
-from models.board_model import BoardModel, Component, Net
+from models.board_model import BoardModel, Component
 from engine.cost_state import _is_power_net
 
 

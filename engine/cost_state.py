@@ -6,10 +6,8 @@ essential for SA performance where thousands of moves are evaluated per second.
 
 from __future__ import annotations
 
-import math
 import re
 from bisect import bisect_left, insort
-from itertools import combinations
 
 from models.board_model import BoardModel
 from profiles.board_profiles import ConstraintRule

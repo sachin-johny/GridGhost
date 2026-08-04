@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import math
-from models.board_model import BoardModel, Component
+from models.board_model import BoardModel
 
 
 def print_board_summary(model: BoardModel, title: str = "Board Summary") -> None:

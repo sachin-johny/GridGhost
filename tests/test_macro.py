@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from models.board_model import Component, BoardOutline
+from models.board_model import Component
 from models.macro import (
     Macro,
     find_cap_offset,

@@ -123,20 +123,6 @@ def get_macro_leader_of(model: BoardModel, cap_ref: str | None = None) -> str | 
     return cached.get(cap_ref)
 
 
-def clear_macro_caches(model: BoardModel) -> None:
-    """Invalidate macro-related caches on ``model``.
-
-    Call this whenever components are added/removed (refs change). SA and
-    legalizer mutate positions in place — refs don't change — so they do
-    NOT need to call this.
-    """
-    for attr in ('_macro_member_refs_cache', '_macro_leader_of_cache',
-                 '_decap_map_cache', '_signal_flow_chain_map_cache',
-                 '_comp_ref_idx_map'):
-        if hasattr(model, attr):
-            delattr(model, attr)
-
-
 def get_group_indices(
     model: BoardModel,
     idx: int,
@@ -227,26 +213,6 @@ def apply_delta_with_clamp(
         half_h = comp.effective_height / 2.0
         comp.x = max(x_min + half_w, min(comp.x + dx, x_max - half_w))
         comp.y = max(y_min + half_h, min(comp.y + dy, y_max - half_h))
-
-
-def move_group_with_ic(
-    model: BoardModel,
-    ic_idx: int,
-    dx: float,
-    dy: float,
-    bounds: tuple[float, float, float, float] | None = None,
-    decap_map: dict[str, list[str]] | None = None,
-    ref_idx_map: dict[str, int] | None = None,
-) -> set[int]:
-    """Move an IC and all its assigned caps by (dx, dy).
-
-    Returns the set of indices that were moved (always includes ic_idx;
-    includes cap indices that actually moved). Caller is responsible
-    for CostState.incremental_update(moved) and MoveUndo capture.
-    """
-    group = get_group_indices(model, ic_idx, decap_map, ref_idx_map)
-    apply_delta_with_clamp(model, group, dx, dy, bounds)
-    return group
 
 
 def get_ic_caps_for_index(

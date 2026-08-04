@@ -13,7 +13,6 @@ For Phase 1, we implement:
 
 from __future__ import annotations
 
-import math
 from itertools import combinations
 
 from models.board_model import BoardModel, Component, Net

@@ -9,26 +9,8 @@ Each profile sets:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Optional
-from pathlib import Path
-
-
-def _require_yaml():
-    """Lazy-import PyYAML, raising a helpful error if it's not installed.
-
-    PyYAML is an optional dependency — it's only needed when loading or
-    saving custom board profiles from YAML files.  The default pipeline
-    uses the built-in dict profiles, so most users never need it.
-    """
-    try:
-        import yaml  # type: ignore
-        return yaml
-    except ImportError as exc:  # pragma: no cover - exercised only without pyyaml
-        raise ImportError(
-            "PyYAML is required for YAML board profile loading/saving. "
-            "Install it with: pip install pyyaml"
-        ) from exc
 
 
 @dataclass
@@ -136,8 +118,7 @@ BUILTIN_PROFILES: dict[str, BoardProfile] = {
             # dominated HPWL+boundary.  Lowered to weight=1.0 / 3mm so
             # it's a gentle nudge, not a hard constraint — SA can still
             # satisfy it when there's room, but won't catastrophically
-            # deform the placement to do so.  See scripts/ab_test_sa.py
-            # for the regression data.
+            # deform the placement to do so.
             ConstraintRule("thermal_separation", weight=1.0,
                            params={"min_distance_mm": 3.0}),
             ConstraintRule("high_current_path", weight=4.0),
@@ -210,53 +191,3 @@ def get_profile(name: str) -> BoardProfile:
 def list_profiles() -> list[BoardProfile]:
     """Return all available board profiles."""
     return list(BUILTIN_PROFILES.values())
-
-
-def load_profile_from_yaml(path: str) -> BoardProfile:
-    """Load a custom board profile from a YAML file."""
-    yaml = _require_yaml()
-    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-    rules = [
-        ConstraintRule(
-            name=r.get("name", ""),
-            weight=r.get("weight", 1.0),
-            enabled=r.get("enabled", True),
-            params=r.get("params", {}),
-        )
-        for r in data.get("rules", [])
-    ]
-    return BoardProfile(
-        name=data.get("name", "custom"),
-        display_name=data.get("display_name", "Custom Profile"),
-        description=data.get("description", ""),
-        alpha=data.get("alpha", 1.0),
-        beta=data.get("beta", 5.0),
-        gamma=data.get("gamma", 3.0),
-        delta=data.get("delta", 4.0),
-        rules=rules,
-    )
-
-
-def save_profile_to_yaml(profile: BoardProfile, path: str) -> None:
-    """Save a board profile to a YAML file."""
-    yaml = _require_yaml()
-    data = {
-        "name": profile.name,
-        "display_name": profile.display_name,
-        "description": profile.description,
-        "alpha": profile.alpha,
-        "beta": profile.beta,
-        "gamma": profile.gamma,
-        "delta": profile.delta,
-        "rules": [
-            {
-                "name": r.name,
-                "weight": r.weight,
-                "enabled": r.enabled,
-                "params": r.params,
-            }
-            for r in profile.rules
-        ],
-    }
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(yaml.dump(data, default_flow_style=False, sort_keys=False), encoding="utf-8")

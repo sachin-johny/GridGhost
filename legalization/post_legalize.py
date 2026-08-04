@@ -29,16 +29,8 @@ for O(k) HPWL evaluation per component.
 
 from __future__ import annotations
 
-from models.board_model import BoardModel, Component, BoardOutline, Net, Pad
-from legalization.legalizer import (
-    _compute_local_hpwl,
-    _build_comp_net_lookup,
-    _count_overlaps_involving,
-    _compute_overlap_stats,
-    _enforce_boundary_single,
-    _is_non_square,
-    _count_oob,
-)
+from models.board_model import BoardModel, Component, BoardOutline
+from legalization.legalizer import _compute_local_hpwl, _build_comp_net_lookup, _compute_overlap_stats, _is_non_square, _count_oob
 from engine.group_moves import propagate_ic_delta
 
 

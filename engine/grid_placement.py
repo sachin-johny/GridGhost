@@ -12,7 +12,6 @@ by force-directed or SA optimization (Phase 2+).
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 from models.board_model import BoardModel, Component
 from engine.net_clustering import compute_seed_positions, cluster_components
@@ -367,7 +366,6 @@ def _resolve_corner_collisions(
 
         if not resolved_any:
             break
-
 
 
 def _apply_strong_repulsion(model: BoardModel, exclude_types: set[str] | None = None) -> None:

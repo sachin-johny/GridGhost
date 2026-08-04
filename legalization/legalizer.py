@@ -9,11 +9,10 @@ from __future__ import annotations
 
 import re
 import math
-from typing import Optional
 
-from models.board_model import BoardModel, Component, BoardOutline, Net, Pad
+from models.board_model import BoardModel, Component, BoardOutline, Net
 from engine.constraint_evaluator import evaluate_constraint_penalties, _build_decoupling_map
-from engine.group_moves import propagate_ic_delta, propagate_ic_move, is_macro_member
+from engine.group_moves import propagate_ic_delta, propagate_ic_move
 from legalization.spatial_grid import SpatialGrid, compute_overlap_stats_fast, count_overlaps_involving_fast, count_pair_overlaps_involving_fast
 
 
@@ -1201,49 +1200,6 @@ def _greedy_resolve(
             print(f"  Greedy resolution: {final} overlaps remaining (board may be too dense)")
 
 
-def _push_apart_one(
-    movable: Component, fixed: Component, strength: float,
-    grid_mm: float, board: BoardOutline | None = None,
-) -> None:
-    ax1, ay1, ax2, ay2 = movable.bbox
-    bx1, by1, bx2, by2 = fixed.bbox
-
-    overlap_x = min(ax2, bx2) - max(ax1, bx1)
-    overlap_y = min(ay2, by2) - max(ay1, by1)
-
-    if overlap_x <= 0 or overlap_y <= 0:
-        return
-
-    push_mm = max(grid_mm * 1.5, 0.15)
-
-    if board is not None and fixed.is_edge_connector:
-        board_cx = (board.x_min + board.x_max) / 2.0
-        board_cy = (board.y_min + board.y_max) / 2.0
-        center_dx = 1 if board_cx >= fixed.x else -1
-        center_dy = 1 if board_cy >= fixed.y else -1
-
-        if abs(board_cx - fixed.x) >= abs(board_cy - fixed.y):
-            push_x = max(overlap_x * strength, push_mm)
-            movable.x += center_dx * push_x
-        else:
-            push_y = max(overlap_y * strength, push_mm)
-            movable.y += center_dy * push_y
-        return
-
-    if overlap_x <= overlap_y:
-        push_x = max(overlap_x * strength, push_mm)
-        push_y = 0
-    else:
-        push_x = 0
-        push_y = max(overlap_y * strength, push_mm)
-
-    dx = 1 if movable.x >= fixed.x else -1
-    dy = 1 if movable.y >= fixed.y else -1
-
-    movable.x += dx * push_x
-    movable.y += dy * push_y
-
-
 def _push_apart(c1: Component, c2: Component, strength: float, grid_mm: float) -> None:
     ax1, ay1, ax2, ay2 = c1.bbox
     bx1, by1, bx2, by2 = c2.bbox
@@ -1526,7 +1482,6 @@ def _push_apart_hpwl(
         propagate_ic_move(model, mover, mover_old_x, mover_old_y, mover_old_rot,
                           new_x, new_y, mover.rotation,
                           bounds=(interior_bbox[0], interior_bbox[1], interior_bbox[2], interior_bbox[3]) if interior_bbox else None)
-
 
 
 def _nudge_caps_to_ics(
@@ -2349,11 +2304,6 @@ def _count_oob(model: BoardModel) -> int:
     return count
 
 
-def _compute_total_overlap_area(model: BoardModel) -> float:
-    _, total_area = _compute_overlap_stats(model)
-    return total_area
-
-
 # =============================================================================
 # Adaptive bbox expansion + anti-centroid spread (plan.md §3-4)
 # =============================================================================
@@ -2604,4 +2554,3 @@ def _spread_pass(
         print(f"  spread pass: moved {moved} components from {densest_name} "
               f"(density={densest['density']:.2f}) toward {sparsest_name} "
               f"(density={sparsest['density']:.2f}, step={step:.2f}mm)")
-

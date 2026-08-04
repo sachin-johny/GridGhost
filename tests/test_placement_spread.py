@@ -22,7 +22,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from models.board_model import BoardModel, BoardOutline, Component, Net
+from models.board_model import BoardModel, Net
 from place.cluster import weighted_attractor_target
 from parsers.kicad_parser import KiCadParser
 from place.pipeline import place_v2

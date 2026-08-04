@@ -19,7 +19,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from models.board_model import Component, BoardOutline, rotated_bbox_offset
+from models.board_model import Component, rotated_bbox_offset
 from parsers.kicad_parser import KiCadParser
 from place.connectors import place_connectors_perimeter
 

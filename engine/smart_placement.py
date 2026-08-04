@@ -949,16 +949,6 @@ def _compute_hpwl(model: "BoardModel", interior_refs: Set[str] | None = None) ->
     return total
 
 
-def _compute_overlap_cost(components: List["Component"]) -> float:
-    """Total overlap area between components — penalizes condensation."""
-    total = 0.0
-    for i, ca in enumerate(components):
-        for cb in components[i + 1:]:
-            if ca.overlaps(cb):
-                total += ca.overlap_area(cb)
-    return total
-
-
 def _optimize_interior_sa(
     model: "BoardModel",
     interior: List["Component"],

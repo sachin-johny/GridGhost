@@ -15,7 +15,7 @@ from typing import Optional
 
 from engine._pure_graph import Graph, louvain_communities
 
-from models.board_model import BoardModel, Component, BoardOutline
+from models.board_model import BoardModel
 
 
 from engine.cost_state import _is_power_net

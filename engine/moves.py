@@ -11,10 +11,7 @@ import random
 from dataclasses import dataclass
 
 from models.board_model import BoardModel
-from engine.group_moves import (
-    get_decap_map, get_ref_idx_map, get_group_indices,
-    get_ic_caps_for_index, get_group_followers, apply_delta_with_clamp, IC_TYPES,
-)
+from engine.group_moves import get_group_followers, apply_delta_with_clamp
 
 
 @dataclass

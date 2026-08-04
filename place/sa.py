@@ -41,18 +41,6 @@ def _restore_positions(model: "BoardModel", snap: dict[str, tuple[float, float, 
             c.set_rotation(r)
 
 
-def _macro_snapshot(macros: list["Macro"]) -> list[list[tuple[float, float, float]]]:
-    return [[(c.x, c.y, c.rotation) for c in m.members] for m in macros]
-
-
-def _macro_restore(macros: list["Macro"], snap: list[list[tuple[float, float, float]]]) -> None:
-    for m, members in zip(macros, snap):
-        for c, (x, y, r) in zip(m.members, members):
-            c.x = x
-            c.y = y
-            c.set_rotation(r)
-
-
 def _calibrate_initial_temp(
     model: "BoardModel",
     macros: list["Macro"],
