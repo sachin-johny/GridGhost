@@ -219,7 +219,8 @@ def cmd_place(args) -> None:
             connector_mating_margin=args.connector_mating_margin,
             seed=seed,
             verbose=getattr(args, "verbose", False),
-            rudy_weight=getattr(args, "rudy_weight", 0.0) or 0.0,
+            rudy_weight=getattr(args, "rudy_weight", None),
+            pin_density_weight=getattr(args, "pin_density_weight", None),
             use_abacus=(getattr(args, "legalizer", "heuristic") == "abacus"),
             use_sa_polish=(getattr(args, "legalizer", "heuristic") == "sa_polish"),
         )
@@ -654,10 +655,20 @@ def main():
                          help="Use the macro-first placement pipeline (rigid cap-IC macros). Default: on. Use --no-macro-v2 for the legacy grid pipeline.")
     p_place.add_argument("--seed", type=int, default=42,
                          help="Random seed for SA/placement determinism (default: 42; use --seed 0 for non-deterministic)")
-    p_place.add_argument("--rudy-weight", type=float, default=0.0,
-                         help="RUDY congestion penalty weight in SA cost function (default: 0 = disabled). "
-                              "When > 0, SA gets gradient signal to spread macros away from routing choke points. "
-                              "The verbose report always shows RUDY regardless of this setting.")
+    p_place.add_argument("--rudy-weight", type=float, default=None,
+                         help="RUDY wire-density congestion penalty weight in SA cost function "
+                              "(default: from config.json, currently 1.0 = enabled). "
+                              "When > 0, SA gets gradient signal to spread macros away from "
+                              "routing choke points (areas where many nets' bounding boxes "
+                              "overlap). Pass 0 to disable. The verbose report always shows "
+                              "RUDY regardless of this setting.")
+    p_place.add_argument("--pin-density-weight", type=float, default=None,
+                         help="Pin-density congestion penalty weight in SA cost function "
+                              "(default: from config.json, currently 0.2 = enabled). "
+                              "Complementary to --rudy-weight: catches pin-escape congestion "
+                              "(dense clusters of signal pins) that RUDY's wire-density model "
+                              "misses. Pass 0 to disable. The verbose report always shows "
+                              "pin density regardless of this setting.")
     # --- macro-v2-only knobs (previously documented in README but never
     # registered as CLI args; place_v2() always accepted them). ---
     p_place.add_argument("--grid-mm", type=float, default=None,

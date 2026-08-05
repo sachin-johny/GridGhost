@@ -127,7 +127,8 @@ def place_v2(
     connector_mating_margin: float = 5.0,
     seed: int = 42,
     verbose: bool = False,
-    rudy_weight: float = 0.0,
+    rudy_weight: float | None = None,
+    pin_density_weight: float | None = None,
     use_abacus: bool = False,
     use_sa_polish: bool = False,
 ) -> dict[str, object]:
@@ -135,12 +136,29 @@ def place_v2(
 
     Returns a dict with cost breakdown before/after SA and legalizer stats.
 
-    Finding 7 fix: ``rudy_weight`` adds RUDY congestion to the SA cost
-    function (default 0 = disabled). When > 0, SA gets gradient signal
-    to spread macros away from routing choke points. The verbose report
-    always shows RUDY (initial + final) so the user can see congestion
-    regardless of whether SA is using it as a cost term.
+    Routability signals: ``rudy_weight`` and ``pin_density_weight`` add
+    two complementary congestion terms to the SA cost function. Both
+    default to ``None`` — resolved against ``config.json``
+    (``annealer.rudy_weight`` / ``annealer.pin_density_weight``), which
+    ships with both ON so the placer produces a routable result out of
+    the box. Pass ``0`` to explicitly disable either signal. The verbose
+    report always shows both signals' initial + final state regardless
+    of whether they're active in the cost, so the user can see
+    congestion even when running with the signals off.
     """
+    # Resolve routability weights against config when the caller didn't
+    # explicitly pass one. The CLI passes ``None`` when the user didn't
+    # set the flag, so the config default (0.3 / 0.2 in config.json)
+    # wins — fixing the old bug where the CLI default of 0.0 silently
+    # disabled RUDY even though config.json said 0.3.
+    if rudy_weight is None or pin_density_weight is None:
+        from config import load_config
+        _cfg = load_config()
+        if rudy_weight is None:
+            rudy_weight = _cfg.annealer.rudy_weight
+        if pin_density_weight is None:
+            pin_density_weight = getattr(_cfg.annealer, "pin_density_weight", 0.0)
+
     # ─── Phase 1: classify → assign → build macros ───────────────────
     interior_macros, connector_macros, fixed_macros = build_macros(model)
     if verbose:
@@ -273,22 +291,32 @@ def place_v2(
         cost_init = evaluate(model, interior_macros + connector_macros + fixed_macros,
                               alpha=alpha, beta=beta, gamma=gamma,
                               net_weights=chain_net_weights)
-        # Finding 7 fix: wire RUDY congestion into the macro-v2 pipeline's
+        # Wire RUDY + pin-density congestion into the macro-v2 pipeline's
         # verbose report (was only in the legacy smart_placement path).
         # RUDY (Rectangular Uniform wire DensitY) estimates routing
         # congestion by distributing each net's bbox uniformly across the
-        # grid cells it covers. The penalty is non-zero only when peak
-        # congestion exceeds 1.5× the average — i.e. when there's a
-        # routing choke point HPWL alone misses.
+        # grid cells it covers. Pin density counts signal pins per cell,
+        # catching pin-escape congestion RUDY misses. Both penalties are
+        # non-zero only when peak congestion exceeds 1.5× the average —
+        # i.e. when there's a routing choke point HPWL alone misses.
         # See engine/congestion.py for the full implementation.
-        from engine.congestion import rudy_congestion_penalty
+        from engine.congestion import (
+            rudy_congestion_penalty,
+            pin_density_penalty as _pin_density_penalty,
+        )
         rudy_penalty_init, rudy_peak_init, rudy_avg_init, _ = rudy_congestion_penalty(model)
+        pd_penalty_init, pd_peak_init, pd_avg_init, _ = _pin_density_penalty(model)
         print(f"  After initial: total={cost_init['total']:.2f} "
               f"(hpwl={cost_init['hpwl']:.1f}, overlap={cost_init['overlap']:.1f}, "
               f"boundary={cost_init['boundary']:.1f})")
         if rudy_penalty_init > 0:
             print(f"  RUDY: penalty={rudy_penalty_init:.3f} peak={rudy_peak_init:.3f} "
-                  f"avg={rudy_avg_init:.3f} (routing congestion hotspot detected)")
+                  f"avg={rudy_avg_init:.3f} (wire-density hotspot detected)")
+        if pd_penalty_init > 0:
+            print(f"  Pin-density: penalty={pd_penalty_init:.3f} peak={pd_peak_init:.3f} "
+                  f"avg={pd_avg_init:.3f} (pin-escape hotspot detected)")
+        if rudy_penalty_init == 0 and pd_penalty_init == 0:
+            print("  Routability: no congestion hotspots detected (RUDY + pin-density clean)")
 
     # ─── Phase 4: SA on interior macros (connectors + fixed stay put) ──
     # Bounds = interior_bbox (possibly already expanded in Phase 3) so SA
@@ -300,14 +328,96 @@ def place_v2(
     # signal to keep movable macros away from them. Macro.translate /
     # set_pose refuse to move is_fixed macros, so SA's random picks of
     # fixed macros no-op (a few iterations wasted, no correctness issue).
+    #
+    # Density-adaptive RUDY weight (routability-first tuning):
+    # The config.json rudy_weight is the BASELINE; we scale it by a
+    # factor that depends on the board's interior density AND its raw
+    # RUDY peak (the actual congestion pressure). On sparse, low-
+    # congestion boards (cbb, cbbwO: density<0.30, peak<0.1) RUDY is
+    # just noise that competes with HPWL — we scale it DOWN. On dense,
+    # high-congestion boards (test4, test6, th_sensor: density>0.40
+    # and/or peak>0.5) routability matters most — we scale it UP.
+    #
+    # The scale is multiplicative on top of the configured baseline, so
+    # users who explicitly set --rudy-weight still get their value
+    # scaled by the same factor (the scale is a board-shape signal, not
+    # a user-intent signal).
     sa_bounds = interior_bbox
+
+    # Compute interior density now (we re-derive it for the keepout
+    # callback below anyway; doing it here lets us also use it for
+    # the RUDY-weight scaling).
+    sa_bounds_area = (sa_bounds[2] - sa_bounds[0]) * (sa_bounds[3] - sa_bounds[1])
+    interior_macro_area = sum(
+        max(0.0, m.bbox[2] - m.bbox[0]) * max(0.0, m.bbox[3] - m.bbox[1])
+        for m in interior_macros
+    )
+    interior_density = interior_macro_area / sa_bounds_area if sa_bounds_area > 0 else 0.0
+
+    # Raw RUDY peak on the CURRENT (pre-SA) placement — a direct signal
+    # of how congested the board is. Cheap to compute (one RUDY map pass).
+    raw_rudy_peak = 0.0
+    try:
+        from engine.congestion import rudy_congestion_penalty as _rcp
+        _pen, raw_rudy_peak, _avg, _ovf = _rcp(model)
+    except Exception:
+        raw_rudy_peak = 0.0
+
+    # Density-adaptive scale (v2 — calibrated on 15 boards: 6 test_pcbs +
+    # 9 external_boards/rl_pcb):
+    #   density < 0.30  AND  peak < 0.10  -> 0.3× (sparse, low congestion)
+    #   density > 0.45                   -> 1.2× (dense alone)
+    #   peak   > 0.50                    -> 1.2× (very high peak alone)
+    #   otherwise                           1.0× (the configured baseline)
+    #
+    # v2 change: the v1 rule `density > 0.45 OR peak > 0.40` fired too
+    # broadly on medium-density boards with one moderately-high peak cell.
+    # test6 (density 0.36, peak 0.46) is the canonical bad case: at 1.2×
+    # scale, SA chased overflow at the cost of BOTH HPWL and the RUDY
+    # peak itself (peak rose from 0.38 → 0.61 — an actual routability
+    # regression at the hotspot). Raising the peak threshold from 0.40
+    # to 0.50 lets test6 fall to baseline 1.0× while keeping th_sensor
+    # (peak 0.52), tc_logger_silabs (peak 1.12), and v_d_afe (peak 0.62)
+    # at 1.2× — those boards responded well to 1.2× amplification.
+    #
+    # The peak-rising failure mode (SA trading a higher peak for lower
+    # overflow) is addressed at the THRESHOLD level here, not via a cost
+    # formula change. A quadratic peak term `0.5*peak*peak` was tried in
+    # rudy_congestion_penalty — it fixed test6 but regressed th_sensor,
+    # test5, and tc_logger_silabs (both HPWL and peak worsened under the
+    # altered cost landscape), so it was reverted. See engine/congestion.py.
+    #
+    # Calibration across 15 boards (ON vs OFF HPWL %), per TUNING_SUMMARY.md:
+    #   v1: average -2.2%; test6 +17% (the bad case above)
+    #   v2: average -3.2%; 13 wins, 1 neutral, 1 near-neutral (test6 +1.4%,
+    #       was +17%), 1 structural loss (PModBoard +15.2% but peak drops —
+    #       a routability win). Zero residual overlaps on any board.
+    #
+    # The dense/congested scale stays at 1.2× (not 1.5×) — 1.5× was too
+    # aggressive on test6: at effective weight 1.5, SA thrashed and HPWL
+    # regressed by +42mm with high variance.
+    if interior_density < 0.30 and raw_rudy_peak < 0.10:
+        rudy_scale = 0.3
+    elif interior_density > 0.45:
+        rudy_scale = 1.2
+    elif raw_rudy_peak > 0.50:
+        rudy_scale = 1.2
+    else:
+        rudy_scale = 1.0
+    effective_rudy_weight = rudy_weight * rudy_scale
+    if verbose:
+        print(f"  Density-adaptive RUDY: density={interior_density:.2f} "
+              f"raw_peak={raw_rudy_peak:.3f} -> scale={rudy_scale:.1f}× "
+              f"(effective weight={effective_rudy_weight:.2f}, config={rudy_weight:.2f})")
+
     sa_result = run_macro_sa(
         model, interior_macros + fixed_macros, sa_bounds,
         iterations=sa_iterations, reheats=sa_reheats,
         alpha=alpha, beta=beta, gamma=gamma,
         seed=seed, verbose=verbose,
         net_weights=chain_net_weights,
-        rudy_weight=rudy_weight,
+        rudy_weight=effective_rudy_weight,
+        pin_density_weight=pin_density_weight,
     )
 
     # ─── Phase 5: legalize all macros together ───────────────────────
@@ -352,12 +462,9 @@ def place_v2(
     # density the legalizer actually faces — board-level density
     # (component_area / board_area) understates the packing pressure
     # because it includes the margin ring and connector reserve.
-    sa_bounds_area = (sa_bounds[2] - sa_bounds[0]) * (sa_bounds[3] - sa_bounds[1])
-    interior_macro_area = sum(
-        max(0.0, m.bbox[2] - m.bbox[0]) * max(0.0, m.bbox[3] - m.bbox[1])
-        for m in interior_macros
-    )
-    interior_density = interior_macro_area / sa_bounds_area if sa_bounds_area > 0 else 0.0
+    # (Re-using the sa_bounds_area/interior_macro_area/interior_density
+    # computed above for the RUDY-weight scaling — they're the same
+    # quantities.)
 
     # Finding 5 fix: ONE density-adaptive keepout scale, here in the
     # legalizer callback. Previously this callback applied its own
@@ -434,10 +541,14 @@ def place_v2(
     final_cost = evaluate(model, all_macros, alpha=alpha, beta=beta, gamma=gamma,
                           net_weights=chain_net_weights)
     if verbose:
-        # Finding 7: report final RUDY so the user can see whether SA +
+        # Report final RUDY + pin-density so the user can see whether SA +
         # legalization created or resolved routing choke points.
-        from engine.congestion import rudy_congestion_penalty
+        from engine.congestion import (
+            rudy_congestion_penalty,
+            pin_density_penalty as _pin_density_penalty,
+        )
         rudy_penalty_final, rudy_peak_final, rudy_avg_final, _ = rudy_congestion_penalty(model)
+        pd_penalty_final, pd_peak_final, pd_avg_final, _ = _pin_density_penalty(model)
         print(
             f"  Final: total={final_cost['total']:.2f} "
             f"(hpwl={final_cost['hpwl']:.1f}, overlap={final_cost['overlap']:.1f}, "
@@ -448,6 +559,11 @@ def place_v2(
                   f"avg={rudy_avg_final:.3f}")
         elif rudy_penalty_init > 0:
             print(f"  RUDY: no hotspots remaining (was {rudy_penalty_init:.3f} before SA)")
+        if pd_penalty_final > 0:
+            print(f"  Pin-density: penalty={pd_penalty_final:.3f} peak={pd_peak_final:.3f} "
+                  f"avg={pd_avg_final:.3f}")
+        elif pd_penalty_init > 0:
+            print(f"  Pin-density: no hotspots remaining (was {pd_penalty_init:.3f} before SA)")
 
     return {
         "sa_result": sa_result,

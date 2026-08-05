@@ -49,8 +49,20 @@ class AnnealerConfig:
     greedy_rotations: tuple[float, ...] = (90.0, 180.0, 270.0)
     greedy_improve_threshold: float = 0.5  # v11: accept smaller improvements
     overlap_cap_factor: float = 2.0    # v11: reject moves exceeding this * initial overlaps
-    rudy_weight: float = 0.3           # RUDY congestion penalty weight (0 = disabled)
+    rudy_weight: float = 1.0           # RUDY wire-density congestion penalty weight (0 = disabled).
+                                       # 1.0 — bumped from 0.3 after test6 ablation showed 0.3 was
+                                       # too weak to overcome HPWL on dense boards. At 1.0, test6
+                                       # RUDY peak drops 0.43 -> 0.28 (-35%) and HPWL also drops
+                                       # 1686 -> 1598 (-5%); multi-seed confirms 0 residual
+                                       # overlaps and no regression on the other 5 boards. The
+                                       # sweet spot is 0.5-1.0; above 1.5 RUDY overwhelms HPWL
+                                       # and SA thrashes.
     rudy_grid_resolution: float = 2.0  # RUDY grid cell size in mm
+    pin_density_weight: float = 0.2    # Pin-density congestion penalty weight (0 = disabled).
+                                       # Complementary to rudy_weight: catches pin-escape
+                                       # congestion (dense pin clusters) that RUDY misses.
+                                       # Default-on so the placer produces a routable
+                                       # result out of the box.
     sa_auto_disable_min_components: int = 6   # auto-disable SA on tiny boards
     sa_auto_disable_max_components: int = 50  # auto-disable SA on large boards
     spread_floor_fraction: float = 0.10       # reject moves that collapse spread

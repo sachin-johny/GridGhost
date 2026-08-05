@@ -191,7 +191,7 @@ GridGhost/
 ├── engine/                        # Shared + legacy modules.
 │   ├── net_clustering.py          # Hypergraph clustering — reused by place/cluster.py
 │   ├── cost_state.py              # Incremental cost state — reused by cost/, place/
-│   ├── congestion.py              # RUDY congestion map — reused by cost/, place/sa
+│   ├── congestion.py              # RUDY wire-density + pin-density congestion maps — reused by cost/, place/sa
 │   ├── constraint_evaluator.py    # Constraint penalty evaluation — reused by cost_state
 │   ├── group_moves.py             # Macro/group move primitives — reused widely
 │   ├── subcircuit_patterns.py     # Subcircuit pattern detection — reused by clustering

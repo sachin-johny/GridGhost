@@ -6,8 +6,11 @@ body. No independent follower clamping; moves that would push any
 member out of bounds are REJECTED.
 
 Cost function is from ``cost.cost.evaluate``: HPWL (with power rails
-included) + overlap + boundary. No penalty scaling, no spread floor,
-no fill-first move operator, no RUDY, no Metropolis-on-density.
+included) + overlap + boundary + optional RUDY congestion + optional
+pin-density congestion. Both routability signals are cached and
+recomputed every ``rudy_recompute_every`` steps (the cache cadence
+is shared because the two maps walk the same nets/pads, so refreshing
+them together is essentially free).
 
 This is intentionally simpler than the existing engine/annealer.py.
 The complexity lived there because it was papering over the absence
@@ -123,6 +126,7 @@ def run_macro_sa(
     net_weights: dict[str, float] | None = None,
     rudy_weight: float = 0.0,
     rudy_recompute_every: int = 50,
+    pin_density_weight: float = 0.0,
     bias_overlapping: bool = False,
     bias_overlap_prob: float = 0.6,
 ) -> dict[str, float]:
@@ -143,12 +147,21 @@ def run_macro_sa(
         pure translate can't make room.
 
     Finding 7 fix: ``rudy_weight`` adds RUDY congestion to the cost
-    function (default 0 = disabled, matching previous behavior). When
-    > 0, the RUDY penalty is recomputed every ``rudy_recompute_every``
-    steps and passed to ``evaluate`` as a pre-computed penalty (avoids
-    re-computing the RUDY map on every cost evaluation — that would
-    dominate SA runtime). Boards with routing choke points get
-    gradient signal to spread macros away from congested cells.
+    function. The RUDY penalty is recomputed every
+    ``rudy_recompute_every`` steps and passed to ``evaluate`` as a
+    pre-computed penalty (avoids re-computing the RUDY map on every
+    cost evaluation — that would dominate SA runtime). Boards with
+    routing choke points get gradient signal to spread macros away
+    from congested cells.
+
+    Routability pair: ``pin_density_weight`` adds a complementary
+    pin-density congestion term. RUDY sees wire density from net
+    bounding boxes; pin density sees local pin-escape demand. Both
+    default-on via ``config.json`` so the placer produces a routable
+    result out of the box; pass weight 0 to disable either signal.
+    The two signals share the ``rudy_recompute_every`` cadence — the
+    maps walk the same nets/pads, so refreshing them together is
+    essentially free.
 
     ``bias_overlapping`` (default False — opt-in, doesn't affect the
     main placement pipeline unless explicitly requested): with
@@ -167,9 +180,11 @@ def run_macro_sa(
     rng = random.Random(seed)
 
     # Finding 7: RUDY penalty cache. Recomputed every rudy_recompute_every
-    # steps. rudy_weight=0 (default) disables RUDY in SA — matching
-    # previous behavior — but the verbose report in place/pipeline.py
-    # still shows RUDY so the user can see congestion.
+    # steps. The pin-density cache rides the same cadence — the two maps
+    # walk the same nets/pads, so refreshing them together is essentially
+    # free. A weight of 0 disables the corresponding signal in SA, but
+    # the verbose report in place/pipeline.py still shows both so the
+    # user can see congestion regardless.
     rudy_penalty_cache: float | None = None
     if rudy_weight > 0:
         try:
@@ -180,9 +195,22 @@ def run_macro_sa(
         if verbose:
             print(f"  SA: RUDY enabled (weight={rudy_weight}, initial penalty={rudy_penalty_cache:.3f})")
 
+    pin_density_penalty_cache: float | None = None
+    if pin_density_weight > 0:
+        try:
+            from engine.congestion import pin_density_penalty as _pdp
+            pin_density_penalty_cache, _peak, _avg, _overflow = _pdp(model)
+        except Exception:
+            pin_density_penalty_cache = 0.0
+        if verbose:
+            print(f"  SA: pin-density enabled (weight={pin_density_weight}, "
+                  f"initial penalty={pin_density_penalty_cache:.3f})")
+
     initial = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma,
                        net_weights=net_weights,
-                       rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache)
+                       rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache,
+                       pin_density_weight=pin_density_weight,
+                       pin_density_penalty=pin_density_penalty_cache)
     initial_total = initial["total"]
     best_total = initial_total
     best_snapshot = _snapshot_positions(model)
@@ -203,21 +231,25 @@ def run_macro_sa(
     # model/macros are back in their pre-calibration state here — safe
     # to build the incremental tracker's cache from current positions.
     #
-    # rudy_weight's contribution is intentionally NOT part of the
-    # tracker (it's recomputed wholesale every rudy_recompute_every
-    # steps anyway, see below) — it's added on top of the tracker's
-    # hpwl/overlap/boundary total for the accept/reject decision, same
-    # as the non-incremental cost.evaluate() does.
+    # rudy_weight's and pin_density_weight's contributions are
+    # intentionally NOT part of the tracker (they're recomputed wholesale
+    # every rudy_recompute_every steps anyway, see below) — they're
+    # added on top of the tracker's hpwl/overlap/boundary total for the
+    # accept/reject decision, same as the non-incremental cost.evaluate()
+    # does.
     tracker = IncrementalCostTracker(
         model, macros, alpha=alpha, beta=beta, gamma=gamma, net_weights=net_weights,
     )
     # Sanity: the tracker's from-cache total must agree with the
-    # from-scratch evaluate() above (excluding the rudy term, which
-    # the tracker doesn't carry). Cheap to check once; catches macro/
-    # model mismatches (e.g. a macro whose members aren't all in
+    # from-scratch evaluate() above (excluding the routability terms,
+    # which the tracker doesn't carry). Cheap to check once; catches
+    # macro/model mismatches (e.g. a macro whose members aren't all in
     # model.components) immediately instead of silently drifting.
     tracker_initial = tracker.total()
-    if abs(tracker_initial["total"] - (initial_total - rudy_weight * (rudy_penalty_cache or 0.0))) > 1e-3:
+    expected_tracker_total = (initial_total
+                              - rudy_weight * (rudy_penalty_cache or 0.0)
+                              - pin_density_weight * (pin_density_penalty_cache or 0.0))
+    if abs(tracker_initial["total"] - expected_tracker_total) > 1e-3:
         # Fall back to full recompute every iteration rather than trust
         # a tracker that disagrees with ground truth — correctness over
         # speed if the two ever diverge (e.g. a future macro field the
@@ -335,11 +367,15 @@ def run_macro_sa(
 
             if tracker is not None:
                 proposed = tracker.propose(touched_indices)
-                new_total = proposed["total"] + rudy_weight * (rudy_penalty_cache or 0.0)
+                new_total = (proposed["total"]
+                             + rudy_weight * (rudy_penalty_cache or 0.0)
+                             + pin_density_weight * (pin_density_penalty_cache or 0.0))
             else:
                 new_cost = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma,
                                     net_weights=net_weights,
-                                    rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache)
+                                    rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache,
+                                    pin_density_weight=pin_density_weight,
+                                    pin_density_penalty=pin_density_penalty_cache)
                 new_total = new_cost["total"]
             delta = new_total - current_total
 
@@ -363,15 +399,28 @@ def run_macro_sa(
 
             T *= cooling
 
-            # Finding 7: periodically recompute the RUDY penalty so SA's
-            # cost reflects the current routing congestion (not a stale
-            # snapshot from the start of the reheat round). The recompute
-            # is O(nets × cells) — doing it every step would dominate
-            # SA runtime, so we batch it every rudy_recompute_every steps.
-            if rudy_weight > 0 and (it + 1) % rudy_recompute_every == 0:
+            # Finding 7: periodically recompute the routability penalties
+            # so SA's cost reflects the current routing congestion (not
+            # a stale snapshot from the start of the reheat round). The
+            # recompute is O(nets × cells) for RUDY and O(pins) for pin
+            # density — doing it every step would dominate SA runtime,
+            # so we batch it every rudy_recompute_every steps. The two
+            # signals share the cadence because their maps walk the same
+            # nets/pads; refreshing them together is essentially free.
+            if ((rudy_weight > 0 or pin_density_weight > 0)
+                    and (it + 1) % rudy_recompute_every == 0):
                 try:
-                    from engine.congestion import rudy_congestion_penalty
-                    rudy_penalty_cache, _peak, _avg, _overflow = rudy_congestion_penalty(model)
+                    if rudy_weight > 0:
+                        from engine.congestion import rudy_congestion_penalty
+                        (rudy_penalty_cache,
+                         _peak, _avg, _overflow) = rudy_congestion_penalty(model)
+                except Exception:
+                    pass
+                try:
+                    if pin_density_weight > 0:
+                        from engine.congestion import pin_density_penalty as _pdp
+                        (pin_density_penalty_cache,
+                         _peak, _avg, _overflow) = _pdp(model)
                 except Exception:
                     pass
 
@@ -386,7 +435,9 @@ def run_macro_sa(
 
     final = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma,
                      net_weights=net_weights,
-                     rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache)
+                     rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache,
+                     pin_density_weight=pin_density_weight,
+                     pin_density_penalty=pin_density_penalty_cache)
     if verbose:
         print(
             f"  SA done: initial={initial_total:.2f}, final={final['total']:.2f} "

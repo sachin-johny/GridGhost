@@ -191,7 +191,8 @@ def run_placement_pipeline(
     boards: list[Path],
     output_dir: Path,
     *,
-    rudy_weight: float = 0.0,
+    rudy_weight: float | None = None,
+    pin_density_weight: float | None = None,
     seed: int = 42,
     source_label: str = "test_pcbs",
 ) -> tuple[list[dict], dict]:
@@ -212,7 +213,8 @@ def run_placement_pipeline(
         print(f"\n  [{pcb_path.stem}] running place_v2...")
         board_result = _run_one_board(
             pcb_path, output_dir,
-            rudy_weight=rudy_weight, seed=seed, source_label=source_label,
+            rudy_weight=rudy_weight, pin_density_weight=pin_density_weight,
+            seed=seed, source_label=source_label,
         )
         board_results.append(board_result)
         n_ovl = board_result.get("overlaps", "?")
@@ -238,7 +240,8 @@ def _run_one_board(
     pcb_path: Path,
     output_dir: Path,
     *,
-    rudy_weight: float = 0.0,
+    rudy_weight: float | None = None,
+    pin_density_weight: float | None = None,
     seed: int = 42,
     source_label: str,
 ) -> dict:
@@ -285,6 +288,7 @@ def _run_one_board(
             seed=seed,
             verbose=False,
             rudy_weight=rudy_weight,
+            pin_density_weight=pin_density_weight,
         )
         sa_failed = False
         sa_error = None
@@ -552,8 +556,10 @@ def main():
                     help="Skip phase 2 (placement pipeline on test_pcbs)")
     ap.add_argument("--only", nargs="*", default=None,
                     help="Only run these board stems (e.g. cbb test4). Applies to phases 2+3.")
-    ap.add_argument("--rudy-weight", type=float, default=0.0,
-                    help="RUDY congestion penalty weight in SA (default: 0 = disabled)")
+    ap.add_argument("--rudy-weight", type=float, default=None,
+                    help="RUDY congestion penalty weight in SA (default: from config.json = enabled)")
+    ap.add_argument("--pin-density-weight", type=float, default=None,
+                    help="Pin-density congestion penalty weight in SA (default: from config.json = enabled)")
     ap.add_argument("--seed", type=int, default=42,
                     help="Random seed for placement determinism (default: 42)")
     ap.add_argument("--output-dir", default=None,
@@ -598,7 +604,9 @@ def main():
     if not args.skip_placement and test_boards:
         results, summary = run_placement_pipeline(
             test_boards, output_dir,
-            rudy_weight=args.rudy_weight, seed=args.seed,
+            rudy_weight=args.rudy_weight,
+            pin_density_weight=args.pin_density_weight,
+            seed=args.seed,
             source_label="test_pcbs",
         )
         all_board_results.extend(results)
@@ -619,7 +627,9 @@ def main():
     if not args.skip_external and external_boards:
         results, summary = run_placement_pipeline(
             external_boards, output_dir,
-            rudy_weight=args.rudy_weight, seed=args.seed,
+            rudy_weight=args.rudy_weight,
+            pin_density_weight=args.pin_density_weight,
+            seed=args.seed,
             source_label="external_boards",
         )
         all_board_results.extend(results)
@@ -672,7 +682,8 @@ def main():
             + (" --skip-cli-smoke" if args.skip_cli_smoke else "")
             + (" --skip-overlap-regression" if args.skip_overlap_regression else "")
             + (" --skip-external" if args.skip_external else "")
-            + (f" --rudy-weight {args.rudy_weight}" if args.rudy_weight else "")
+            + (f" --rudy-weight {args.rudy_weight}" if args.rudy_weight is not None else "")
+            + (f" --pin-density-weight {args.pin_density_weight}" if args.pin_density_weight is not None else "")
             + (f" --seed {args.seed}" if args.seed != 42 else "")
         ),
         "phases": phases,

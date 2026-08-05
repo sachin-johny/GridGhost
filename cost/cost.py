@@ -132,6 +132,8 @@ def evaluate(
     net_weights: dict[str, float] | None = None,
     rudy_weight: float = 0.0,
     rudy_penalty: float | None = None,
+    pin_density_weight: float = 0.0,
+    pin_density_penalty: float | None = None,
 ) -> dict[str, float]:
     """Total placement cost.
 
@@ -159,8 +161,20 @@ def evaluate(
             0, the penalty is computed here (slower). Callers that
             evaluate cost in a tight SA loop should pre-compute the
             penalty every N steps and pass it in.
+        pin_density_weight: Pin-density congestion penalty weight
+            (default 0 = disabled). Complementary to ``rudy_weight``:
+            RUDY sees wire density from net bounding boxes; pin density
+            sees local pin-escape demand (a tight cluster of small
+            passives next to a QFN has high pin density even if every
+            net is short and contributes little to RUDY). Both default
+            ON via config.json so the placer produces a routable result
+            out of the box; pass weight 0 to disable either signal.
+        pin_density_penalty: Pre-computed pin-density penalty (avoids
+            re-computing the pin map on every cost evaluation). Same
+            caching pattern as ``rudy_penalty``.
 
-    Returns dict with hpwl, overlap, boundary, rudy, and total components.
+    Returns dict with hpwl, overlap, boundary, rudy, pin_density, and
+    total components.
     """
     h = total_hpwl(model, include_power=include_power, exclude_nets=exclude_nets,
                     net_weights=net_weights)
@@ -176,10 +190,23 @@ def evaluate(
                 r = 0.0
         else:
             r = rudy_penalty
+    p = 0.0
+    if pin_density_weight > 0:
+        if pin_density_penalty is None:
+            try:
+                from engine.congestion import pin_density_penalty as _pdp
+                p, _peak, _avg, _overflow = _pdp(model)
+            except Exception:
+                p = 0.0
+        else:
+            p = pin_density_penalty
     return {
         "hpwl": h,
         "overlap": o,
         "boundary": b,
         "rudy": r,
-        "total": alpha * h + beta * o + gamma * b + rudy_weight * r,
+        "pin_density": p,
+        "total": (alpha * h + beta * o + gamma * b
+                  + rudy_weight * r
+                  + pin_density_weight * p),
     }

@@ -32,8 +32,10 @@
         "greedy_rotations": [90.0, 180.0, 270.0],
         "greedy_improve_threshold": 0.5,
         "overlap_cap_factor": 2.0,
-        "rudy_weight": 0.3,
+        "rudy_weight": 1.0,
         "rudy_grid_resolution": 2.0,
+        "pin_density_weight": 0.2,
+        "pin_density_grid_resolution": 2.0,
         "sa_auto_disable_min_components": 6,
         "sa_auto_disable_max_components": 50,
         "spread_floor_fraction": 0.10

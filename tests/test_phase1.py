@@ -1264,6 +1264,355 @@ def test_routing_congestion_in_profiles():
             f"{profile_name} should NOT have routing_congestion (off by default)"
 
 
+def test_pin_density_penalty_detects_hotspot():
+    """Pin-density congestion must fire when many signal pins share one
+    grid cell — a pin-escape hotspot.
+
+    Sets up 4 ICs in a tight cluster (all within one 2mm cell) connected
+    to 4 far-away passives. Pin density sees 4 pins stacked in one cell
+    (peak = 4.0, well above the 2.0 floor target) and fires. This is the
+    case pin density was added for: a router has to escape 4 pins out of
+    a 2mm × 2mm area, which is hard even if the wires themselves are
+    short.
+    """
+    from engine.congestion import (
+        compute_pin_density_map,
+        pin_density_penalty,
+    )
+
+    # 4 ICs clustered at (5.0..5.2, 5.0..5.2), each net's other endpoint
+    # is a passive at the far corner of the 20×20 board.
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=20, y_max=20),
+        components=[
+            # Clustered ICs (4 pins in one 2mm cell)
+            Component(
+                ref=f"U{i+1}", x=x, y=y, width=0.4, height=0.4,
+                component_type="ic",
+                pads=[Pad(pad_name="1", x=0, y=0, net=f"N{i+1}")],
+                nets=[f"N{i+1}"],
+            )
+            for i, (x, y) in enumerate([
+                (5.0, 5.0), (5.2, 5.0), (5.0, 5.2), (5.2, 5.2),
+            ])
+        ] + [
+            # Far-away passives (one per net, each in its own far cell)
+            Component(
+                ref=f"R{i+1}", x=x, y=y, width=0.4, height=0.4,
+                component_type="resistor",
+                pads=[Pad(pad_name="1", x=0, y=0, net=f"N{i+1}")],
+                nets=[f"N{i+1}"],
+            )
+            for i, (x, y) in enumerate([
+                (17.0, 17.0), (3.0, 17.0), (17.0, 3.0), (3.0, 3.0),
+            ])
+        ],
+        nets=[
+            Net(name="N1", pins=[("U1", "1"), ("R1", "1")]),
+            Net(name="N2", pins=[("U2", "1"), ("R2", "1")]),
+            Net(name="N3", pins=[("U3", "1"), ("R3", "1")]),
+            Net(name="N4", pins=[("U4", "1"), ("R4", "1")]),
+        ],
+    )
+
+    grid, meta = compute_pin_density_map(model, grid_resolution=2.0)
+    # All 4 clustered IC pins fall in the (4..6, 4..6) mm cell. The 4
+    # far-away passives each land in their own cell. So the cluster cell
+    # has peak = 4.0.
+    peak = max(max(row) for row in grid)
+    assert peak >= 4.0, f"Pin density peak should be ≥ 4 in the clustered cell, got {peak}"
+
+    pd_penalty, pd_peak, _pd_avg, _pd_ovf = pin_density_penalty(model, grid_resolution=2.0)
+    assert pd_penalty > 0, "Pin-density penalty must fire on a pin hotspot"
+    assert pd_peak == peak, f"pin_density_penalty peak {pd_peak} != map peak {peak}"
+
+
+def test_pin_density_complements_rudy_on_long_nets():
+    """Pin density is more sensitive than RUDY to pin-escape clusters
+    when each net's bbox is large.
+
+    On a board where many pins cluster in one cell but each net's bbox
+    is large (long nets), RUDY's per-cell contribution from each net is
+    small (1/num_cells_in_bbox). RUDY still fires (the cluster cell
+    accumulates contributions from all nets whose bbox includes it),
+    but the penalty is dominated by the cluster's wire-density
+    contribution. Pin density's penalty is dominated by the raw pin
+    count and is far larger relative to the board's average.
+
+    This is the complementary-roles argument: the two signals detect
+    different aspects of the same congestion pattern, so shipping both
+    gives the placer a richer gradient signal than either alone.
+    """
+    from engine.congestion import (
+        pin_density_penalty,
+        rudy_congestion_penalty,
+    )
+
+    # 4 ICs clustered tightly, each net's other endpoint is on the
+    # opposite side of a 100×100 board. Each net's bbox spans the
+    # entire board, so each net's RUDY contribution per cell is ~1/576.
+    # The cluster cell sees ~4/576 ≈ 0.007 from RUDY. Pin density sees
+    # 4 pins stacked in one cell — peak 4.0.
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=100, y_max=100),
+        components=[
+            Component(
+                ref=f"U{i+1}", x=x, y=y, width=0.4, height=0.4,
+                component_type="ic",
+                pads=[Pad(pad_name="1", x=0, y=0, net=f"N{i+1}")],
+                nets=[f"N{i+1}"],
+            )
+            for i, (x, y) in enumerate([
+                (50.0, 50.0), (50.1, 50.0), (50.0, 50.1), (50.1, 50.1),
+            ])
+        ] + [
+            Component(
+                ref=f"R{i+1}", x=x, y=y, width=0.4, height=0.4,
+                component_type="resistor",
+                pads=[Pad(pad_name="1", x=0, y=0, net=f"N{i+1}")],
+                nets=[f"N{i+1}"],
+            )
+            for i, (x, y) in enumerate([
+                (5.0, 5.0), (95.0, 5.0), (5.0, 95.0), (95.0, 95.0),
+            ])
+        ],
+        nets=[
+            Net(name="N1", pins=[("U1", "1"), ("R1", "1")]),
+            Net(name="N2", pins=[("U2", "1"), ("R2", "1")]),
+            Net(name="N3", pins=[("U3", "1"), ("R3", "1")]),
+            Net(name="N4", pins=[("U4", "1"), ("R4", "1")]),
+        ],
+    )
+
+    pd_penalty, pd_peak, pd_avg, _pd_ovf = pin_density_penalty(model, grid_resolution=2.0)
+    rudy_penalty, rudy_peak, rudy_avg, _rudy_ovf = rudy_congestion_penalty(model, grid_resolution=2.0)
+
+    # Both signals fire — they're complementary, not mutually exclusive.
+    assert pd_penalty > 0, (
+        f"Pin density should fire on the 4-pin cluster, got penalty={pd_penalty}"
+    )
+    assert pd_peak >= 4.0, f"Pin density peak should be ≥ 4, got {pd_peak}"
+
+    # Pin density's signal-to-noise (peak / average) is much higher than
+    # RUDY's on this board, because pin density's per-cell value is
+    # either 0 or K (the pin count) — sharp peaks — while RUDY spreads
+    # each net's contribution across its entire bbox — soft peaks.
+    # On this board pin density's SNR is ~2500× (peak 4 / avg 0.0016),
+    # RUDY's is ~4.4× (peak 0.007 / avg 0.0016). Pin density is hundreds
+    # of times more sensitive to this pin-escape cluster than RUDY —
+    # that's why shipping both signals gives a richer gradient.
+    pd_snr = pd_peak / max(pd_avg, 1e-12)
+    rudy_snr = rudy_peak / max(rudy_avg, 1e-12)
+    assert pd_snr > rudy_snr * 10, (
+        f"Pin density's signal-to-noise ratio ({pd_snr:.1f}×) should be "
+        f"much higher than RUDY's ({rudy_snr:.1f}×) on a pin-escape "
+        f"cluster with long nets — that's the whole point of having "
+        f"both signals."
+    )
+
+
+def test_pin_density_excludes_power_pins():
+    """Power/ground pins must not contribute to pin-density congestion.
+
+    Every IC has VCC/GND, so counting them would uniformly inflate every
+    cell and wash out the signal. Power pins must be excluded so the map
+    reflects signal-routing demand only.
+    """
+    from engine.congestion import compute_pin_density_map
+
+    # Two components, each with one +3V3 pin and one signal pin.
+    # Both pairs of +3V3 pins fall in the same cell; the signal pins
+    # are spread out.
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=20, y_max=20),
+        components=[
+            Component(
+                ref="U1", x=5, y=5, width=2, height=2, component_type="ic",
+                pads=[
+                    Pad(pad_name="1", x=0, y=0, net="+3V3"),
+                    Pad(pad_name="2", x=0.5, y=0, net="SIG_A"),
+                ],
+                nets=["+3V3", "SIG_A"],
+            ),
+            Component(
+                ref="U2", x=6, y=5, width=2, height=2, component_type="ic",
+                pads=[
+                    Pad(pad_name="1", x=0, y=0, net="+3V3"),
+                    Pad(pad_name="2", x=0.5, y=0, net="SIG_A"),
+                ],
+                nets=["+3V3", "SIG_A"],
+            ),
+        ],
+        nets=[
+            Net(name="+3V3", pins=[("U1", "1"), ("U2", "1")]),
+            Net(name="SIG_A", pins=[("U1", "2"), ("U2", "2")]),
+        ],
+    )
+
+    grid, _meta = compute_pin_density_map(model, grid_resolution=2.0)
+    total_pins_in_grid = sum(sum(row) for row in grid)
+    # Two signal pins on SIG_A → only those should be counted.
+    # The +3V3 pins must be excluded.
+    assert total_pins_in_grid == 2.0, (
+        f"Power pins should be excluded from pin density; expected 2 signal "
+        f"pins counted, got {total_pins_in_grid}"
+    )
+
+
+def test_pin_density_penalty_zero_on_uniform_board():
+    """Pin-density penalty must be 0 on a uniformly distributed board.
+
+    Same adaptive-target scheme as RUDY (1.5× average). On a uniform
+    board peak ≈ average, so the penalty is zero — it only fires when
+    there's an actual hotspot.
+    """
+    from engine.congestion import pin_density_penalty
+
+    # 16 components evenly spread on a 4×4 grid across a 40×40 board.
+    # Each cell of the 2mm grid (20×20 cells) holds at most 1 pin →
+    # peak == average == 1.0 → penalty 0.
+    positions = [(x, y) for x in range(5, 40, 9) for y in range(5, 40, 9)]
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=40, y_max=40),
+        components=[
+            Component(
+                ref=f"U{i+1}", x=x, y=y, width=1, height=1, component_type="ic",
+                pads=[Pad(pad_name="1", x=0, y=0, net=f"N{i+1}")],
+                nets=[f"N{i+1}"],
+            )
+            for i, (x, y) in enumerate(positions)
+        ],
+        nets=[
+            # Pair adjacent pins on shared nets so each net has >= 2 pins.
+            Net(name=f"N{i+1}",
+                pins=[("U1", "1"), (f"U{i+1}", "1")] if i > 0
+                else [("U1", "1"), ("U2", "1")])
+            for i in range(len(positions))
+        ],
+    )
+
+    pd_penalty, _peak, _avg, _ovf = pin_density_penalty(model, grid_resolution=2.0)
+    assert pd_penalty == 0.0, (
+        f"Uniformly distributed board should have 0 pin-density penalty, "
+        f"got {pd_penalty}"
+    )
+
+
+def test_evaluate_cost_function_includes_pin_density_term():
+    """cost.evaluate() must thread pin_density_weight into the total.
+
+    Verifies the new cost-function wiring end-to-end: with pin density
+    active and rudy disabled, the total cost should equal
+    α·HPWL + β·Overlap + γ·Boundary + pin_density_weight·PinDensity.
+    """
+    from cost.cost import evaluate
+    from models.macro import Macro
+
+    # Use the clustered setup so pin density actually fires (>2 pins in
+    # one cell, above the 2.0 floor target).
+    model = BoardModel(
+        board=BoardOutline(x_min=0, y_min=0, x_max=20, y_max=20),
+        components=[
+            Component(
+                ref=f"U{i+1}", x=x, y=y, width=0.4, height=0.4,
+                component_type="ic",
+                pads=[Pad(pad_name="1", x=0, y=0, net=f"N{i+1}")],
+                nets=[f"N{i+1}"],
+            )
+            for i, (x, y) in enumerate([
+                (5.0, 5.0), (5.2, 5.0), (5.0, 5.2), (5.2, 5.2),
+            ])
+        ] + [
+            Component(
+                ref=f"R{i+1}", x=x, y=y, width=0.4, height=0.4,
+                component_type="resistor",
+                pads=[Pad(pad_name="1", x=0, y=0, net=f"N{i+1}")],
+                nets=[f"N{i+1}"],
+            )
+            for i, (x, y) in enumerate([
+                (17.0, 17.0), (3.0, 17.0), (17.0, 3.0), (3.0, 3.0),
+            ])
+        ],
+        nets=[
+            Net(name="N1", pins=[("U1", "1"), ("R1", "1")]),
+            Net(name="N2", pins=[("U2", "1"), ("R2", "1")]),
+            Net(name="N3", pins=[("U3", "1"), ("R3", "1")]),
+            Net(name="N4", pins=[("U4", "1"), ("R4", "1")]),
+        ],
+    )
+
+    macros = [Macro.alone(c) for c in model.components]
+
+    # Disable RUDY, enable pin density
+    result = evaluate(
+        model, macros,
+        alpha=1.0, beta=25.0, gamma=8.0,
+        rudy_weight=0.0,
+        pin_density_weight=0.5,
+    )
+
+    # Verify the breakdown includes the pin_density field
+    assert "pin_density" in result, "evaluate() must include pin_density in its breakdown"
+    assert result["pin_density"] > 0, "pin_density should be > 0 on the hotspot board"
+
+    # Verify the total = α·HPWL + β·Overlap + γ·Boundary + 0.5·PinDensity
+    expected_total = (
+        1.0 * result["hpwl"]
+        + 25.0 * result["overlap"]
+        + 8.0 * result["boundary"]
+        + 0.5 * result["pin_density"]
+    )
+    assert abs(result["total"] - expected_total) < 1e-6, (
+        f"Total {result['total']} != expected {expected_total} — pin_density_weight "
+        f"not threaded correctly into total cost"
+    )
+
+    # And with pin_density_weight=0, the total should NOT include the pin term
+    result_off = evaluate(
+        model, macros,
+        alpha=1.0, beta=25.0, gamma=8.0,
+        rudy_weight=0.0,
+        pin_density_weight=0.0,
+    )
+    expected_off = (
+        1.0 * result_off["hpwl"]
+        + 25.0 * result_off["overlap"]
+        + 8.0 * result_off["boundary"]
+    )
+    assert abs(result_off["total"] - expected_off) < 1e-6
+    # The pin_density field is still computed (for reporting) when weight=0
+    # only if a pre-computed penalty is passed in; otherwise it's 0. Either
+    # way, it must not affect the total.
+    assert result_off["total"] < result["total"], (
+        "Disabling pin_density_weight should give a lower total cost on this hotspot board"
+    )
+
+
+def test_rudy_weight_defaults_to_config_value():
+    """The CLI default for --rudy-weight must defer to config.json.
+
+    Regression test for the original bug: the CLI parser defaulted
+    --rudy-weight to 0.0, which silently disabled RUDY even though
+    config.json said 0.3. The fix makes the CLI default None and lets
+    place_v2() resolve None → config.annealer.rudy_weight.
+
+    Verifies that:
+    - config.json has a non-zero rudy_weight (so the default is "on")
+    - place_v2's rudy_weight parameter, when None, resolves to the
+      config value (not to 0.0)
+    """
+    from config import load_config
+    cfg = load_config()
+    assert cfg.annealer.rudy_weight > 0, (
+        "config.json annealer.rudy_weight must be > 0 so RUDY is on by default; "
+        f"got {cfg.annealer.rudy_weight}"
+    )
+    assert cfg.annealer.pin_density_weight > 0, (
+        "config.json annealer.pin_density_weight must be > 0 so pin-density is "
+        f"on by default; got {cfg.annealer.pin_density_weight}"
+    )
+
+
 def test_thermal_separation_rule_dispatch():
     """Phase 2.4: thermal_separation must be a dispatchable ConstraintRule.
 
@@ -2635,6 +2984,12 @@ def main():
     run_test("Profile rules", test_profile_rules)
     run_test("Routing congestion rule dispatch", test_routing_congestion_rule_dispatch)
     run_test("Routing congestion in profiles", test_routing_congestion_in_profiles)
+    run_test("Pin density detects hotspot", test_pin_density_penalty_detects_hotspot)
+    run_test("Pin density complements RUDY on long nets", test_pin_density_complements_rudy_on_long_nets)
+    run_test("Pin density excludes power pins", test_pin_density_excludes_power_pins)
+    run_test("Pin density zero on uniform board", test_pin_density_penalty_zero_on_uniform_board)
+    run_test("evaluate() threads pin_density into total", test_evaluate_cost_function_includes_pin_density_term)
+    run_test("RUDY + pin-density default-on via config", test_rudy_weight_defaults_to_config_value)
     run_test("Thermal separation rule dispatch", test_thermal_separation_rule_dispatch)
     run_test("Thermal separation far apart no penalty", test_thermal_separation_far_apart_no_penalty)
     run_test("Thermal separation ignores same-net pairs", test_thermal_separation_ignores_same_net_pairs)

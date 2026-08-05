@@ -87,12 +87,24 @@ auto_placer/
 ## Core Concepts
 
 ### Cost Function (macro pipeline)
-`Total Cost = α·HPWL + β·Overlap + γ·Boundary`
+`Total Cost = α·HPWL + β·Overlap + γ·Boundary + rudy·RUDY + pin_density·PinDensity`
 - **HPWL** — Half-perimeter wirelength over all nets. **Power/ground nets are included**
   (key change vs legacy) — caps share rails with their IC, so power-net HPWL is the
   gradient signal keeping caps near their assigned IC during SA.
 - **Overlap** — sum of pairwise macro bbox intersection areas (macros = rigid union bboxes).
 - **Boundary** — linear distance penalty for bboxes outside the outline; edge connectors (intentional overhang) excluded.
+- **RUDY** — wire-density congestion (each net's bbox spread uniformly across the grid
+  cells it covers). Catches routing choke points where many nets' bboxes overlap — HPWL
+  alone is blind to this. Default weight `1.0` (from `config.json` `annealer.rudy_weight`);
+  pass `--rudy-weight 0` to disable.
+- **Pin density** — signal-pin count per grid cell. Catches pin-escape congestion
+  (dense clusters of small passives next to a QFN) that RUDY's wire-density model misses.
+  Default weight `0.2` (from `config.json` `annealer.pin_density_weight`); pass
+  `--pin-density-weight 0` to disable.
+
+Both routability signals are **default-on** so the placer produces a routable result
+out of the box. The verbose report (`-v`) always shows initial + final values for both,
+even when their weight is set to 0.
 
 The legacy path additionally applies a **δ·Constraints** term via `engine/cost_function.py`
 + `engine/constraint_evaluator.py` (decoupling proximity, crystal-MCU, thermal, etc.).
@@ -134,7 +146,8 @@ Key `place` options (defaults come from `config.json`; see README for the full t
 | `--sa-reheat` | `3` | `annealer.reheat_count` |
 | `--alpha/--beta/--gamma` | `1.0 / 25.0 / 8.0` | macro-v2 cost weights |
 | `--seed` | `42` | SA/placement RNG seed (`--seed 0` = non-deterministic) |
-| `--rudy-weight` | `0.0` | RUDY congestion penalty in SA cost (0 = off) |
+| `--rudy-weight` | `0.3` (from config) | RUDY wire-density congestion penalty in SA cost (0 = off) |
+| `--pin-density-weight` | `0.2` (from config) | Pin-density congestion penalty in SA cost (0 = off). Complements RUDY. |
 | `--legalizer` | `heuristic` | one of `heuristic` / `abacus` / `sa_polish` |
 | `--connector-mating-margin` | `5.0` | edge offset for perimeter connectors |
 | `--macro-v2/--no-macro-v2` | on | toggle pipeline (`--no-macro-v2` = legacy grid) |
