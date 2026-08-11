@@ -63,8 +63,12 @@ def _in_bounds(comp: Component, interior_bbox, board: BoardOutline) -> bool:
     if interior_bbox:
         return (x1 >= interior_bbox[0] and x2 <= interior_bbox[2]
                 and y1 >= interior_bbox[1] and y2 <= interior_bbox[3])
-    return (x1 >= board.x_min and x2 <= board.x_max
-            and y1 >= board.y_min and y2 <= board.y_max)
+    # board.contains_bbox() is polygon-aware: for a rectangular board this
+    # is identical to the old direct x_min/x_max/y_min/y_max comparison;
+    # for a board with notches/mouse-bites/cutouts it also rejects a bbox
+    # that landed in a concavity even though it's within the outer AABB —
+    # which the raw rectangle comparison used to silently accept.
+    return board.contains_bbox(comp.bbox)
 
 
 def _clamp_to_bounds(comp, interior_bbox, board):
@@ -75,13 +79,13 @@ def _clamp_to_bounds(comp, interior_bbox, board):
         x_max = interior_bbox[2] - half_w
         y_min = interior_bbox[1] + half_h
         y_max = interior_bbox[3] - half_h
+        new_x = max(x_min, min(comp.x, x_max))
+        new_y = max(y_min, min(comp.y, y_max))
     else:
-        x_min = board.x_min + half_w
-        x_max = board.x_max - half_w
-        y_min = board.y_min + half_h
-        y_max = board.y_max - half_h
-    new_x = max(x_min, min(comp.x, x_max))
-    new_y = max(y_min, min(comp.y, y_max))
+        # board.fit_bbox_inside() degenerates to the exact same single
+        # clamp for a rectangular board; for a polygon board it also
+        # pulls the component clear of any notch/hole it's sitting in.
+        new_x, new_y = board.fit_bbox_inside(comp.x, comp.y, half_w, half_h)
     changed = (new_x != comp.x or new_y != comp.y)
     comp.x = new_x
     comp.y = new_y

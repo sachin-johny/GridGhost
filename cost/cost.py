@@ -100,23 +100,23 @@ def total_boundary(model: "BoardModel") -> float:
     """Total out-of-bounds distance for all components.
 
     Edge connectors (intentional overhang) are excluded. Returns the
-    linear sum of how far each component's bbox pokes past each board
-    edge — a smooth gradient SA can follow.
+    linear sum of how far each component's bbox pokes past the board
+    outline — a smooth gradient SA can follow.
+
+    Polygon-aware via ``BoardOutline.bbox_overflow``: for a rectangular
+    outline this is exactly the old left+right+top+bottom overflow sum
+    (preserved byte-for-byte by ``bbox_overflow``); for a non-rectangular
+    outline (notches, mouse-bites, cutouts, holes) it charges each bbox
+    corner that has strayed off the TRUE board for its distance back to
+    the nearest outline edge — so SA on the default macro-v2 path gets a
+    gradient away from concavities, not just the outer AABB.
     """
     b = model.board
     total = 0.0
     for c in model.components:
         if getattr(c, "is_edge_connector", False):
             continue
-        x1, y1, x2, y2 = c.bbox
-        if x1 < b.x_min:
-            total += b.x_min - x1
-        if y1 < b.y_min:
-            total += b.y_min - y1
-        if x2 > b.x_max:
-            total += x2 - b.x_max
-        if y2 > b.y_max:
-            total += y2 - b.y_max
+        total += b.bbox_overflow(c.bbox)
     return total
 
 

@@ -444,6 +444,7 @@ def displace_to_clear_slots(
     max_candidate_slots: int = 400,
     verbose: bool = False,
     per_macro_keepout: "callable[[Macro], float] | None" = None,
+    board: "BoardOutline | None" = None,
 ) -> int:
     """Tetris-style global cleanup — jump overlapping macros to the nearest empty slot.
 
@@ -494,6 +495,7 @@ def displace_to_clear_slots(
     bounds_h = y_max - y_min
     if bounds_w <= 0 or bounds_h <= 0:
         return _count_residual_overlaps(macros)
+    is_poly = board is not None and board.is_polygon
 
     # Build a sparse candidate-slot grid. Aim for ~max_candidate_slots
     # evenly-spaced positions across the bounds. The slot step is
@@ -541,24 +543,29 @@ def displace_to_clear_slots(
         m.leader.y += dy
         m.apply_offsets()
         try:
-            # Global bounds check: if the macro's bbox pokes past the
-            # GLOBAL bounds (not keepout-shrunk), reject the slot —
-            # the macro would be physically off the board. Keepout
-            # violations (macro in-bounds but within keepout zone) are
-            # NOT rejected here: with the overlap-aware boundary clamp,
-            # a keepout-violating slot won't cause the clamp to yank the
-            # macro into an overlap (the clamp rolls back instead). A
-            # keepout violation is a soft DFM concern, not a placement
-            # invalidity — better to place the macro in-bounds with a
-            # keepout violation than to leave it OOB (which IS a hard
-            # invalidity). The previous version rejected keepout-violating
-            # slots, which caused Tetris to fail on dense boards where
-            # no keepout-clear slot existed — leaving macros OOB.
-            for c in m.members:
-                cx1, cy1, cx2, cy2 = c.bbox
-                if (cx1 < x_min - 1e-6 or cy1 < y_min - 1e-6 or
-                    cx2 > x_max + 1e-6 or cy2 > y_max + 1e-6):
-                    return True  # past global bounds → reject slot
+            # "Off the board" check: reject the slot if the macro would be
+            # physically off the board. For a rectangular outline that is
+            # the per-member AABB check below; for a polygon outline
+            # (notches/cutouts/holes) the macro's union bbox must be fully
+            # inside the TRUE outline — a slot inside the AABB but in a
+            # notch is just as invalid as one past the outer edge. Keepout
+            # violations (in-bounds but within the keepout zone) are NOT
+            # rejected here: a keepout violation is a soft DFM concern, not
+            # a placement invalidity — better to place the macro in-bounds
+            # with a keepout violation than to leave it OOB (which IS a hard
+            # invalidity). (See _fit_macro_to_polygon / boundary_clamp for
+            # where keepout is enforced as a margin.) The previous version
+            # rejected keepout-violating slots, which caused Tetris to fail
+            # on dense boards where no keepout-clear slot existed.
+            if is_poly:
+                if not board.contains_bbox(m.bbox):
+                    return True  # off the true board (notch/hole/edge) → reject
+            else:
+                for c in m.members:
+                    cx1, cy1, cx2, cy2 = c.bbox
+                    if (cx1 < x_min - 1e-6 or cy1 < y_min - 1e-6 or
+                        cx2 > x_max + 1e-6 or cy2 > y_max + 1e-6):
+                        return True  # past global bounds → reject slot
             for o in others:
                 if o is m:
                     continue
@@ -589,6 +596,11 @@ def displace_to_clear_slots(
     def _is_oob(m: "Macro") -> bool:
         if m.is_fixed:
             return False
+        if is_poly:
+            # OOB on a polygon board = not fully inside the outline (in a
+            # notch/cutout/hole, or past the outer edge). contains_bbox is
+            # the polygon authority here, not the AABB.
+            return not board.contains_bbox(m.bbox)
         bx1, by1, bx2, by2 = m.bbox
         return (bx1 < x_min - 1e-6 or by1 < y_min - 1e-6 or
                 bx2 > x_max + 1e-6 or by2 > y_max + 1e-6)
@@ -671,10 +683,78 @@ def _count_residual_overlaps(macros: list["Macro"]) -> int:
     return n
 
 
+def _fit_macro_to_polygon(
+    m: "Macro",
+    board: "BoardOutline",
+    *,
+    others: list["Macro"] | None = None,
+    keepout: float = 0.0,
+    bounds: tuple[float, float, float, float] | None = None,
+) -> bool:
+    """Fit macro ``m`` fully inside a non-rectangular board outline.
+
+    Pulls the macro out of any concavity it has strayed into (a connector
+    notch, mouse-bite, mounting cutout, or hole) by translating it to the
+    nearest position — found via ``board.fit_bbox_inside`` — where its
+    union bbox is fully on the TRUE board, honoring ``keepout`` as a DFM
+    edge margin.
+
+    Rigid bodies make this cheap: translating the leader applies the same
+    delta to every follower, so the union bbox's half-extents are preserved
+    by the move. Fitting the union half-extents to the polygon therefore
+    guarantees every follower fits it too — the cap-IC rigid-body invariant
+    cannot be broken by a pure translation. The translation is validated
+    against the board's AABB (a superset of the polygon), so a polygon-valid
+    target always passes the rectangle bounds check ``Macro.translate``
+    performs; ``board.contains_bbox`` is the final polygon authority,
+    re-checked after the move.
+
+    Returns True if the macro ended the call fully inside the outline,
+    False otherwise. When ``others`` is given, a fit that would create a
+    NEW macro-macro overlap is rolled back and returns False — the caller
+    leaves the macro where it was for the next pass / Tetris to handle,
+    the same recovery contract as the overlap-aware rectangle clamp.
+
+    No-op (returns True) for fixed macros or a rectangular outline —
+    callers gate polygon behavior on ``board.is_polygon``, and these
+    guards keep the helper safe if they don't.
+    """
+    if m.is_fixed or not board.is_polygon:
+        return True
+    bx1, by1, bx2, by2 = m.bbox
+    cur_cx = (bx1 + bx2) / 2.0
+    cur_cy = (by1 + by2) / 2.0
+    half_w = (bx2 - bx1) / 2.0
+    half_h = (by2 - by1) / 2.0
+
+    tx, ty = board.fit_bbox_inside(cur_cx, cur_cy, half_w, half_h, margin=keepout)
+    if abs(tx - cur_cx) < 1e-9 and abs(ty - cur_cy) < 1e-9:
+        # fit_bbox_inside returned the current center — accept iff it is
+        # genuinely contained (it converges immediately when already in,
+        # but may give up after max_iterations still partly off-board).
+        return board.contains_bbox(m.bbox)
+
+    # The board AABB is a superset of the polygon, so a polygon-valid
+    # target passes the rectangle bounds check Macro.translate performs.
+    rect_bounds = bounds if bounds is not None else (
+        board.x_min, board.y_min, board.x_max, board.y_max)
+    snap = m._snapshot()
+    if not m.translate(tx - cur_cx, ty - cur_cy, bounds=rect_bounds):
+        return board.contains_bbox(m.bbox)
+    if not board.contains_bbox(m.bbox):
+        m._restore(snap)
+        return False
+    if others is not None and any(m.overlaps(o) for o in others if o is not m):
+        m._restore(snap)
+        return False
+    return True
+
+
 def boundary_clamp(
     macros: list["Macro"],
     bounds: tuple[float, float, float, float],
     per_macro_keepout: "callable[[Macro], float] | None" = None,
+    board: "BoardOutline | None" = None,
 ) -> int:
     """Clamp each macro inside bounds. Returns count of macros that couldn't fit.
 
@@ -689,17 +769,35 @@ def boundary_clamp(
     clamped to (bounds + 5mm) while a resistor's bbox is clamped to
     (bounds + 0mm).
 
+    Polygon outlines: when ``board`` is a non-rectangular outline, each
+    macro is fit to the TRUE board geometry (notches/cutouts/holes
+    excluded) via ``_fit_macro_to_polygon`` instead of the four-sided
+    rectangle clamp — the rectangle clamp would otherwise push a
+    component into a notch it shares an AABB with. The rectangular fast
+    path is byte-for-byte unchanged when ``board`` is None or
+    rectangular, so existing rectangle-outline behavior (and its tuning)
+    is preserved exactly.
+
     Fixed macros (``is_fixed=True``) are skipped — their positions are
     intentional (e.g. connectors placed on the perimeter with overhang)
     and clamping them would corrupt the placement.
     """
     x_min, y_min, x_max, y_max = bounds
     failed = 0
+    is_poly = board is not None and board.is_polygon
     for m in macros:
         if m.is_fixed:
             continue  # connectors stay where place_connectors_perimeter put them
         # Per-macro extra keepout (ICs/MCUs get pushed further from edge)
         ke = per_macro_keepout(m) if per_macro_keepout else 0.0
+        if is_poly:
+            # Polygon path: fit the union bbox inside the true outline
+            # (clear of notches/cutouts/holes), honoring the per-macro
+            # keepout as a margin. The rectangle path below is bypassed
+            # entirely for polygon boards.
+            if not _fit_macro_to_polygon(m, board, keepout=ke, bounds=bounds):
+                failed += 1
+            continue
         bx_min = x_min + ke
         by_min = y_min + ke
         bx_max = x_max - ke
@@ -808,6 +906,11 @@ def legalize(
     Returns a dict with overlap count, boundary-failure count, cap-IC
     distance violation count, and the (possibly expanded) bounds.
     """
+    # The board outline — None for a plain rectangle. Threaded into every
+    # clamp / Tetris call so polygon outlines (notches/cutouts/holes) are
+    # honored on the default path; rectangular boards take the unchanged
+    # fast path everywhere (board is None-or-rectangular ⇒ is_poly False).
+    board = getattr(model, "board", None)
     if target_density is None:
         from utils.density import target_pack_density
         target_density = target_pack_density()
@@ -839,7 +942,8 @@ def legalize(
 
     if use_abacus:
         abacus_legalize_macros(model, macros, bounds, grid_mm=grid_mm, verbose=verbose)
-        failed = boundary_clamp(macros, bounds, per_macro_keepout=per_macro_keepout)
+        failed = boundary_clamp(macros, bounds, per_macro_keepout=per_macro_keepout,
+                                board=board)
         residual = _count_residual_overlaps(macros)
         if residual > 0 and verbose:
             print(f"  Abacus: {residual} residual overlap(s) after row DP + boundary clamp")
@@ -865,6 +969,7 @@ def legalize(
             # clamp to pull them in.
             failed = _boundary_clamp_overlap_aware(
                 macros, bounds, per_macro_keepout=per_macro_keepout,
+                board=board,
             )
             residual = _count_residual_overlaps(macros)
     else:
@@ -879,6 +984,7 @@ def legalize(
         # not be able to fix without pushing the macro back OOB).
         failed = _boundary_clamp_overlap_aware(
             macros, bounds, per_macro_keepout=per_macro_keepout,
+            board=board,
         )
 
         # Iterate: clamp creates overlaps, push-apart fixes them but may push
@@ -887,6 +993,7 @@ def legalize(
             new_residual = push_apart_overlapping(macros, bounds, max_passes=max_push_passes)
             new_failed = _boundary_clamp_overlap_aware(
                 macros, bounds, per_macro_keepout=per_macro_keepout,
+                board=board,
             )
             if new_residual == residual and new_failed == failed:
                 # No progress this round.
@@ -902,6 +1009,7 @@ def legalize(
             # Re-clamp with overlap-aware variant after the cleanup push.
             failed = _boundary_clamp_overlap_aware(
                 macros, bounds, per_macro_keepout=per_macro_keepout,
+                board=board,
             )
 
         # ─── Force-directed spread pass (root-cause fix for greedy local minima) ──
@@ -952,6 +1060,7 @@ def legalize(
                     # doesn't yank macros into each other.
                     failed = _boundary_clamp_overlap_aware(
                         macros, bounds, per_macro_keepout=per_macro_keepout,
+                        board=board,
                     )
                     # One more push-apart to clean up any overlaps the
                     # boundary_clamp re-introduced.
@@ -1049,14 +1158,22 @@ def legalize(
         # keepout violation is a soft warning (parts manufacturable but
         # close to edge). The CLI distinguishes these now.
         failed = 0
+        is_poly_failed = board is not None and board.is_polygon
         bx_min, by_min, bx_max, by_max = bounds
         for m in macros:
             if m.is_fixed:
                 continue
-            bx1, by1, bx2, by2 = m.bbox
-            if (bx1 < bx_min - 1e-6 or bx2 > bx_max + 1e-6 or
-                by1 < by_min - 1e-6 or by2 > by_max + 1e-6):
-                failed += 1
+            if is_poly_failed:
+                # Off the TRUE board (notch/cutout/hole or past the outer
+                # edge) counts as a hard failure — contains_bbox is the
+                # polygon authority, not the AABB.
+                if not board.contains_bbox(m.bbox):
+                    failed += 1
+            else:
+                bx1, by1, bx2, by2 = m.bbox
+                if (bx1 < bx_min - 1e-6 or bx2 > bx_max + 1e-6 or
+                    by1 < by_min - 1e-6 or by2 > by_max + 1e-6):
+                    failed += 1
 
     # ─── Tetris-style "displace to nearest empty slot" cleanup (Finding 3 fix) ──
     # The greedy push-apart + force-spread above are LOCAL heuristics.
@@ -1086,6 +1203,7 @@ def legalize(
         new_residual = displace_to_clear_slots(
             macros, bounds, grid_mm=grid_mm, verbose=verbose,
             per_macro_keepout=per_macro_keepout,
+            board=board,
         )
         if new_residual < residual:
             if verbose:
@@ -1104,6 +1222,7 @@ def legalize(
         # into each other while pulling them in-bounds.
         failed = _boundary_clamp_overlap_aware(
             macros, bounds, per_macro_keepout=per_macro_keepout,
+            board=board,
         )
         # CRITICAL: even the overlap-aware clamp can leave a macro OOB
         # (when no in-bounds position is overlap-free). Recount the

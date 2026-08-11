@@ -112,6 +112,7 @@ def _boundary_clamp_overlap_aware(
     macros: list["Macro"],
     bounds: tuple[float, float, float, float],
     per_macro_keepout=None,
+    board=None,
 ) -> int:
     """Like ``boundary_clamp`` but rolls back a macro's translation if it
     would create a new overlap.
@@ -143,12 +144,24 @@ def _boundary_clamp_overlap_aware(
     is bigger than the keepout-shrunk bounds, i.e. genuinely too big
     for the board) is reported in the failed count.
     """
-    from place.legalizer import push_apart_overlapping
+    from place.legalizer import push_apart_overlapping, _fit_macro_to_polygon
 
+    is_poly = board is not None and board.is_polygon
     x_min, y_min, x_max, y_max = bounds
     failed = 0
     for m in macros:
         if m.is_fixed:
+            continue
+        if is_poly:
+            # Polygon path: fit the macro to the TRUE outline (notches/
+            # cutouts/holes excluded), rolling back if the fit would
+            # create a new overlap — same recovery contract as the
+            # rectangle path below. keepout=0 mirrors the rectangle path's
+            # deliberate use of GLOBAL (not keepout-shrunk) bounds: the
+            # keepout loop in legalize() enforces DFM margins separately;
+            # this clamp's sole job is "no macro physically off the board".
+            if not _fit_macro_to_polygon(m, board, others=macros, bounds=bounds):
+                failed += 1
             continue
         # Use GLOBAL bounds for the clamp, NOT keepout-shrunk bounds.
         # The keepout enforcement is handled separately by the keepout
@@ -289,6 +302,10 @@ def sa_polish_legalize(
     """
     from place.legalizer import _count_residual_overlaps, boundary_clamp, push_apart_overlapping
 
+    # Thread the board outline into the overlap-aware clamp + Tetris so a
+    # non-rectangular board (notches/cutouts/holes) is honored on the
+    # sa_polish path too. None ⇒ rectangular fast path (unchanged).
+    board = getattr(model, "board", None)
     residual_before = _count_residual_overlaps(macros)
     if residual_before == 0:
         return {"residual_overlaps": 0, "boundary_failures": 0}
@@ -358,6 +375,7 @@ def sa_polish_legalize(
     # The overlap-aware clamp breaks that loop at the source.
     failed = _boundary_clamp_overlap_aware(
         macros, bounds, per_macro_keepout=per_macro_keepout,
+        board=board,
     )
     residual_after = _count_residual_overlaps(macros)
 
@@ -388,6 +406,7 @@ def sa_polish_legalize(
             displace_to_clear_slots(
                 macros, bounds, grid_mm=1.0,
                 per_macro_keepout=per_macro_keepout,
+                board=board,
             )
         except ImportError:
             pass
@@ -396,6 +415,7 @@ def sa_polish_legalize(
         # so this final clamp doesn't re-introduce the problem.
         failed = _boundary_clamp_overlap_aware(
             macros, bounds, per_macro_keepout=per_macro_keepout,
+            board=board,
         )
         residual_after = _count_residual_overlaps(macros)
 

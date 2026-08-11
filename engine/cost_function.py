@@ -265,14 +265,13 @@ def total_boundary_penalty(model: BoardModel) -> float:
             continue
         x_min, y_min, x_max, y_max = comp.bbox
 
-        # --- Board boundary overflow (existing behavior) ---
-        left_overflow = max(0.0, board.x_min - x_min)
-        right_overflow = max(0.0, x_max - board.x_max)
-        top_overflow = max(0.0, board.y_min - y_min)
-        bottom_overflow = max(0.0, y_max - board.y_max)
-
-        # Linear penalty (proportional to distance outside)
-        overflow = left_overflow + right_overflow + top_overflow + bottom_overflow
+        # --- Board boundary overflow ---
+        # board.bbox_overflow() is polygon-aware: for a plain rectangular
+        # outline it's exactly the original left+right+top+bottom overflow
+        # sum; for a non-rectangular outline (connector notches, mouse-
+        # bites, cutouts) it charges distance back to the nearest outline
+        # edge for any corner that has strayed off the board.
+        overflow = board.bbox_overflow(comp.bbox)
         total += overflow
 
         # --- Keepout overlap (new) ---
@@ -295,14 +294,26 @@ def total_boundary_penalty(model: BoardModel) -> float:
         # SA has a smooth gradient toward the interior.
         extra = edge_keepout_extra_for(comp, model)
         if extra > 0.0 and overflow == 0.0:
-            d_left = x_min - board.x_min
-            d_right = board.x_max - x_max
-            d_top = y_min - board.y_min
-            d_bottom = board.y_max - y_max
-            total += max(0.0, extra - d_left)
-            total += max(0.0, extra - d_right)
-            total += max(0.0, extra - d_top)
-            total += max(0.0, extra - d_bottom)
+            if not board.is_polygon:
+                # Rectangle outline: preserve the original four independent
+                # per-side terms exactly (a component squeezed into a
+                # corner is charged once per nearby side it's close to).
+                d_left = x_min - board.x_min
+                d_right = board.x_max - x_max
+                d_top = y_min - board.y_min
+                d_bottom = board.y_max - y_max
+                total += max(0.0, extra - d_left)
+                total += max(0.0, extra - d_right)
+                total += max(0.0, extra - d_top)
+                total += max(0.0, extra - d_bottom)
+            else:
+                # Non-rectangular outline: "distance to the nearest of 4
+                # axis-aligned sides" doesn't generalize to an arbitrary
+                # polygon boundary, so use the true clearance to the
+                # nearest outline/hole edge from each bbox corner instead.
+                for (cx, cy) in ((x_min, y_min), (x_max, y_min), (x_max, y_max), (x_min, y_max)):
+                    clearance = board.distance_to_boundary(cx, cy)
+                    total += max(0.0, extra - clearance)
 
     return total
 
@@ -319,9 +330,7 @@ def count_out_of_bounds(model: BoardModel) -> int:
     for comp in model.components:
         if comp.is_edge_connector:
             continue
-        x_min, y_min, x_max, y_max = comp.bbox
-        if (x_min < board.x_min or x_max > board.x_max or
-                y_min < board.y_min or y_max > board.y_max):
+        if not board.contains_bbox(comp.bbox):
             count += 1
     return count
 

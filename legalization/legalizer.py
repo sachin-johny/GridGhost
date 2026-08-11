@@ -420,8 +420,7 @@ def _enforce_boundary(
         # Rotation-aware: if still OOB and non-square, try 90°
         if _is_non_square(comp):
             bbox = comp.bbox
-            still_oob = (bbox[0] < board.x_min or bbox[2] > board.x_max
-                         or bbox[1] < board.y_min or bbox[3] > board.y_max)
+            still_oob = not board.contains_bbox(bbox)
             if interior_bbox and not still_oob:
                 still_oob = (bbox[0] < interior_bbox[0] or bbox[2] > interior_bbox[2]
                              or bbox[1] < interior_bbox[1] or bbox[3] > interior_bbox[3])
@@ -486,13 +485,27 @@ def _enforce_boundary(
                             x_max = interior_bbox[2] - half_w
                             y_min = interior_bbox[1] + half_h
                             y_max = interior_bbox[3] - half_h
+                            trial_x = max(x_min, min(trial_x, x_max))
+                            trial_y = max(y_min, min(trial_y, y_max))
                         else:
                             x_min = board.x_min + half_w
                             x_max = board.x_max - half_w
                             y_min = board.y_min + half_h
                             y_max = board.y_max - half_h
-                        trial_x = max(x_min, min(trial_x, x_max))
-                        trial_y = max(y_min, min(trial_y, y_max))
+                            trial_x = max(x_min, min(trial_x, x_max))
+                            trial_y = max(y_min, min(trial_y, y_max))
+                            if board.is_polygon:
+                                # A trial that reduces overlap count but
+                                # lands the component off the true board
+                                # (a notch/mouse-bite/cutout it's only
+                                # clear of by the outer AABB) must not be
+                                # considered — otherwise this de-overlap
+                                # search can undo the boundary clamp that
+                                # already ran above.
+                                trial_bbox = (trial_x - half_w, trial_y - half_h,
+                                              trial_x + half_w, trial_y + half_h)
+                                if not board.contains_bbox(trial_bbox):
+                                    continue
                         comp.x = trial_x
                         comp.y = trial_y
                         trial_overlaps = sum(1 for other in components
@@ -568,26 +581,58 @@ def _enforce_boundary_single(
     half_w = comp.effective_width / 2.0
     half_h = comp.effective_height / 2.0
     if interior_bbox:
+        # interior_bbox is always a plain axis-aligned sub-rectangle of the
+        # board (used to corral macro members etc.), independent of the
+        # outer board's shape — a rectangle clamp is exact here regardless
+        # of whether the board outline itself is polygonal.
         x_min = interior_bbox[0] + half_w + extra_keepout_mm
         x_max = interior_bbox[2] - half_w - extra_keepout_mm
         y_min = interior_bbox[1] + half_h + extra_keepout_mm
         y_max = interior_bbox[3] - half_h - extra_keepout_mm
+        # Guard against the clamp window collapsing for large ICs on small
+        # sub-regions — fall back to the non-extra-keepout bounds so the
+        # component still has somewhere to sit.
+        if x_min > x_max:
+            x_min = interior_bbox[0] + half_w
+            x_max = interior_bbox[2] - half_w
+        if y_min > y_max:
+            y_min = interior_bbox[1] + half_h
+            y_max = interior_bbox[3] - half_h
+        comp.x = max(x_min, min(comp.x, x_max))
+        comp.y = max(y_min, min(comp.y, y_max))
+    elif board.is_polygon:
+        # Polygon board outline: board.fit_bbox_inside() pulls the
+        # component fully onto the true board shape — clear of any
+        # notch/mouse-bite/cutout it landed in, not just the outer
+        # bounding box — and (as of the `margin` parameter) also honors
+        # the DFM edge-keepout margin the same way the rectangle branch
+        # below does, via an axis-aligned inflate-and-test approximation
+        # rather than a true polygon offset (see fit_bbox_inside's
+        # docstring). The true outline is always respected either way —
+        # only the extra clearance margin is approximate.
+        comp.x, comp.y = board.fit_bbox_inside(comp.x, comp.y, half_w, half_h, margin=extra_keepout_mm)
+        x_min = board.x_min + half_w + extra_keepout_mm
+        x_max = board.x_max - half_w - extra_keepout_mm
+        y_min = board.y_min + half_h + extra_keepout_mm
+        y_max = board.y_max - half_h - extra_keepout_mm
+        if x_min > x_max:
+            x_min, x_max = board.x_min + half_w, board.x_max - half_w
+        if y_min > y_max:
+            y_min, y_max = board.y_min + half_h, board.y_max - half_h
     else:
         x_min = board.x_min + half_w + extra_keepout_mm
         x_max = board.x_max - half_w - extra_keepout_mm
         y_min = board.y_min + half_h + extra_keepout_mm
         y_max = board.y_max - half_h - extra_keepout_mm
-    # Guard against the clamp window collapsing for large ICs on small
-    # boards — fall back to the non-extra-keepout bounds so the component
-    # still has somewhere to sit.
-    if x_min > x_max:
-        x_min = interior_bbox[0] + half_w if interior_bbox else board.x_min + half_w
-        x_max = interior_bbox[2] - half_w if interior_bbox else board.x_max - half_w
-    if y_min > y_max:
-        y_min = interior_bbox[1] + half_h if interior_bbox else board.y_min + half_h
-        y_max = interior_bbox[3] - half_h if interior_bbox else board.y_max - half_h
-    comp.x = max(x_min, min(comp.x, x_max))
-    comp.y = max(y_min, min(comp.y, y_max))
+        # Guard against the clamp window collapsing for large ICs on
+        # small boards — fall back to the non-extra-keepout bounds so
+        # the component still has somewhere to sit.
+        if x_min > x_max:
+            x_min, x_max = board.x_min + half_w, board.x_max - half_w
+        if y_min > y_max:
+            y_min, y_max = board.y_min + half_h, board.y_max - half_h
+        comp.x = max(x_min, min(comp.x, x_max))
+        comp.y = max(y_min, min(comp.y, y_max))
 
     # Keepout eviction: if the component's center is inside a keepout,
     # nudge it to the nearest keepout edge (plus the component's half-
@@ -609,6 +654,26 @@ def _enforce_boundary_single(
                 else:
                     comp.y = k.y_max + half_h
                 # Re-clamp to board/interior after the nudge.
+                comp.x = max(x_min, min(comp.x, x_max))
+                comp.y = max(y_min, min(comp.y, y_max))
+
+    # For a polygon board outline, the rectangle clamps above (the
+    # interior_bbox corral and the keepout-nudge re-clamp) can leave the
+    # component parked in a notch/mouse-bite/cutout even though it
+    # started clear of one — do a final polygon-aware fit so the true
+    # outline is always the last word, not just the outer bounding box.
+    # This runs for the interior_bbox case too: a sub-rectangle that
+    # straddles a concavity would otherwise trap the component in it.
+    # When interior_bbox is set, the fit result is pulled back into the
+    # sub-rectangle so the polygon fit can't escape the corral (best
+    # effort if the sub-rectangle itself overlaps the notch — the
+    # overlap-resolution loop cleans up the rest; this is never worse
+    # than the rectangle clamp alone, which left it in the notch).
+    if board.is_polygon:
+        bbox = (comp.x - half_w, comp.y - half_h, comp.x + half_w, comp.y + half_h)
+        if not board.contains_bbox(bbox):
+            comp.x, comp.y = board.fit_bbox_inside(comp.x, comp.y, half_w, half_h)
+            if interior_bbox:
                 comp.x = max(x_min, min(comp.x, x_max))
                 comp.y = max(y_min, min(comp.y, y_max))
 
@@ -2298,8 +2363,7 @@ def _count_oob(model: BoardModel) -> int:
     for comp in model.components:
         if comp.is_edge_connector:
             continue
-        x1, y1, x2, y2 = comp.bbox
-        if x1 < board.x_min or x2 > board.x_max or y1 < board.y_min or y2 > board.y_max:
+        if not board.contains_bbox(comp.bbox):
             count += 1
     return count
 

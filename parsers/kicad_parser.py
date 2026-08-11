@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from models.board_model import BoardModel, BoardOutline, Component, Net, Pad
+from models.board_model import _polygon_area, _segments_intersect
 
 
 # ---------------------------------------------------------------------------
@@ -354,15 +355,251 @@ def _collect_edge_cuts_shapes(sexp: list) -> list[dict]:
     return shapes
 
 
+Point = tuple[float, float]
+
+
+def _circle_center(x1: float, y1: float, x2: float, y2: float, x3: float, y3: float) -> Optional[Point]:
+    """Center of the circle through 3 points, or None if (near-)collinear."""
+    ax, ay = x2 - x1, y2 - y1
+    bx, by = x3 - x1, y3 - y1
+    d = 2.0 * (ax * by - ay * bx)
+    if abs(d) < 1e-9:
+        return None
+    ux = (by * (ax * ax + ay * ay) - ay * (bx * bx + by * by)) / d
+    uy = (ax * (bx * bx + by * by) - bx * (ax * ax + ay * ay)) / d
+    return (x1 + ux, y1 + uy)
+
+
+def _arc_to_polyline(gr_arc: list, steps: int = 8) -> list[Point]:
+    """Approximate a gr_arc (KiCad 7+ start/mid/end 3-point format) as a
+    short polyline, for outline tracing and bounding-box purposes.
+
+    Falls back to a straight line between start/end if the geometry is
+    degenerate (collinear points, or an older/unsupported arc encoding),
+    which is still strictly better than ignoring the arc entirely.
+    """
+    start_pt = find_first(gr_arc, "start")
+    mid_pt = find_first(gr_arc, "mid")
+    end_pt = find_first(gr_arc, "end")
+    pts: list[Point] = []
+    if start_pt and len(start_pt) >= 3:
+        pts.append((try_float(start_pt[1]), try_float(start_pt[2])))
+    if end_pt and len(end_pt) >= 3:
+        end = (try_float(end_pt[1]), try_float(end_pt[2]))
+    else:
+        return pts
+    if not (mid_pt and len(mid_pt) >= 3 and pts):
+        pts.append(end)
+        return pts
+
+    sx, sy = pts[0]
+    mx, my = try_float(mid_pt[1]), try_float(mid_pt[2])
+    ex, ey = end
+    center = _circle_center(sx, sy, mx, my, ex, ey)
+    if center is None:
+        return [pts[0], end]
+    cx, cy = center
+    r = math.hypot(sx - cx, sy - cy)
+
+    def norm(a: float) -> float:
+        while a < 0:
+            a += 2 * math.pi
+        while a >= 2 * math.pi:
+            a -= 2 * math.pi
+        return a
+
+    a0 = math.atan2(sy - cy, sx - cx)
+    am = norm(math.atan2(my - cy, mx - cx) - a0)
+    a1 = norm(math.atan2(ey - cy, ex - cx) - a0)
+    # Sweep from the start angle through the mid-point angle to the end
+    # angle, in whichever rotational direction actually passes through it.
+    sweep = a1 if am <= a1 else -(2 * math.pi - a1)
+    return [
+        (cx + r * math.cos(a0 + sweep * i / steps), cy + r * math.sin(a0 + sweep * i / steps))
+        for i in range(steps + 1)
+    ]
+
+
+def _collect_edge_cuts_segments(sexp: list) -> list[tuple[Point, Point]]:
+    """Every straight edge implied by Edge.Cuts line/rect/arc geometry.
+
+    gr_poly is excluded here — it's already a complete standalone closed
+    loop and is handled directly by ``_trace_outer_board_polygon``.
+    """
+    segments: list[tuple[Point, Point]] = []
+
+    for gr_line in find_all(sexp, "gr_line"):
+        layer = find_first(gr_line, "layer")
+        if not (layer and len(layer) > 1 and "Edge.Cuts" in str(layer[1])):
+            continue
+        start_pt = find_first(gr_line, "start")
+        end_pt = find_first(gr_line, "end")
+        if start_pt and len(start_pt) >= 3 and end_pt and len(end_pt) >= 3:
+            a = (try_float(start_pt[1]), try_float(start_pt[2]))
+            b = (try_float(end_pt[1]), try_float(end_pt[2]))
+            segments.append((a, b))
+
+    for gr_rect in find_all(sexp, "gr_rect"):
+        layer = find_first(gr_rect, "layer")
+        if not (layer and len(layer) > 1 and "Edge.Cuts" in str(layer[1])):
+            continue
+        start_pt = find_first(gr_rect, "start")
+        end_pt = find_first(gr_rect, "end")
+        if start_pt and len(start_pt) >= 3 and end_pt and len(end_pt) >= 3:
+            x1, y1 = try_float(start_pt[1]), try_float(start_pt[2])
+            x2, y2 = try_float(end_pt[1]), try_float(end_pt[2])
+            corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+            for i in range(4):
+                segments.append((corners[i], corners[(i + 1) % 4]))
+
+    for gr_arc in find_all(sexp, "gr_arc"):
+        layer = find_first(gr_arc, "layer")
+        if not (layer and len(layer) > 1 and "Edge.Cuts" in str(layer[1])):
+            continue
+        pts = _arc_to_polyline(gr_arc)
+        for i in range(len(pts) - 1):
+            segments.append((pts[i], pts[i + 1]))
+
+    return segments
+
+
+def _chain_segments_to_loops(segments: list[tuple[Point, Point]], tol: float = 1e-3) -> list[list[Point]]:
+    """Greedily chain line segments that share endpoints (within ``tol``
+    mm) into closed polygon loops.
+
+    Any chain that never closes (an open outline, a stray dangling edge)
+    is dropped rather than guessed at — the caller falls back to the
+    AABB-based rectangle outline in that case, so an incomplete Edge.Cuts
+    drawing degrades to the pre-existing behavior instead of producing a
+    wrong shape.
+    """
+    def key(pt: Point) -> tuple[int, int]:
+        return (round(pt[0] / tol), round(pt[1] / tol))
+
+    remaining = list(segments)
+    loops: list[list[Point]] = []
+    while remaining:
+        a, b = remaining.pop(0)
+        loop = [a, b]
+        while True:
+            tail = loop[-1]
+            found = False
+            for i, (sa, sb) in enumerate(remaining):
+                if key(sa) == key(tail):
+                    loop.append(sb)
+                    remaining.pop(i)
+                    found = True
+                    break
+                if key(sb) == key(tail):
+                    loop.append(sa)
+                    remaining.pop(i)
+                    found = True
+                    break
+            if not found:
+                break
+            if key(loop[-1]) == key(loop[0]) and len(loop) > 2:
+                break
+        if key(loop[-1]) == key(loop[0]) and len(loop) > 2:
+            loop.pop()  # drop the duplicate closing vertex
+            loops.append(loop)
+        # else: never closed — discarded, see docstring.
+    return loops
+
+
+def _is_axis_aligned_rect(poly: list[Point], tol: float = 1e-6) -> bool:
+    """True if ``poly`` is (up to vertex order) exactly a 4-corner
+    axis-aligned rectangle — the common case, kept on the original
+    rectangle code path (with its outward margin) for full backward
+    compatibility."""
+    if len(poly) != 4:
+        return False
+    xs = sorted({round(p[0], 6) for p in poly})
+    ys = sorted({round(p[1], 6) for p in poly})
+    if len(xs) != 2 or len(ys) != 2:
+        return False
+    expected = {(xs[0], ys[0]), (xs[1], ys[0]), (xs[1], ys[1]), (xs[0], ys[1])}
+    actual = {(round(p[0], 6), round(p[1], 6)) for p in poly}
+    return expected == actual
+
+
+def _polygon_self_intersects(poly: list[Point]) -> bool:
+    """True if any two non-adjacent edges of ``poly`` cross. Our
+    containment/clamp math assumes a simple (non-self-intersecting)
+    polygon, so a self-intersecting trace is rejected by the caller
+    rather than silently mishandled."""
+    n = len(poly)
+    for i in range(n):
+        a1, a2 = poly[i], poly[(i + 1) % n]
+        for j in range(i + 1, n):
+            if j == i or (j + 1) % n == i or j == (i + 1) % n:
+                continue  # adjacent edges legitimately share a vertex
+            b1, b2 = poly[j], poly[(j + 1) % n]
+            if _segments_intersect(a1, a2, b1, b2):
+                return True
+    return False
+
+
+def _trace_outer_board_polygon(sexp: list) -> Optional[list[Point]]:
+    """Reconstruct the true (possibly non-rectangular) outer board outline
+    as a polygon from Edge.Cuts geometry.
+
+    Real boards routinely draw their outline with a connector notch,
+    mouse-bite tabs, or a castellated/cutout edge baked directly into the
+    Edge.Cuts perimeter — not just as a separate internal keepout shape.
+    Taking only the AABB of that geometry (the old behavior) silently
+    discards the concavity. This traces the actual loop instead.
+
+    Returns the largest-area closed loop found (interior cutouts are
+    smaller and handled separately as keepouts), or None if the Edge.Cuts
+    geometry doesn't reduce to a clean simple polygon — callers fall back
+    to the AABB rectangle exactly as before this feature existed, so an
+    unusual or incomplete drawing degrades gracefully instead of failing.
+    """
+    loops: list[list[Point]] = []
+
+    for gr_poly in find_all(sexp, "gr_poly"):
+        layer = find_first(gr_poly, "layer")
+        if not (layer and len(layer) > 1 and "Edge.Cuts" in str(layer[1])):
+            continue
+        pts_expr = find_first(gr_poly, "pts")
+        if not pts_expr:
+            continue
+        pts = [(try_float(xy[1]), try_float(xy[2])) for xy in find_all(pts_expr, "xy") if len(xy) >= 3]
+        if len(pts) >= 3:
+            loops.append(pts)
+
+    segments = _collect_edge_cuts_segments(sexp)
+    if segments:
+        loops.extend(_chain_segments_to_loops(segments))
+
+    loops = [loop for loop in loops if len(loop) >= 3]
+    if not loops:
+        return None
+
+    loops.sort(key=_polygon_area, reverse=True)
+    outer = loops[0]
+    if _polygon_self_intersects(outer):
+        return None
+    return outer
+
+
 def _extract_board_outline(sexp: list) -> BoardOutline:
     """Extract board outline from Edge.Cuts geometry.
 
-    Takes the global AABB of all Edge.Cuts geometry (rects, lines,
-    polys, circles).  Internal cutouts that are entirely inside the
-    outer outline don't enlarge the AABB, so this returns the correct
-    outer outline.  Cutouts themselves are extracted separately by
-    _collect_edge_cuts_shapes and turned into keepouts by the parser.
+    First tries to trace the actual outer polygon (handles notches,
+    mouse-bites, and other non-rectangular outlines drawn directly into
+    the board edge). If that traces out to a plain axis-aligned
+    rectangle, or if the geometry can't be reduced to a clean simple
+    polygon, falls back to the original behavior: the global AABB of all
+    Edge.Cuts geometry (rects, lines, polys, arcs, circles), expanded by
+    a small margin. Internal cutouts that are entirely inside the outer
+    outline are extracted separately by _collect_edge_cuts_shapes and
+    turned into keepouts by the parser.
     """
+    outer_polygon = _trace_outer_board_polygon(sexp)
+    if outer_polygon is not None and not _is_axis_aligned_rect(outer_polygon):
+        return BoardOutline(polygon=outer_polygon)
+
     points_x = []
     points_y = []
 
@@ -412,6 +649,17 @@ def _extract_board_outline(sexp: list) -> BoardOutline:
                 r = math.sqrt((ex - cx) ** 2 + (ey - cy) ** 2)
                 points_x.extend([cx - r, cx + r])
                 points_y.extend([cy - r, cy + r])
+
+    # gr_arc on Edge.Cuts — previously ignored entirely, which under-sized
+    # the AABB (and could clip the real board) for any outline using arcs
+    # (rounded corners, curved notches). Sampled the same way the polygon
+    # tracer above samples arcs.
+    for gr_arc in find_all(sexp, "gr_arc"):
+        layer = find_first(gr_arc, "layer")
+        if layer and len(layer) > 1 and "Edge.Cuts" in str(layer[1]):
+            for px, py in _arc_to_polyline(gr_arc):
+                points_x.append(px)
+                points_y.append(py)
 
     if not points_x:
         # Default board if no outline found

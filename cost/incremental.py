@@ -113,18 +113,11 @@ class IncrementalCostTracker:
     def _component_boundary(self, c: "Component") -> float:
         if getattr(c, "is_edge_connector", False):
             return 0.0
-        b = self.model.board
-        x1, y1, x2, y2 = c.bbox
-        total = 0.0
-        if x1 < b.x_min:
-            total += b.x_min - x1
-        if y1 < b.y_min:
-            total += b.y_min - y1
-        if x2 > b.x_max:
-            total += x2 - b.x_max
-        if y2 > b.y_max:
-            total += y2 - b.y_max
-        return total
+        # Polygon-aware — matches cost.total_boundary exactly. Rectangle
+        # outline: byte-for-byte the old four-sided overflow sum (the SA
+        # inner loop hits this on every proposed move, so it must stay
+        # cheap and identical for the common rectangular case).
+        return self.model.board.bbox_overflow(c.bbox)
 
     def overlapping_pairs(self) -> list[tuple[int, int]]:
         """Macro-index pairs with nonzero cached overlap right now.
