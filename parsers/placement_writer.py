@@ -176,8 +176,10 @@ def _apply_footprint_positions(text: str, comp_map: dict[str, Component]) -> str
 
         if ref and ref in comp_map:
             comp = comp_map[ref]
-            if not comp.is_fixed or True:  # Apply even to "fixed" if user wants
-                fp_block = _update_position(fp_block, comp)
+            # Apply position update to all components, including "fixed" ones
+            # (the writer is called after the placer has settled final positions
+            # — fixed components still need to be written back even if unmoved).
+            fp_block = _update_position(fp_block, comp)
 
         result.append(fp_block)
         pos = fp_end + 1
@@ -228,68 +230,39 @@ def _extract_reference(fp_block: str) -> Optional[str]:
 
 
 def _update_position(fp_block: str, comp: Component) -> str:
-    """Update the (at x y [rotation]) field in a footprint block."""
+    """Update the (at x y [rotation]) field in a footprint block.
+
+    KiCad applies the footprint's rotation to every pad on top of the pad's
+    own local (at X Y R) — i.e. world_rot = footprint_R + pad_R. Previous
+    versions of this function ALSO added the rotation delta to each pad's
+    local ``at``, producing world_rot = footprint_R + pad_R + delta —
+    double-rotating pads in the world frame. Latent on symmetric 2-pin
+    components (caps/resistors — rotating 180° is a no-op in world frame)
+    but real on asymmetric footprints (SOIC with offset pad orientation,
+    QFN with corner pads). See IMPROVEMENTS §2.2.
+
+    The fix is to update ONLY the footprint's (at ...) and leave pad
+    (at ...) expressions untouched. Pads then rotate naturally with the
+    footprint, matching KiCad's renderer semantics.
+    """
     x_str = format_kicad_coord(comp.x)
     y_str = format_kicad_coord(comp.y)
 
-    # Split at first (pad to isolate header
-    pad_split = re.split(r'\(\s*pad\s', fp_block, maxsplit=1)
-    header = pad_split[0]
-
-    # Extract original footprint rotation from the header before replacing
-    orig_match = re.search(
-        r'\(\s*at\s+[-\d.]+\s+[-\d.]+(?:\s+([-\d.]+))?\s*\)',
-        header,
-    )
-    orig_rotation = float(orig_match.group(1)) if orig_match and orig_match.group(1) else 0.0
-
-    # Compute rotation delta that pads need
+    # Build new (at ...) expression for the FOOTPRINT only.
     new_rotation = round(comp.rotation)
-    rotation_delta = (new_rotation - round(orig_rotation)) % 360
-
-    # Build new (at ...) expression
     if comp.rotation != 0.0:
         new_at = f"(at {x_str} {y_str} {new_rotation})"
     else:
         new_at = f"(at {x_str} {y_str})"
 
-    # Replace the (at ...) in the header
-    header = re.sub(
+    # Replace only the FIRST (at ...) — the footprint's own placement
+    # attribute. Pad (at ...) attributes appear later in the block and
+    # are left untouched.
+    return re.sub(
         r'\(\s*at\s+[-\d.]+\s+[-\d.]+(?:\s+[-\d.]+)?\s*\)',
         new_at,
-        header,
+        fp_block,
         count=1
-    )
-
-    # Reconstruct the block
-    if len(pad_split) > 1:
-        if rotation_delta != 0:
-            pad_section = _add_pad_rotation(pad_split[1], rotation_delta)
-            return header + "(pad " + pad_section
-        return header + "(pad " + pad_split[1]
-    return header
-
-
-def _add_pad_rotation(pad_section: str, rotation_delta: int) -> str:
-    """Add rotation delta to pad (at ...) expressions.
-
-    When a footprint's rotation changes, KiCad applies the change to courtyard/
-    silkscreen but not to pads. This function adjusts each pad's (at X Y [R])
-    by adding the rotation delta so copper layers match the courtyard orientation.
-
-    Pads that already have an explicit rotation (3-arg at) get the delta added.
-    Pads with 2-arg (at X Y) get the delta appended as a new third arg.
-    """
-    def _replace_at(m: re.Match) -> str:
-        x, y = m.group(1), m.group(2)
-        existing_rot = float(m.group(3)) if m.group(3) else 0.0
-        new_rot = round((existing_rot + rotation_delta) % 360)
-        return f"(at {x} {y} {new_rot})"
-
-    return re.sub(
-        r'\(\s*at\s+([-\d.]+)\s+([-\d.]+)(?:\s+([-\d.]+))?\s*\)',
-        _replace_at,
-        pad_section,
     )
 
 

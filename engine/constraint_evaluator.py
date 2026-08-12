@@ -712,7 +712,7 @@ def penalty_ground_plane_clearance(
             oy1 = max(by1, zy1)
             ox2 = min(bx2, zx2)
             oy2 = min(by2, zy2)
-            if ox2 > ox1 and oy2 > by1:
+            if ox2 > ox1 and oy2 > oy1:
                 total += (ox2 - ox1) * (oy2 - oy1)
 
     return total

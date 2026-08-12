@@ -563,8 +563,10 @@ def _compute_spreading_forces(
             dist = math.sqrt(dx * dx + dy * dy)
 
             if dist < 0.1:
-                # Nearly coincident — pick arbitrary direction
-                angle = (hash(ca.ref + cb.ref) % 360) * math.pi / 180.0
+                # Nearly coincident — pick a deterministic direction.
+                # sum-of-ords is PYTHONHASHSEED-independent, unlike hash().
+                pair_key = ca.ref + cb.ref
+                angle = (sum(ord(c) for c in pair_key) % 360) * math.pi / 180.0
                 dx, dy = math.cos(angle), math.sin(angle)
                 dist = 1.0
             else:

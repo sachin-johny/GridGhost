@@ -132,7 +132,9 @@ def detect_interior_chains(
     # One bidirectional chain per seed: forward ray from s, then a backward
     # ray from s avoiding the forward path, concatenated through s.
     candidates: list[list[str]] = []
-    for seed in interior:
+    # sorted() so chain construction is deterministic across PYTHONHASHSEED
+    # values (interior is a set — its iteration order is hash-randomized).
+    for seed in sorted(interior):
         if seed not in adj:
             continue
         forward = extend_ray(seed, set())

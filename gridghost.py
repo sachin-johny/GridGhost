@@ -17,14 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.board_model import BoardModel
 from parsers.kicad_parser import KiCadParser
-from parsers.placement_writer import apply_placement, export_positions_json, write_debug_bboxes
-from engine.net_clustering import cluster_components
-from engine.grid_placement import force_directed_place
-from engine.smart_placement import smart_grid_place, _is_vertical_connector, _compute_interior_bbox
-from engine.cost_function import CostFunction, count_overlaps
-from engine.annealer import run_sa, SAConfig
-from engine.placement_prepass import preplace_caps_near_ics
-from legalization.legalizer import legalize
+from parsers.placement_writer import apply_placement, export_positions_json
 from profiles.board_profiles import get_profile, list_profiles, BoardProfile
 from utils.display import (
     print_board_summary,
@@ -33,6 +26,11 @@ from utils.display import (
     print_cluster_info,
 )
 from config import load_config, Config
+
+# Legacy-only modules are lazy-imported inside cmd_place()'s legacy branch to
+# avoid pulling in the ~8000-line legacy stack (engine/annealer.py,
+# engine/smart_placement.py, legalization/legalizer.py) on every macro-v2 run.
+# `write_debug_bboxes` is also legacy-only — imported lazily where used.
 
 ALGORITHMS = ("force-directed", "grid")
 
@@ -91,14 +89,6 @@ def _ensure_board_capacity(model: BoardModel, target_density: float | None = Non
           f"(density {current_density:.2f} -> {target_density:.2f})")
 
 
-def _apply_config_to_globals(cfg: Config) -> None:
-    """Push config values into module-level constants used by cost_state."""
-    import engine.cost_state as cs
-    cs.OVERLAP_WEIGHT = cfg.cost.overlap_weight
-    cs.BOUNDARY_WEIGHT = cfg.cost.boundary_weight
-    # CONSTRAINT_WEIGHT is set by the profile's delta weight — not from config
-
-
 def cmd_extract(args) -> None:
     """Extract board data from .kicad_pcb to JSON."""
     cfg = load_config(args.config)
@@ -117,7 +107,6 @@ def cmd_extract(args) -> None:
 def cmd_place(args) -> None:
     """Run the full placement pipeline."""
     cfg = load_config(args.config)
-    _apply_config_to_globals(cfg)
 
     # Seed PRNG for deterministic placement. SA uses Python's random
     # module; without a seed, each run produces a different placement.
@@ -167,17 +156,12 @@ def cmd_place(args) -> None:
             print(f"    - {rule.name} (weight={rule.weight})")
     print()
 
-    # Step 3: Interactive tuning (if requested)
+    # Step 3: Interactive tuning (if requested — legacy-only effect).
     if args.interactive:
         _interactive_tuning(profile)
 
-    # Step 4: Net clustering
-    print("Step 3: Computing net clusters...")
-    clusters = cluster_components(model)
-    print_cluster_info(clusters)
-
-    # Step 5: Placement algorithm
-    print("Step 4: Running placement algorithm...")
+    # Step 4: Placement algorithm
+    print("Step 3: Running placement algorithm...")
     algorithm = args.algorithm
     pcfg = cfg.placement
 
@@ -223,8 +207,12 @@ def cmd_place(args) -> None:
             pin_density_weight=getattr(args, "pin_density_weight", None),
             use_abacus=(getattr(args, "legalizer", "heuristic") == "abacus"),
             use_sa_polish=(getattr(args, "legalizer", "heuristic") == "sa_polish"),
+            delta=getattr(args, "delta", 0.0),
+            rules=profile.rules if getattr(args, "delta", 0.0) > 0 else None,
         )
     elif algorithm == "force-directed":
+        # Legacy-only: --algorithm force-directed
+        from engine.grid_placement import force_directed_place
         print("  Algorithm: force-directed (attractive + repulsive forces)")
         force_directed_place(
             model,
@@ -236,7 +224,15 @@ def cmd_place(args) -> None:
             dt=pcfg.force_dt,
         )
     else:
+        # Legacy-only: --algorithm grid
+        from engine.net_clustering import cluster_components
+        from engine.smart_placement import smart_grid_place
         print("  Algorithm: grid (cluster-based seed placement)")
+        # Net clustering is only consumed by the legacy grid pipeline —
+        # macro-v2 has its own clustering via place/cluster.py.
+        print("  Computing net clusters...")
+        clusters = cluster_components(model)
+        print_cluster_info(clusters)
         smart_grid_place(
             model,
             margin=args.margin if args.margin is not None else pcfg.margin,
@@ -296,6 +292,8 @@ def cmd_place(args) -> None:
     # grid has correct grouping from t=0. Gated on decoupling_proximity
     # rule (only mcu_peripheral enables it today).
     if any(r.name == 'decoupling_proximity' and r.enabled for r in profile.rules):
+        from engine.smart_placement import _is_vertical_connector, _compute_interior_bbox
+        from engine.placement_prepass import preplace_caps_near_ics
         interior_comps_pp = [
             c for c in model.components
             if not c.is_fixed and (
@@ -317,6 +315,10 @@ def cmd_place(args) -> None:
     # SA is ON by default; use --no-sa to disable and run greedy+swap only.
     # SA auto-disables on tiny (≤6 comps) and large (≥50 comps) boards.
     import engine.cost_state as cs
+    from engine.annealer import run_sa, SAConfig
+    from engine.cost_function import CostFunction, count_overlaps
+    from engine.smart_placement import _is_vertical_connector, _compute_interior_bbox
+    from legalization.legalizer import legalize
     cs.OVERLAP_WEIGHT = max(profile.beta, 25.0)   # strong — SA should avoid overlaps
     cs.BOUNDARY_WEIGHT = max(profile.gamma, 8.0)   # strong — prevent OOB during SA
     cs.CONSTRAINT_WEIGHT = profile.delta
@@ -554,6 +556,7 @@ def cmd_place(args) -> None:
         print(f"  Placed PCB: {output_pcb}")
 
         if getattr(args, 'debug_bbox', False):
+            from parsers.placement_writer import write_debug_bboxes
             write_debug_bboxes(model, output_pcb, interior_bbox=interior_bbox)
             print(f"  Debug bboxes (board outline + interior bbox + component bboxes) written to Dwgs.User layer")
     else:
@@ -647,9 +650,15 @@ def main():
     p_place.add_argument("--no-sa", action="store_true",
                          help="Disable global SA optimization (default: SA enabled; auto-disables on tiny/large boards)")
     p_place.add_argument("--sa-iterations", type=int, default=None,
-                         help="Max SA temperature steps (default: from config.json)")
+                         help="Max SA temperature steps. Macro-v2 default: "
+                              "max(1500, 25*N) where N=moving macro count. "
+                              "Legacy default: from config.json "
+                              "(annealer.max_iterations).")
     p_place.add_argument("--sa-reheat", type=int, default=None,
-                         help="Number of SA reheat rounds (default: from config.json)")
+                         help="Number of SA reheat rounds. Legacy path uses "
+                              "this flag directly; macro-v2 always uses "
+                              "config.json annealer.reheat_count (currently 3) "
+                              "and ignores this flag.")
     p_place.add_argument("--debug-bbox", action="store_true", help="Draw component bounding boxes on Dwgs.User layer for visual debugging")
     p_place.add_argument("--macro-v2", action=argparse.BooleanOptionalAction, default=True,
                          help="Use the macro-first placement pipeline (rigid cap-IC macros). Default: on. Use --no-macro-v2 for the legacy grid pipeline.")
@@ -672,13 +681,23 @@ def main():
     # --- macro-v2-only knobs (previously documented in README but never
     # registered as CLI args; place_v2() always accepted them). ---
     p_place.add_argument("--grid-mm", type=float, default=None,
-                         help="Legalization grid pitch in mm for the macro-v2 pipeline (default: 1.0)")
+                         help="Legalization grid pitch in mm for the macro-v2 "
+                              "pipeline (default: from config.json "
+                              "legalization.grid_mm, currently 0.5)")
     p_place.add_argument("--alpha", type=float, default=1.0,
                          help="HPWL weight in the macro-v2 cost function (default: 1.0)")
     p_place.add_argument("--beta", type=float, default=25.0,
                          help="Overlap penalty weight in the macro-v2 cost function (default: 25.0)")
     p_place.add_argument("--gamma", type=float, default=8.0,
                          help="Boundary penalty weight in the macro-v2 cost function (default: 8.0)")
+    p_place.add_argument("--delta", type=float, default=0.0,
+                         help="Constraint penalty weight in the macro-v2 cost function "
+                              "(default: 0.0 = disabled). When > 0, the active profile's "
+                              "constraint rules (decoupling proximity, crystal-MCU, thermal "
+                              "grouping/separation, analog/digital separation, etc.) are "
+                              "evaluated via engine/constraint_evaluator.py and added to the "
+                              "SA cost. Opt-in — the default 0 preserves the current "
+                              "macro-v2 behavior. See IMPROVEMENTS §2.4.")
     p_place.add_argument("--connector-mating-margin", type=float, default=5.0,
                          help="Edge offset (mm) for perimeter connectors in the macro-v2 pipeline (default: 5.0)")
     p_place.add_argument("-v", "--verbose", action="store_true",

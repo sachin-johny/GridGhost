@@ -129,6 +129,8 @@ def run_macro_sa(
     pin_density_weight: float = 0.0,
     bias_overlapping: bool = False,
     bias_overlap_prob: float = 0.6,
+    delta: float = 0.0,
+    rules: list | None = None,
 ) -> dict[str, float]:
     """Run macro-aware simulated annealing.
 
@@ -162,6 +164,13 @@ def run_macro_sa(
     The two signals share the ``rudy_recompute_every`` cadence — the
     maps walk the same nets/pads, so refreshing them together is
     essentially free.
+
+    Constraint penalties (opt-in): ``delta`` (default 0) and ``rules``
+    (default None) wire ``engine/constraint_evaluator.py`` into the SA
+    cost. The constraint penalty is recomputed every
+    ``rudy_recompute_every`` steps (same cadence as RUDY/pin-density)
+    via the incremental tracker's ``refresh_constraint_penalty()``.
+    Default 0 = current behavior. See IMPROVEMENTS §2.4.
 
     ``bias_overlapping`` (default False — opt-in, doesn't affect the
     main placement pipeline unless explicitly requested): with
@@ -210,7 +219,8 @@ def run_macro_sa(
                        net_weights=net_weights,
                        rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache,
                        pin_density_weight=pin_density_weight,
-                       pin_density_penalty=pin_density_penalty_cache)
+                       pin_density_penalty=pin_density_penalty_cache,
+                       delta=delta, rules=rules)
     initial_total = initial["total"]
     best_total = initial_total
     best_snapshot = _snapshot_positions(model)
@@ -239,6 +249,7 @@ def run_macro_sa(
     # does.
     tracker = IncrementalCostTracker(
         model, macros, alpha=alpha, beta=beta, gamma=gamma, net_weights=net_weights,
+        delta=delta, rules=rules,
     )
     # Sanity: the tracker's from-cache total must agree with the
     # from-scratch evaluate() above (excluding the routability terms,
@@ -249,6 +260,12 @@ def run_macro_sa(
     expected_tracker_total = (initial_total
                               - rudy_weight * (rudy_penalty_cache or 0.0)
                               - pin_density_weight * (pin_density_penalty_cache or 0.0))
+    # When constraint penalties are active, the tracker's constraint_total
+    # is the from-scratch value the tracker computed at init — which is
+    # also what evaluate() computed (delta * c is in initial_total).
+    # The tracker's "total" already includes delta * constraint, so we
+    # don't subtract it here. (If the tracker's constraint cache and
+    # evaluate() ever disagree, the >1e-3 check below catches it.)
     if abs(tracker_initial["total"] - expected_tracker_total) > 1e-3:
         # Fall back to full recompute every iteration rather than trust
         # a tracker that disagrees with ground truth — correctness over
@@ -375,11 +392,15 @@ def run_macro_sa(
                                     net_weights=net_weights,
                                     rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache,
                                     pin_density_weight=pin_density_weight,
-                                    pin_density_penalty=pin_density_penalty_cache)
+                                    pin_density_penalty=pin_density_penalty_cache,
+                                    delta=delta, rules=rules)
                 new_total = new_cost["total"]
-            delta = new_total - current_total
+            # Local var renamed `delta` → `delta_cost` to avoid shadowing
+            # the `delta` parameter (constraint weight) when SA is running
+            # with constraint penalties enabled.
+            delta_cost = new_total - current_total
 
-            if delta <= 0 or rng.random() < math.exp(-delta / max(T, 1e-9)):
+            if delta_cost <= 0 or rng.random() < math.exp(-delta_cost / max(T, 1e-9)):
                 # Accept
                 current_total = new_total
                 if tracker is not None:
@@ -407,7 +428,12 @@ def run_macro_sa(
             # so we batch it every rudy_recompute_every steps. The two
             # signals share the cadence because their maps walk the same
             # nets/pads; refreshing them together is essentially free.
-            if ((rudy_weight > 0 or pin_density_weight > 0)
+            #
+            # IMPROVEMENTS §2.4: constraint penalties share the same
+            # cadence for the same reason (full rule evaluation walks
+            # the model — too expensive per step).
+            if ((rudy_weight > 0 or pin_density_weight > 0
+                 or (delta > 0 and rules))
                     and (it + 1) % rudy_recompute_every == 0):
                 try:
                     if rudy_weight > 0:
@@ -423,6 +449,12 @@ def run_macro_sa(
                          _peak, _avg, _overflow) = _pdp(model)
                 except Exception:
                     pass
+                # Refresh the constraint penalty cache (full recompute).
+                # The tracker carries the cached value between refreshes;
+                # this updates it so SA's accept/reject sees the current
+                # constraint state.
+                if delta > 0 and rules and tracker is not None:
+                    tracker.refresh_constraint_penalty()
 
         if verbose:
             print(f"  SA reheat {reheat_round}: T={T:.4f}, current={current_total:.2f}, best={best_total:.2f}")
@@ -437,11 +469,16 @@ def run_macro_sa(
                      net_weights=net_weights,
                      rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache,
                      pin_density_weight=pin_density_weight,
-                     pin_density_penalty=pin_density_penalty_cache)
+                     pin_density_penalty=pin_density_penalty_cache,
+                     delta=delta, rules=rules)
     if verbose:
+        constraint_str = (
+            f", constraint={final.get('constraint', 0.0):.2f}"
+            if delta > 0 and rules else ""
+        )
         print(
             f"  SA done: initial={initial_total:.2f}, final={final['total']:.2f} "
-            f"(best={best_total:.2f})"
+            f"(best={best_total:.2f}{constraint_str})"
         )
 
     return {

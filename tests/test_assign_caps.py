@@ -40,6 +40,7 @@ def _cap(ref, nets):
     return Component(
         ref=ref, x=0, y=0, width=2, height=1,
         courtyard_margin=0.0, component_type="capacitor", nets=nets,
+        value="100n",
     )
 
 

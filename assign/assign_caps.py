@@ -29,7 +29,10 @@ if TYPE_CHECKING:
 IC_TYPES = frozenset({"ic", "mcu", "regulator"})
 
 # Caps larger than this are "bulk", not decoupling followers.
-DECAP_MAX_VALUE_F = 1e-6  # 1uF
+# 10µF covers common 4.7/10µF IC bulk-decoupling caps; the previous 1µF
+# threshold mis-classified them as decoupling followers (which get paired
+# tightly to a single IC via a rigid macro).
+DECAP_MAX_VALUE_F = 10e-6  # 10uF
 
 # Net-name patterns that mark power rails.
 _POWER_PREFIXES = (
@@ -161,9 +164,12 @@ def classify_caps(
             bulk_refs.append(cap.ref)
             continue
 
-        # On an IC-shared power rail. Classify by value.
+        # On an IC-shared power rail. Classify by value. Unparseable
+        # values default to BULK (conservative) — pairing an unknown
+        # cap tightly to an IC as a rigid decoupling follower is riskier
+        # than treating it as a standalone bulk cap.
         val_f = parse_cap_value(getattr(cap, "value", "") or "")
-        if val_f is not None and val_f > DECAP_MAX_VALUE_F:
+        if val_f is None or val_f > DECAP_MAX_VALUE_F:
             bulk_refs.append(cap.ref)
         else:
             decap_to_ics[cap.ref] = eligible

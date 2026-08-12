@@ -131,6 +131,8 @@ def place_v2(
     pin_density_weight: float | None = None,
     use_abacus: bool = False,
     use_sa_polish: bool = False,
+    delta: float = 0.0,
+    rules: list | None = None,
 ) -> dict[str, object]:
     """Run the macro-first placement pipeline.
 
@@ -145,6 +147,15 @@ def place_v2(
     report always shows both signals' initial + final state regardless
     of whether they're active in the cost, so the user can see
     congestion even when running with the signals off.
+
+    Constraint penalties (opt-in): ``delta`` (default 0) and ``rules``
+    (a list of ``ConstraintRule`` from a board profile) wire the legacy
+    ``engine/constraint_evaluator.py`` evaluator into the macro-v2 SA
+    cost. When ``delta > 0`` and ``rules`` is non-empty, SA gets
+    gradient signal for decoupling proximity, crystal-MCU, thermal
+    grouping/separation, analog/digital separation, etc. — same rules
+    the legacy path applies. Default 0 = current macro-v2 behavior
+    (no constraint penalties). See IMPROVEMENTS §2.4.
     """
     # Resolve routability weights against config when the caller didn't
     # explicitly pass one. The CLI passes ``None`` when the user didn't
@@ -418,6 +429,8 @@ def place_v2(
         net_weights=chain_net_weights,
         rudy_weight=effective_rudy_weight,
         pin_density_weight=pin_density_weight,
+        delta=delta,
+        rules=rules,
     )
 
     # ─── Phase 5: legalize all macros together ───────────────────────

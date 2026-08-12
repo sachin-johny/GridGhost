@@ -60,6 +60,116 @@ def _snap_to_grid(value: float, grid_mm: float) -> float:
     return round(value / grid_mm) * grid_mm
 
 
+class _MacroSpatialGrid:
+    """Uniform-grid spatial index over Macro bboxes.
+
+    Adapted from ``legalization/spatial_grid.py:SpatialGrid`` (which
+    indexes Components) to operate on Macro union bboxes. Used by the
+    4 O(N²) hot loops in this module — ``push_apart_overlapping``,
+    ``_count_residual_overlaps``, ``displace_to_clear_slots``, and
+    ``force_spread_overlapping`` — to skip the inner-loop scan over
+    every macro when looking for overlaps. For a 70-macro board the
+    win is small; for 200+ macros it's the difference between O(N²)
+    and ~O(N) per pass.
+
+    The grid is a CHEAP pre-filter: it returns CANDIDATE macro indices
+    whose AABB shares a cell with the query macro. The actual overlap
+    test (which honours the mounting-hole / mechanical exemption via
+    ``Macro.overlaps``) still runs on each candidate — the grid never
+    changes overlap semantics, only the set of pairs we test.
+
+    See IMPROVEMENTS §2.3.
+    """
+
+    __slots__ = ("_x_min", "_y_min", "cell_size", "cells")
+
+    def __init__(self, bounds: tuple[float, float, float, float], cell_size: float):
+        self._x_min = bounds[0]
+        self._y_min = bounds[1]
+        self.cell_size = cell_size
+        self.cells: dict[tuple[int, int], list[int]] = {}
+
+    @classmethod
+    def from_macros(
+        cls,
+        macros: list["Macro"],
+        bounds: tuple[float, float, float, float],
+    ) -> "_MacroSpatialGrid":
+        """Build a grid sized to the largest macro bbox dimension.
+
+        Cell size = max(max_macro_dim * 1.5, 1.0) so each macro overlaps
+        at most ~4 neighbour cells (1 + halo) — keeps candidate lists
+        short without making the grid so fine that empty cells dominate.
+        """
+        max_dim = 0.0
+        for m in macros:
+            bx1, by1, bx2, by2 = m.bbox
+            max_dim = max(max_dim, bx2 - bx1, by2 - by1)
+        cell_size = max(max_dim * 1.5, 1.0)
+        grid = cls(bounds, cell_size)
+        grid.build(macros)
+        return grid
+
+    def _cells_for_bbox(
+        self, bbox: tuple[float, float, float, float]
+    ) -> list[tuple[int, int]]:
+        x1, y1, x2, y2 = bbox
+        # Clamp lower bounds to 0 — a macro slightly OOB on the negative
+        # side still needs to be indexed (we don't want to lose overlaps
+        # with macros at the corner of bounds).
+        col_min = max(int((x1 - self._x_min) / self.cell_size), 0)
+        row_min = max(int((y1 - self._y_min) / self.cell_size), 0)
+        col_max = int((x2 - self._x_min) / self.cell_size)
+        row_max = int((y2 - self._y_min) / self.cell_size)
+        if col_max < col_min:
+            col_max = col_min
+        if row_max < row_min:
+            row_max = row_min
+        return [
+            (c, r)
+            for c in range(col_min, col_max + 1)
+            for r in range(row_min, row_max + 1)
+        ]
+
+    def build(self, macros: list["Macro"]) -> None:
+        self.cells.clear()
+        for idx in range(len(macros)):
+            for cell in self._cells_for_bbox(macros[idx].bbox):
+                if cell not in self.cells:
+                    self.cells[cell] = []
+                self.cells[cell].append(idx)
+
+    def query_candidates(self, idx: int, macros: list["Macro"]) -> list[int]:
+        """Return macro indices whose bbox MIGHT overlap ``macros[idx]``.
+
+        Always a superset of the true overlap set — caller must run the
+        real ``Macro.overlaps`` test on each candidate.
+        """
+        m = macros[idx]
+        result: set[int] = set()
+        for cell in self._cells_for_bbox(m.bbox):
+            if cell in self.cells:
+                result.update(self.cells[cell])
+        result.discard(idx)
+        return list(result)
+
+    def query_candidates_for_bbox(
+        self, bbox: tuple[float, float, float, float],
+        exclude_idx: int | None = None,
+    ) -> list[int]:
+        """Variant for ``displace_to_clear_slots`` which queries against
+        a hypothetical bbox (a candidate slot) rather than an existing
+        macro's current bbox.
+        """
+        result: set[int] = set()
+        for cell in self._cells_for_bbox(bbox):
+            if cell in self.cells:
+                result.update(self.cells[cell])
+        if exclude_idx is not None:
+            result.discard(exclude_idx)
+        return list(result)
+
+
 def expand_bounds_to_fit(
     macros: list["Macro"],
     bounds: tuple[float, float, float, float],
@@ -182,14 +292,31 @@ def push_apart_overlapping(
     fixed macros overlap (shouldn't happen — connectors are placed on
     the perimeter with spacing), the overlap is reported but not
     resolved.
+
+    Uses ``_MacroSpatialGrid`` to skip the inner-loop scan over every
+    macro when looking for overlaps. The grid is rebuilt per pass
+    (macros move between passes). See IMPROVEMENTS §2.3.
     """
     for _ in range(max_passes):
         any_overlap = False
         any_resolved = False
 
+        # Rebuild the spatial grid once per pass — macros moved last
+        # pass, so bboxes have changed. Building per-pass (not per-
+        # macro) keeps the O(N) build cost amortised across the inner
+        # loop.
+        grid = _MacroSpatialGrid.from_macros(macros, bounds)
+        seen_pairs: set[tuple[int, int]] = set()
+
         for i in range(len(macros)):
-            for j in range(i + 1, len(macros)):
-                a = macros[i]
+            a = macros[i]
+            for j in grid.query_candidates(i, macros):
+                # Deduplicate pairs — the grid returns each pair twice
+                # (once from i, once from j).
+                pair = (i, j) if i < j else (j, i)
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
                 b = macros[j]
                 if not a.overlaps(b):
                     continue
@@ -265,12 +392,7 @@ def push_apart_overlapping(
         if not any_resolved:
             break
 
-    residual = 0
-    for i in range(len(macros)):
-        for j in range(i + 1, len(macros)):
-            if macros[i].overlaps(macros[j]):
-                residual += 1
-    return residual
+    return _count_residual_overlaps(macros)
 
 
 def _try_push(
@@ -340,22 +462,34 @@ def force_spread_overlapping(
     move themselves.
 
     Returns the residual overlap count after ``max_passes`` passes.
+
+    Uses ``_MacroSpatialGrid`` to skip the inner-loop scan over every
+    macro when computing each macro's overlap count and repulsion
+    vector. Grid is rebuilt per pass. See IMPROVEMENTS §2.3.
     """
     bounds_cx = (bounds[0] + bounds[2]) / 2
     bounds_cy = (bounds[1] + bounds[3]) / 2
 
-    def _count_overlaps_for(m: "Macro") -> int:
-        return sum(1 for o in macros if o is not m and m.overlaps(o))
+    def _count_overlaps_for(m: "Macro", grid: _MacroSpatialGrid,
+                              m_idx: int) -> int:
+        return sum(1 for j in grid.query_candidates(m_idx, macros)
+                    if macros[j] is not m and m.overlaps(macros[j]))
 
     for _ in range(max_passes):
         any_moved = False
-        # Snapshot current overlap counts per macro
-        overlap_counts = {id(m): _count_overlaps_for(m) for m in macros}
+        # Rebuild grid per pass — macros moved last pass.
+        grid = _MacroSpatialGrid.from_macros(macros, bounds)
+        # Snapshot current overlap counts per macro (by index, not id —
+        # id() works but index is faster and stable within a pass).
+        overlap_counts = {
+            idx: _count_overlaps_for(m, grid, idx)
+            for idx, m in enumerate(macros)
+        }
 
-        for m in macros:
+        for m_idx, m in enumerate(macros):
             if m.is_fixed:
                 continue
-            if overlap_counts[id(m)] == 0:
+            if overlap_counts[m_idx] == 0:
                 continue  # no overlaps — skip
 
             # Compute net repulsion from all overlapping neighbors
@@ -363,7 +497,8 @@ def force_spread_overlapping(
             mcx = (mx1 + mx2) / 2
             mcy = (my1 + my2) / 2
             fx, fy = 0.0, 0.0
-            for o in macros:
+            for j in grid.query_candidates(m_idx, macros):
+                o = macros[j]
                 if o is m or not m.overlaps(o):
                     continue
                 ox1, oy1, ox2, oy2 = o.bbox
@@ -374,9 +509,11 @@ def force_spread_overlapping(
                 dy = mcy - ocy
                 dist = math.hypot(dx, dy)
                 if dist < 1e-6:
-                    # Macros exactly co-located — push in a random-ish
-                    # direction (use ref hash for determinism)
-                    dx, dy = 1.0 if hash(m.leader.ref) % 2 else -1.0, 1.0
+                    # Macros exactly co-located — push in a deterministic
+                    # direction based on the leader refs (avoids PYTHONHASHSEED
+                    # dependence of built-in hash() on strings).
+                    pair_key = f"{m.leader.ref}|{o.leader.ref}"
+                    dx, dy = 1.0 if sum(ord(c) for c in pair_key) % 2 else -1.0, 1.0
                     dist = math.hypot(dx, dy)
                 # Weight by overlap depth (deeper overlap = stronger push)
                 ox_depth = min(mx2, ox2) - max(mx1, ox1)
@@ -414,12 +551,12 @@ def force_spread_overlapping(
                     m._restore(snap)
                     continue
 
-            new_count = _count_overlaps_for(m)
-            if new_count < overlap_counts[id(m)]:
+            new_count = _count_overlaps_for(m, grid, m_idx)
+            if new_count < overlap_counts[m_idx]:
                 # Net improvement — keep the move
                 any_moved = True
                 # Update overlap counts for the next iteration
-                overlap_counts[id(m)] = new_count
+                overlap_counts[m_idx] = new_count
             else:
                 # No improvement — revert
                 m._restore(snap)
@@ -427,13 +564,7 @@ def force_spread_overlapping(
         if not any_moved:
             break
 
-    # Final residual count
-    residual = 0
-    for i in range(len(macros)):
-        for j in range(i + 1, len(macros)):
-            if macros[i].overlaps(macros[j]):
-                residual += 1
-    return residual
+    return _count_residual_overlaps(macros)
 
 
 def displace_to_clear_slots(
@@ -523,8 +654,19 @@ def displace_to_clear_slots(
     if not candidate_x or not candidate_y:
         return _count_residual_overlaps(macros)
 
+    # Build the spatial grid ONCE for the whole Tetris pass. Macros move
+    # during jumps, but the candidate-slot search tests against every
+    # other macro's CURRENT position — rebuilding per slot would be more
+    # expensive than the scan it saves. After each accepted jump we
+    # rebuild so subsequent slot searches see the new layout. See
+    # IMPROVEMENTS §2.3.
+    grid = _MacroSpatialGrid.from_macros(macros, bounds)
+    # Map macro object → index for grid queries.
+    macro_idx = {id(m): i for i, m in enumerate(macros)}
+
     def _overlaps_at(m: "Macro", new_x: float, new_y: float,
-                     others: list["Macro"], keepout: float = 0.0) -> bool:
+                     others: list["Macro"], keepout: float = 0.0,
+                     grid_ref: _MacroSpatialGrid | None = None) -> bool:
         """Would macro ``m`` overlap any other macro if its leader were at (new_x, new_y)?
 
         Also checks that the macro's bbox fits inside the keepout-shrunk
@@ -534,7 +676,12 @@ def displace_to_clear_slots(
 
         Computes the macro's bbox at the proposed new leader position
         (preserving current rotation) WITHOUT modifying the macro, then
-        checks pairwise overlap with every other macro.
+        checks pairwise overlap with every other macro. When
+        ``grid_ref`` is provided, only the macros whose current bbox
+        shares a cell with ``m``'s hypothetical new bbox are tested —
+        the rest can't possibly overlap. The grid is built from CURRENT
+        positions, so it's only valid for queries against the current
+        layout (the caller rebuilds it after each accepted jump).
         """
         snap = m._snapshot()
         dx = new_x - m.leader.x
@@ -566,11 +713,25 @@ def displace_to_clear_slots(
                     if (cx1 < x_min - 1e-6 or cy1 < y_min - 1e-6 or
                         cx2 > x_max + 1e-6 or cy2 > y_max + 1e-6):
                         return True  # past global bounds → reject slot
-            for o in others:
-                if o is m:
-                    continue
-                if m.overlaps(o):
-                    return True
+            if grid_ref is not None:
+                # Grid-accelerated: only test macros whose current bbox
+                # shares a cell with m's hypothetical new bbox. Use the
+                # exclude_idx variant so m doesn't get tested against
+                # itself (its own grid entry is for its CURRENT bbox,
+                # which doesn't apply to the hypothetical position).
+                m_index = macro_idx.get(id(m))
+                for j in grid_ref.query_candidates_for_bbox(m.bbox, exclude_idx=m_index):
+                    o = others[j]
+                    if o is m:
+                        continue
+                    if m.overlaps(o):
+                        return True
+            else:
+                for o in others:
+                    if o is m:
+                        continue
+                    if m.overlaps(o):
+                        return True
             return False
         finally:
             m._restore(snap)
@@ -578,8 +739,12 @@ def displace_to_clear_slots(
     # Identify overlapping macros (non-fixed, with at least one non-fixed
     # overlapping neighbor). Macros that overlap ONLY fixed obstacles
     # can't be helped by jumping — the fixed obstacle is in the way.
-    def _has_movable_overlap(m: "Macro") -> bool:
-        for o in macros:
+    # Grid-accelerated: query each macro's candidate set instead of
+    # scanning every other macro.
+    def _has_movable_overlap(m: "Macro", m_idx: int,
+                               grid_ref: _MacroSpatialGrid) -> bool:
+        for j in grid_ref.query_candidates(m_idx, macros):
+            o = macros[j]
             if o is m:
                 continue
             if not m.overlaps(o):
@@ -605,8 +770,10 @@ def displace_to_clear_slots(
         return (bx1 < x_min - 1e-6 or by1 < y_min - 1e-6 or
                 bx2 > x_max + 1e-6 or by2 > y_max + 1e-6)
 
-    overlapping_macros = [m for m in macros
-                          if not m.is_fixed and _has_movable_overlap(m)]
+    overlapping_macros: list["Macro"] = []
+    for idx, m in enumerate(macros):
+        if not m.is_fixed and _has_movable_overlap(m, idx, grid):
+            overlapping_macros.append(m)
     oob_macros = [m for m in macros if _is_oob(m)]
     # Deduplicate: a macro can be both overlapping and OOB.
     seen = set(id(m) for m in overlapping_macros)
@@ -619,9 +786,14 @@ def displace_to_clear_slots(
         return _count_residual_overlaps(macros)
 
     # Sort by overlap count (most-overlapping first — biggest win per jump).
-    def _overlap_count(m: "Macro") -> int:
-        return sum(1 for o in macros if o is not m and m.overlaps(o))
-    overlapping_macros.sort(key=lambda m: -_overlap_count(m))
+    # Grid-accelerated: same candidate-set query as _has_movable_overlap.
+    def _overlap_count(m: "Macro", m_idx: int,
+                        grid_ref: _MacroSpatialGrid) -> int:
+        return sum(1 for j in grid_ref.query_candidates(m_idx, macros)
+                    if macros[j] is not m and m.overlaps(macros[j]))
+    overlapping_macros.sort(
+        key=lambda m: -_overlap_count(m, macro_idx[id(m)], grid)
+    )
 
     if verbose:
         print(f"  Tetris: {len(overlapping_macros)} macros with overlaps, "
@@ -633,7 +805,7 @@ def displace_to_clear_slots(
         # (a macro can be in this list because it was OOB earlier but
         # a previous jump already fixed it, or because it was overlapping
         # but a neighbor's jump resolved the overlap).
-        if _overlap_count(m) == 0 and not _is_oob(m):
+        if _overlap_count(m, macro_idx[id(m)], grid) == 0 and not _is_oob(m):
             continue
 
         cur_x, cur_y = m.leader.x, m.leader.y
@@ -654,17 +826,22 @@ def displace_to_clear_slots(
         # previous top_k=80 limit caused Tetris to give up on macros
         # whose 80 nearest slots were all blocked — even when clear
         # slots existed further away. On a 19×19 grid (361 slots),
-        # evaluating all of them is cheap (O(slots × macros) ≈ 27k
-        # overlap checks per macro). For very large boards the grid
-        # is capped at max_candidate_slots=400 anyway.
+        # evaluating all of them is cheap (O(slots × candidates_per_cell)
+        # ≈ 27k / 10 = 2.7k overlap checks per macro with the grid).
+        # For very large boards the grid is capped at
+        # max_candidate_slots=400 anyway.
         for d2, sx, sy in slots:
-            if not _overlaps_at(m, sx, sy, macros, keepout=ke):
+            if not _overlaps_at(m, sx, sy, macros, keepout=ke, grid_ref=grid):
                 # Jump to this slot. Use translate (which respects bounds)
                 # so we don't accidentally place the macro OOB.
                 dx = sx - cur_x
                 dy = sy - cur_y
                 if m.translate(dx, dy, bounds=bounds):
                     jumps_made += 1
+                    # Rebuild the grid so the next macro's slot search
+                    # sees this macro at its new position. Cheap (O(N))
+                    # and only fires on accepted jumps.
+                    grid = _MacroSpatialGrid.from_macros(macros, bounds)
                     break
 
     if verbose and jumps_made:
@@ -674,13 +851,176 @@ def displace_to_clear_slots(
 
 
 def _count_residual_overlaps(macros: list["Macro"]) -> int:
-    """Count pairwise macro overlaps (helper)."""
-    n = 0
-    for i in range(len(macros)):
-        for j in range(i + 1, len(macros)):
+    """Count pairwise macro overlaps (helper).
+
+    Uses ``_MacroSpatialGrid`` when the macro count is large enough to
+    benefit (>15 macros — below that the grid build cost exceeds the
+    scan cost). Below the threshold the plain O(N²) scan runs — that's
+    still the right answer for small boards where the grid overhead
+    would dominate. See IMPROVEMENTS §2.3.
+    """
+    n = len(macros)
+    if n < 15:
+        # Plain O(N²) — grid build cost would exceed the scan cost.
+        count = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                if macros[i].overlaps(macros[j]):
+                    count += 1
+        return count
+    # Grid-accelerated: build once, query per macro.
+    bounds = _macros_bounds(macros)
+    grid = _MacroSpatialGrid.from_macros(macros, bounds)
+    seen: set[tuple[int, int]] = set()
+    count = 0
+    for i in range(n):
+        for j in grid.query_candidates(i, macros):
+            pair = (i, j) if i < j else (j, i)
+            if pair in seen:
+                continue
+            seen.add(pair)
             if macros[i].overlaps(macros[j]):
-                n += 1
-    return n
+                count += 1
+    return count
+
+
+def _macros_bounds(macros: list["Macro"]) -> tuple[float, float, float, float]:
+    """Compute the AABB of every macro. Used as the spatial grid extent."""
+    x_min = y_min = float("inf")
+    x_max = y_max = float("-inf")
+    for m in macros:
+        bx1, by1, bx2, by2 = m.bbox
+        if bx1 < x_min:
+            x_min = bx1
+        if by1 < y_min:
+            y_min = by1
+        if bx2 > x_max:
+            x_max = bx2
+        if by2 > y_max:
+            y_max = by2
+    if x_min == float("inf"):
+        return (0.0, 0.0, 1.0, 1.0)
+    return (x_min, y_min, x_max, y_max)
+
+
+def _macro_in_keepout(m: "Macro", keepouts: list) -> tuple[float, float, float] | None:
+    """Return ``(push_x, push_y, depth)`` to evict ``m`` from the deepest keepout it overlaps.
+
+    Returns None when the macro is clear of every keepout (or when there
+    are no keepouts). The push vector points from the center of the
+    nearest violated keepout toward the macro's center — applying it
+    moves the macro OUT of that keepout along the cheaper axis (the one
+    with less overlap depth), matching the strategy used by
+    ``push_apart_overlapping``.
+
+    Used by ``_keepout_clamp`` to evict macros from internal cutouts
+    (mounting slots, milled pockets, non-plated through-holes). Without
+    this, SA's cost function (``total_keepout_overlap``) gets the
+    gradient right but the legalizer would have to fight the SA gradient
+    instead of reinforcing it. See IMPROVEMENTS §2.1.
+    """
+    if not keepouts:
+        return None
+    if m.is_fixed:
+        # Fixed macros (connectors) intentionally overhang — skip.
+        return None
+    mx1, my1, mx2, my2 = m.bbox
+    mcx = (mx1 + mx2) / 2.0
+    mcy = (my1 + my2) / 2.0
+    best: tuple[float, float, float] | None = None
+    best_depth = -1.0
+    for k in keepouts:
+        ox1 = max(mx1, k.x_min)
+        oy1 = max(my1, k.y_min)
+        ox2 = min(mx2, k.x_max)
+        oy2 = min(my2, k.y_max)
+        if ox2 <= ox1 or oy2 <= oy1:
+            continue
+        ox_depth = ox2 - ox1
+        oy_depth = oy2 - oy1
+        kcx = (k.x_min + k.x_max) / 2.0
+        kcy = (k.y_min + k.y_max) / 2.0
+        # Direction from keepout center to macro center (push outward).
+        dx = mcx - kcx
+        dy = mcy - kcy
+        dist = math.hypot(dx, dy)
+        if dist < 1e-6:
+            # Macro exactly centred on the keepout — pick X by default.
+            dx, dy = 1.0, 0.0
+            dist = 1.0
+        # Cheaper axis: smaller of ox_depth, oy_depth.
+        if ox_depth <= oy_depth:
+            push = ox_depth + 0.01
+            px = (1.0 if dx >= 0 else -1.0) * push
+            py = 0.0
+            depth = ox_depth
+        else:
+            push = oy_depth + 0.01
+            px = 0.0
+            py = (1.0 if dy >= 0 else -1.0) * push
+            depth = oy_depth
+        if depth > best_depth:
+            best_depth = depth
+            best = (px, py, depth)
+    return best
+
+
+def _keepout_clamp(
+    macros: list["Macro"],
+    bounds: tuple[float, float, float, float],
+    keepouts: list,
+) -> int:
+    """Evict any non-fixed macro that overlaps an internal keepout zone.
+
+    Iterates up to 5 passes: each pass picks the deepest keepout overlap
+    for each macro and pushes it out along the cheaper axis (mirroring
+    ``push_apart_overlapping``'s strategy). Stops when no macro moved.
+
+    Returns the count of macros still inside a keepout after the loop
+    (residual violations — these get reported to the caller and surface
+    as a keepout_overlap penalty in the SA cost function so the next SA
+    round can try to fix them with a different placement).
+
+    Fixed macros (connectors placed on the perimeter with intentional
+    overhang) are skipped — see ``_macro_in_keepout``.
+    """
+    if not keepouts:
+        return 0
+    x_min, y_min, x_max, y_max = bounds
+    failed = 0
+    for _ in range(5):
+        any_moved = False
+        for m in macros:
+            push = _macro_in_keepout(m, keepouts)
+            if push is None:
+                continue
+            px, py, _depth = push
+            snap = m._snapshot()
+            ok = m.translate(px, py, bounds=bounds)
+            if not ok:
+                # Try only the non-zero axis, then the perpendicular
+                # as a fallback (one of them may be blocked by bounds).
+                if abs(px) > 1e-9:
+                    ok = m.translate(px, 0.0, bounds=bounds)
+                elif abs(py) > 1e-9:
+                    ok = m.translate(0.0, py, bounds=bounds)
+            if ok:
+                # Reject moves that create a new macro-macro overlap.
+                new_overlap = any(m.overlaps(o) for o in macros if o is not m)
+                if new_overlap:
+                    m._restore(snap)
+                else:
+                    any_moved = True
+            else:
+                m._restore(snap)
+        if not any_moved:
+            break
+    # Count residual macros still inside a keepout (for reporting).
+    failed = 0
+    for m in macros:
+        if _macro_in_keepout(m, keepouts) is not None:
+            failed += 1
+    return failed
 
 
 def _fit_macro_to_polygon(
@@ -1175,6 +1515,32 @@ def legalize(
                     by1 < by_min - 1e-6 or by2 > by_max + 1e-6):
                     failed += 1
 
+    # ─── Internal-keepout clamp (mounting slots, milled pockets, NPTH holes) ──
+    # The cost function's `total_keepout_overlap` gives SA a gradient
+    # AWAY from internal cutouts; this clamp reinforces that with a
+    # hard legalizer pass that evicts any macro still sitting on a
+    # keepout after the boundary clamp + push-apart rounds above.
+    # See IMPROVEMENTS §2.1.
+    keepouts = getattr(model, "keepouts", None) or []
+    keepout_failures = 0
+    if keepouts:
+        keepout_failures = _keepout_clamp(macros, bounds, keepouts)
+        if keepout_failures > 0 and verbose:
+            print(
+                f"  Keepout clamp: {keepout_failures} macro(s) still inside "
+                f"an internal cutout (cost-function penalty will apply)"
+            )
+        # Push-apart may be needed if the keepout eviction displaced
+        # macros into each other.
+        residual = push_apart_overlapping(macros, bounds, max_passes=max_push_passes)
+        # Re-run the overlap-aware boundary clamp (keepout eviction may
+        # have pushed something OOB).
+        failed = _boundary_clamp_overlap_aware(
+            macros, bounds, per_macro_keepout=per_macro_keepout,
+            board=board,
+        )
+        residual = _count_residual_overlaps(macros)
+
     # ─── Tetris-style "displace to nearest empty slot" cleanup (Finding 3 fix) ──
     # The greedy push-apart + force-spread above are LOCAL heuristics.
     # They get stuck in local minima: a macro surrounded by overlapping
@@ -1253,11 +1619,13 @@ def legalize(
         print(
             f"  Legalize: {residual} residual overlaps, "
             f"{failed} boundary failures, {cap_ic_overlaps} cap-IC overlaps"
+            + (f", {keepout_failures} keepout violations" if keepout_failures else "")
         )
 
     return {
         "residual_overlaps": residual,
         "boundary_failures": failed,
         "cap_ic_overlaps": cap_ic_overlaps,
+        "keepout_failures": keepout_failures,
         "expanded_bounds": bounds,
     }

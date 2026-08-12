@@ -62,12 +62,33 @@ class IncrementalCostTracker:
         gamma: float = 8.0,
         exclude_nets: set[str] | None = None,
         net_weights: dict[str, float] | None = None,
+        keepout_weight: float | None = None,
+        delta: float = 0.0,
+        rules: list | None = None,
     ) -> None:
         self.model = model
         self.macros = macros
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
+        # Keepout weight defaults to γ — matches cost.evaluate()'s default
+        # so the incremental and from-scratch costs agree. See IMPROVEMENTS §2.1.
+        self.keepout_weight = gamma if keepout_weight is None else keepout_weight
+        # Constraint penalty weight (default 0 = disabled). When > 0 AND
+        # rules is provided, the tracker asks evaluate_constraint_penalties
+        # for the current constraint penalty. This is NOT incremental —
+        # the tracker stores the last-seen value and lets the SA caller
+        # refresh it every N steps via ``refresh_constraint_penalty()``.
+        # See IMPROVEMENTS §2.4.
+        self.delta = delta
+        self.rules = rules
+        self._constraint_total = 0.0
+        if delta > 0 and rules:
+            try:
+                from engine.constraint_evaluator import evaluate_constraint_penalties
+                self._constraint_total, _ = evaluate_constraint_penalties(model, rules)
+            except Exception:
+                self._constraint_total = 0.0
         self.exclude_nets = exclude_nets or set()
         self.net_weights = net_weights or {}
 
@@ -106,9 +127,19 @@ class IncrementalCostTracker:
         }
         self._boundary_total = sum(self._boundary_by_ref.values())
 
+        # Keepout overlap cache — per-component, like boundary. Only built
+        # when the board actually has internal cutouts (no-op otherwise).
+        # See IMPROVEMENTS §2.1.
+        self._keepouts = getattr(model, "keepouts", None) or []
+        self._keepout_by_ref: dict[str, float] = {
+            c.ref: self._component_keepout(c) for c in model.components
+        }
+        self._keepout_total = sum(self._keepout_by_ref.values())
+
         self._pending_nets: dict[str, float] | None = None
         self._pending_pairs: dict[tuple[int, int], float] | None = None
         self._pending_boundary: dict[str, float] | None = None
+        self._pending_keepout: dict[str, float] | None = None
 
     def _component_boundary(self, c: "Component") -> float:
         if getattr(c, "is_edge_connector", False):
@@ -118,6 +149,28 @@ class IncrementalCostTracker:
         # inner loop hits this on every proposed move, so it must stay
         # cheap and identical for the common rectangular case).
         return self.model.board.bbox_overflow(c.bbox)
+
+    def _component_keepout(self, c: "Component") -> float:
+        """Intersection area of ``c``'s bbox with every internal keepout.
+
+        Matches ``cost.total_keepout_overlap`` per-component. 0.0 when
+        the board has no internal cutouts (the common case). Edge
+        connectors are exempt. See IMPROVEMENTS §2.1.
+        """
+        if not self._keepouts:
+            return 0.0
+        if getattr(c, "is_edge_connector", False):
+            return 0.0
+        cx1, cy1, cx2, cy2 = c.bbox
+        total = 0.0
+        for k in self._keepouts:
+            ox1 = max(cx1, k.x_min)
+            oy1 = max(cy1, k.y_min)
+            ox2 = min(cx2, k.x_max)
+            oy2 = min(cy2, k.y_max)
+            if ox2 > ox1 and oy2 > oy1:
+                total += (ox2 - ox1) * (oy2 - oy1)
+        return total
 
     def overlapping_pairs(self) -> list[tuple[int, int]]:
         """Macro-index pairs with nonzero cached overlap right now.
@@ -131,15 +184,42 @@ class IncrementalCostTracker:
         return list(self._pair_overlap.keys())
 
     def total(self) -> dict[str, float]:
-        return self._compose(self._hpwl_total, self._overlap_total, self._boundary_total)
+        return self._compose(self._hpwl_total, self._overlap_total,
+                              self._boundary_total, self._keepout_total,
+                              self._constraint_total)
 
-    def _compose(self, hpwl: float, overlap: float, boundary: float) -> dict[str, float]:
+    def _compose(self, hpwl: float, overlap: float, boundary: float,
+                  keepout: float = 0.0, constraint: float = 0.0) -> dict[str, float]:
         return {
             "hpwl": hpwl,
             "overlap": overlap,
             "boundary": boundary,
-            "total": self.alpha * hpwl + self.beta * overlap + self.gamma * boundary,
+            "keepout": keepout,
+            "constraint": constraint,
+            "total": (self.alpha * hpwl + self.beta * overlap
+                       + self.gamma * boundary + self.keepout_weight * keepout
+                       + self.delta * constraint),
         }
+
+    def refresh_constraint_penalty(self) -> float:
+        """Recompute the constraint penalty from scratch.
+
+        SA callers should call this every N steps (e.g. every 50) when
+        ``delta > 0`` so the constraint term stays current. Between
+        refreshes, the tracker uses the last-seen value — the constraint
+        penalty changes slowly (it depends on component positions, not
+        on every micro-move), so this is a reasonable approximation.
+
+        Returns the new constraint penalty.
+        """
+        if not (self.delta > 0 and self.rules):
+            return 0.0
+        try:
+            from engine.constraint_evaluator import evaluate_constraint_penalties
+            self._constraint_total, _ = evaluate_constraint_penalties(self.model, self.rules)
+        except Exception:
+            self._constraint_total = 0.0
+        return self._constraint_total
 
     def propose(self, touched_macro_indices: list[int]) -> dict[str, float]:
         """Recompute cost assuming the touched macros' positions have
@@ -186,14 +266,43 @@ class IncrementalCostTracker:
                 pending_boundary[c.ref] = new_b
                 boundary_delta += new_b - self._boundary_by_ref[c.ref]
 
+        # Keepout delta — only non-trivial when the board has internal
+        # cutouts. Matches the per-component structure of boundary so the
+        # same touched-set walks both. See IMPROVEMENTS §2.1.
+        pending_keepout: dict[str, float] = {}
+        keepout_delta = 0.0
+        if self._keepouts:
+            for idx in touched:
+                for c in self.macros[idx].members:
+                    if c.ref in pending_keepout:
+                        continue
+                    new_k = self._component_keepout(c)
+                    pending_keepout[c.ref] = new_k
+                    keepout_delta += new_k - self._keepout_by_ref[c.ref]
+
         self._pending_nets = pending_nets
         self._pending_pairs = pending_pairs
         self._pending_boundary = pending_boundary
+        self._pending_keepout = pending_keepout
 
+        # Include the cached constraint term so propose() is symmetric with
+        # total() — both carry delta·constraint. The constraint penalty is
+        # NOT recomputed per move (too expensive — it walks the whole model);
+        # it's a cached value refreshed every N steps by the SA caller via
+        # refresh_constraint_penalty(). Between refreshes it's constant, so
+        # it cancels in the SA accept/reject Δ (exactly like the externally-
+        # added RUDY/pin-density terms). Without this, the tracker path's
+        # new_total omitted the constraint term while current_total (from the
+        # full evaluate() at init) included it — so after the first accepted
+        # step the constraint penalty dropped out of SA's running comparison
+        # and effectively stopped influencing per-step acceptance. See
+        # IMPROVEMENTS §2.4.
         return self._compose(
             self._hpwl_total + hpwl_delta,
             self._overlap_total + overlap_delta,
             self._boundary_total + boundary_delta,
+            self._keepout_total + keepout_delta,
+            self._constraint_total,
         )
 
     def commit(self) -> None:
@@ -213,9 +322,14 @@ class IncrementalCostTracker:
         for ref, v in self._pending_boundary.items():
             self._boundary_total += v - self._boundary_by_ref[ref]
             self._boundary_by_ref[ref] = v
+        if self._pending_keepout:
+            for ref, v in self._pending_keepout.items():
+                self._keepout_total += v - self._keepout_by_ref[ref]
+                self._keepout_by_ref[ref] = v
         self._pending_nets = None
         self._pending_pairs = None
         self._pending_boundary = None
+        self._pending_keepout = None
 
     def discard(self) -> None:
         """Drop the last propose()'d values (caller must also revert
@@ -223,3 +337,4 @@ class IncrementalCostTracker:
         self._pending_nets = None
         self._pending_pairs = None
         self._pending_boundary = None
+        self._pending_keepout = None

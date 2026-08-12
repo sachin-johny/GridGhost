@@ -1124,7 +1124,11 @@ def _optimize_interior_sa(
     cost += rudy_cost
     T       = T_start
     cooling = (T_end / T_start) ** (1.0 / max(n_iter, 1))
-    rng     = random.Random(42)
+    # Use the module-level `random` (seeded by --seed in gridghost.py) instead
+    # of a fresh Random(42), so the legacy interior SA honours --seed.
+    # rng.random() / rng.choice() / rng.uniform() all resolve to the seeded
+    # module functions.
+    rng     = random
 
     # Spread move operator: periodically move a component from an overcrowded
     # cell to a less-used cell. Strategy is "fill first, expand if needed":

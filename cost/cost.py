@@ -74,7 +74,20 @@ def total_hpwl(
 
 
 def macro_overlap_area(a: "Macro", b: "Macro") -> float:
-    """Intersection area of two macros' bboxes."""
+    """Intersection area of two macros' bboxes.
+
+    Delegates to ``Macro.overlap_area`` so the mechanical-feature
+    exemption (mounting holes, fiducials, test coupons) is applied
+    consistently — otherwise the cost function sees phantom overlaps
+    for mounting-hole pad+via stacks that the legalizer cannot resolve
+    (they're fixed) and SA wastes move budget trying to push them apart.
+    See ``models/macro.py:_is_overlap_exempt`` for the full rationale.
+    """
+    # ``Macro.overlap_area`` handles the exemption; fall back to raw
+    # bbox math only if a non-Macro duck-typed object was passed (tests
+    # sometimes use lightweight stand-ins).
+    if hasattr(a, "overlap_area") and hasattr(b, "bbox"):
+        return a.overlap_area(b)
     ax1, ay1, ax2, ay2 = a.bbox
     bx1, by1, bx2, by2 = b.bbox
     ox1 = max(ax1, bx1)
@@ -87,7 +100,12 @@ def macro_overlap_area(a: "Macro", b: "Macro") -> float:
 
 
 def total_macro_overlap(macros: list["Macro"]) -> float:
-    """Sum of pairwise macro bbox-overlap areas."""
+    """Sum of pairwise macro bbox-overlap areas.
+
+    Uses ``Macro.overlap_area`` (via ``macro_overlap_area``) so the
+    mechanical-feature exemption is applied uniformly across the
+    cost function and the legalizer — see ``models/macro.py``.
+    """
     total = 0.0
     n = len(macros)
     for i in range(n):
@@ -120,6 +138,41 @@ def total_boundary(model: "BoardModel") -> float:
     return total
 
 
+def total_keepout_overlap(model: "BoardModel") -> float:
+    """Total area of component bboxes intersecting internal keepouts.
+
+    Sums the intersection area of each non-exempt component's bbox with
+    every keepout in ``model.keepouts``. Returns 0.0 when the board has
+    no internal cutouts (the common case — 5 of 6 bundled boards have
+    no Edge.Cuts at all, cbbwO has only an outer rect).
+
+    Edge connectors are exempt (a connector's body may legitimately
+    overhang a mounting-hole zone near the board edge).
+
+    Acts as a γ-style linear penalty: SA gets a smooth gradient pushing
+    macros OUT of internal cutouts (mounting slots, milled pockets,
+    non-plated through-holes). Without this term, SA is blind to
+    keepouts — the legalizer's `_keepout_clamp` would have to do all the
+    work reactively, fighting the SA gradient instead of reinforcing it.
+    See IMPROVEMENTS §2.1.
+    """
+    if not model.keepouts:
+        return 0.0
+    total = 0.0
+    for c in model.components:
+        if getattr(c, "is_edge_connector", False):
+            continue
+        cx1, cy1, cx2, cy2 = c.bbox
+        for k in model.keepouts:
+            ox1 = max(cx1, k.x_min)
+            oy1 = max(cy1, k.y_min)
+            ox2 = min(cx2, k.x_max)
+            oy2 = min(cy2, k.y_max)
+            if ox2 > ox1 and oy2 > oy1:
+                total += (ox2 - ox1) * (oy2 - oy1)
+    return total
+
+
 def evaluate(
     model: "BoardModel",
     macros: list["Macro"],
@@ -134,6 +187,10 @@ def evaluate(
     rudy_penalty: float | None = None,
     pin_density_weight: float = 0.0,
     pin_density_penalty: float | None = None,
+    keepout_weight: float | None = None,
+    delta: float = 0.0,
+    rules: list | None = None,
+    constraint_penalty: float | None = None,
 ) -> dict[str, float]:
     """Total placement cost.
 
@@ -172,14 +229,42 @@ def evaluate(
         pin_density_penalty: Pre-computed pin-density penalty (avoids
             re-computing the pin map on every cost evaluation). Same
             caching pattern as ``rudy_penalty``.
+        keepout_weight: Internal-keepout overlap penalty weight. When
+            None (default), uses ``gamma`` — internal cutouts are
+            conceptually a boundary penalty (the macro is somewhere
+            it can't be), so reusing γ gives a consistent gradient
+            strength. Pass 0.0 to disable keepout enforcement in the
+            cost function (the legalizer still clamps to keepouts via
+            ``_keepout_clamp``; this just removes SA's gradient signal
+            toward that outcome). See IMPROVEMENTS §2.1.
+        delta: Constraint penalty weight (default 0 = disabled).
+            When > 0 AND ``rules`` is provided, the cost function
+            includes ``delta · constraint_penalty(model, rules)`` —
+            the same constraint evaluator the legacy path uses
+            (``engine/constraint_evaluator.py:evaluate_constraint_penalties``).
+            Crystal-MCU proximity, thermal grouping/separation,
+            analog/digital separation, decoupling proximity, etc.
+            Default 0 preserves the current macro-v2 behavior (no
+            constraint penalties) so this is a strictly additive
+            opt-in. See IMPROVEMENTS §2.4.
+        rules: List of ``ConstraintRule`` objects (from a board profile).
+            Required when ``delta > 0``; ignored otherwise.
+        constraint_penalty: Pre-computed constraint penalty (avoids
+            re-computing the rule evaluation on every cost call). Same
+            caching pattern as ``rudy_penalty``. SA callers should
+            pass this in.
 
-    Returns dict with hpwl, overlap, boundary, rudy, pin_density, and
-    total components.
+    Returns dict with hpwl, overlap, boundary, keepout, rudy, pin_density,
+    constraint, and total components.
     """
     h = total_hpwl(model, include_power=include_power, exclude_nets=exclude_nets,
                     net_weights=net_weights)
     o = total_macro_overlap(macros)
     b = total_boundary(model)
+    k = total_keepout_overlap(model)
+    # Keepout overlap defaults to γ (boundary weight) — same gradient
+    # strength as the outer boundary penalty.
+    kw = gamma if keepout_weight is None else keepout_weight
     r = 0.0
     if rudy_weight > 0:
         if rudy_penalty is None:
@@ -200,13 +285,29 @@ def evaluate(
                 p = 0.0
         else:
             p = pin_density_penalty
+    # Constraint penalties — only computed when delta > 0 AND rules are
+    # provided. Default delta=0 means this is a no-op on the macro-v2
+    # path unless the caller explicitly opts in (see IMPROVEMENTS §2.4).
+    c = 0.0
+    if delta > 0 and rules:
+        if constraint_penalty is None:
+            try:
+                from engine.constraint_evaluator import evaluate_constraint_penalties
+                c, _breakdown = evaluate_constraint_penalties(model, rules)
+            except Exception:
+                c = 0.0
+        else:
+            c = constraint_penalty
     return {
         "hpwl": h,
         "overlap": o,
         "boundary": b,
+        "keepout": k,
         "rudy": r,
         "pin_density": p,
-        "total": (alpha * h + beta * o + gamma * b
+        "constraint": c,
+        "total": (alpha * h + beta * o + gamma * b + kw * k
                   + rudy_weight * r
-                  + pin_density_weight * p),
+                  + pin_density_weight * p
+                  + delta * c),
     }
