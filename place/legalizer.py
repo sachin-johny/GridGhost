@@ -1392,7 +1392,7 @@ def legalize(
                     if verbose and spread_residual < residual:
                         print(
                             f"  Force-spread: {residual} -> {spread_residual} "
-                            f"overlaps (−{residual - spread_residual})"
+                            f"overlaps (-{residual - spread_residual})"
                         )
                     residual = spread_residual
                     # Re-clamp after force-spread (it may have pushed
@@ -1575,7 +1575,7 @@ def legalize(
             if verbose:
                 print(
                     f"  Tetris cleanup: {residual} -> {new_residual} "
-                    f"overlaps (−{residual - new_residual})"
+                    f"overlaps (-{residual - new_residual})"
                 )
             residual = new_residual
         # Re-clamp to bounds (Tetris jumps stay in-bounds by construction,
