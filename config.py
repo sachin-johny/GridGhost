@@ -73,6 +73,7 @@ class CostConfig:
     overlap_weight: float = 10.0      # moderate — soft penalty; SA explores, legalizer resolves
     boundary_weight: float = 2.0       # low — HPWL dominates; legalizer handles OOB
     constraint_weight: float = 4.0     # delta — overridden by profile.delta at runtime
+    exclude_nets: list[str] = field(default_factory=list)  # net names to drop from HPWL (e.g. global GND)
 
 
 @dataclass

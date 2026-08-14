@@ -42,7 +42,8 @@
     },
     "cost": {
         "overlap_weight": 10.0,
-        "boundary_weight": 2.0
+        "boundary_weight": 2.0,
+        "exclude_nets": []
     },
     "placement": {
         "margin": 5.0,

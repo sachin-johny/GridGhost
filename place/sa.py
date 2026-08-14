@@ -55,6 +55,7 @@ def _calibrate_initial_temp(
     beta: float,
     gamma: float,
     net_weights: dict[str, float] | None = None,
+    exclude_nets: set[str] | None = None,
     rng: random.Random | None = None,
 ) -> float:
     """Estimate an initial temperature by sampling random moves.
@@ -77,7 +78,7 @@ def _calibrate_initial_temp(
 
     positive_deltas: list[float] = []
     base = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma,
-                    net_weights=net_weights)
+                    net_weights=net_weights, exclude_nets=exclude_nets)
 
     for _ in range(n_samples):
         m = rng.choice(macros)
@@ -87,7 +88,7 @@ def _calibrate_initial_temp(
         if not m.translate(dx, dy, bounds=bounds):
             continue
         new_cost = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma,
-                            net_weights=net_weights)
+                            net_weights=net_weights, exclude_nets=exclude_nets)
         delta_overlap = new_cost["overlap"] - base["overlap"]
         m._restore(snap)
         # Skip overlap-penalty samples: they're noise for HPWL calibration.
@@ -131,6 +132,7 @@ def run_macro_sa(
     bias_overlap_prob: float = 0.6,
     delta: float = 0.0,
     rules: list | None = None,
+    exclude_nets: set[str] | None = None,
 ) -> dict[str, float]:
     """Run macro-aware simulated annealing.
 
@@ -171,6 +173,15 @@ def run_macro_sa(
     ``rudy_recompute_every`` steps (same cadence as RUDY/pin-density)
     via the incremental tracker's ``refresh_constraint_penalty()``.
     Default 0 = current behavior. See IMPROVEMENTS §2.4.
+
+    ``exclude_nets`` (default None): set of net names to drop from
+    HPWL entirely. Useful for global power/ground nets that touch
+    every component — their HPWL is nearly constant regardless of
+    placement, so they provide zero gradient signal to SA but cost
+    O(n) per cost evaluation. Excluding them speeds up SA without
+    changing optimization behavior. Previously the parameter existed
+    in ``cost.evaluate()`` and ``IncrementalCostTracker`` but was never
+    threaded through from the SA/pipeline callers.
 
     ``bias_overlapping`` (default False — opt-in, doesn't affect the
     main placement pipeline unless explicitly requested): with
@@ -216,7 +227,7 @@ def run_macro_sa(
                   f"initial penalty={pin_density_penalty_cache:.3f})")
 
     initial = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma,
-                       net_weights=net_weights,
+                       net_weights=net_weights, exclude_nets=exclude_nets,
                        rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache,
                        pin_density_weight=pin_density_weight,
                        pin_density_penalty=pin_density_penalty_cache,
@@ -227,7 +238,8 @@ def run_macro_sa(
 
     T0 = _calibrate_initial_temp(
         model, macros, bounds, n_samples=80, window_mm=initial_window_mm,
-        alpha=alpha, beta=beta, gamma=gamma, net_weights=net_weights, rng=rng,
+        alpha=alpha, beta=beta, gamma=gamma, net_weights=net_weights,
+        exclude_nets=exclude_nets, rng=rng,
     )
     T0 = max(T0, 1.0)
     T_min = max(T0 * 1e-4, 1e-6)
@@ -249,7 +261,7 @@ def run_macro_sa(
     # does.
     tracker = IncrementalCostTracker(
         model, macros, alpha=alpha, beta=beta, gamma=gamma, net_weights=net_weights,
-        delta=delta, rules=rules,
+        exclude_nets=exclude_nets, delta=delta, rules=rules,
     )
     # Sanity: the tracker's from-cache total must agree with the
     # from-scratch evaluate() above (excluding the routability terms,
@@ -389,7 +401,7 @@ def run_macro_sa(
                              + pin_density_weight * (pin_density_penalty_cache or 0.0))
             else:
                 new_cost = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma,
-                                    net_weights=net_weights,
+                                    net_weights=net_weights, exclude_nets=exclude_nets,
                                     rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache,
                                     pin_density_weight=pin_density_weight,
                                     pin_density_penalty=pin_density_penalty_cache,
@@ -466,7 +478,7 @@ def run_macro_sa(
         m.apply_offsets()
 
     final = evaluate(model, macros, alpha=alpha, beta=beta, gamma=gamma,
-                     net_weights=net_weights,
+                     net_weights=net_weights, exclude_nets=exclude_nets,
                      rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache,
                      pin_density_weight=pin_density_weight,
                      pin_density_penalty=pin_density_penalty_cache,

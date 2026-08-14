@@ -102,6 +102,27 @@ def test_total_hpwl_can_exclude_power():
     assert total_hpwl(model, exclude_nets={"+3V3"}) == 0.0
 
 
+def test_evaluate_exclude_nets_reduces_hpwl():
+    """exclude_nets threaded through evaluate() should reduce HPWL term."""
+    a = _comp("U1", 0.0, 0.0, ctype="ic")
+    b = _comp("C1", 5.0, 0.0, ctype="capacitor")
+    vcc = Net("+3V3", [("U1", "1"), ("C1", "1")])
+    sig = Net("SIG", [("U1", "2"), ("C1", "2")])
+    model = BoardModel(
+        board=BoardOutline(0, 0, 100, 100),
+        components=[a, b],
+        nets=[vcc, sig],
+    )
+    macros = [Macro.alone(a), Macro.alone(b)]
+    with_exclude = evaluate(model, macros, exclude_nets={"+3V3"})
+    without_exclude = evaluate(model, macros, exclude_nets=None)
+    # Excluding +3V3 should reduce HPWL (the SIG net's HPWL remains)
+    assert with_exclude["hpwl"] < without_exclude["hpwl"]
+    # Overlap/boundary are unaffected
+    assert with_exclude["overlap"] == without_exclude["overlap"]
+    assert with_exclude["boundary"] == without_exclude["boundary"]
+
+
 def test_macro_overlap_no_overlap():
     a = Macro.alone(_comp("U1", 0, 0, w=10, h=10))
     b = Macro.alone(_comp("U2", 100, 100, w=10, h=10))

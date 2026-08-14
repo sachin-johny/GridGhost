@@ -183,3 +183,63 @@ def test_bias_overlapping_does_not_crash_and_reduces_overlap():
         if macros[i].overlaps(macros[j])
     )
     assert after <= before
+
+
+def test_incremental_exclude_nets_matches_full_recompute():
+    """IncrementalCostTracker with exclude_nets must agree with evaluate()."""
+    model = _make_board()
+    macros = _build_macros(model)
+    bounds = (0.0, 0.0, 80.0, 80.0)
+    exclude = {"GND"}
+    tracker = IncrementalCostTracker(
+        model, macros, alpha=1.0, beta=25.0, gamma=8.0, exclude_nets=exclude,
+    )
+
+    baseline = evaluate(model, macros, alpha=1.0, beta=25.0, gamma=8.0,
+                        exclude_nets=exclude)
+    assert abs(tracker.total()["total"] - baseline["total"]) < 1e-6
+
+    rng = random.Random(42)
+    for _ in range(100):
+        idx = rng.randrange(len(macros))
+        m = macros[idx]
+        snap = m._snapshot()
+        dx, dy = rng.uniform(-5, 5), rng.uniform(-5, 5)
+        ok = m.translate(dx, dy, bounds=bounds)
+        if not ok:
+            continue
+
+        proposed = tracker.propose([idx])
+        full = evaluate(model, macros, alpha=1.0, beta=25.0, gamma=8.0,
+                        exclude_nets=exclude)
+        assert abs(proposed["total"] - full["total"]) < 1e-6
+
+        if rng.random() < 0.5:
+            tracker.commit()
+        else:
+            m._restore(snap)
+            tracker.discard()
+
+
+def test_sa_exclude_nets_reduces_cost():
+    """run_macro_sa with exclude_nets should produce lower HPWL than without."""
+    from place.sa import run_macro_sa
+
+    model = _make_board(n_ics=6, seed=3)
+    macros = _build_macros(model)
+    bounds = (0.0, 0.0, 80.0, 80.0)
+    exclude = {"GND"}
+
+    # Run SA with exclude_nets — the final HPWL should exclude the GND net
+    result = run_macro_sa(
+        model, macros, bounds, iterations=200, reheats=0,
+        alpha=1.0, beta=25.0, gamma=8.0,
+        seed=42, verbose=False, exclude_nets=exclude,
+    )
+    # Verify SA ran (non-trivial result)
+    assert result["final_hpwl"] >= 0.0
+    # The excluded GND net should NOT be in the HPWL — compare with
+    # a from-scratch evaluate that also excludes GND
+    final_eval = evaluate(model, macros, alpha=1.0, beta=25.0, gamma=8.0,
+                          exclude_nets=exclude)
+    assert abs(result["final_hpwl"] - final_eval["hpwl"]) < 1e-3

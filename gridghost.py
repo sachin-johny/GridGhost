@@ -209,6 +209,10 @@ def cmd_place(args) -> None:
             use_sa_polish=(getattr(args, "legalizer", "heuristic") == "sa_polish"),
             delta=getattr(args, "delta", 0.0),
             rules=profile.rules if getattr(args, "delta", 0.0) > 0 else None,
+            exclude_nets=set(
+                (getattr(args, "exclude_nets", None) or [])
+                + cfg.cost.exclude_nets
+            ),
         )
     elif algorithm == "force-directed":
         # Legacy-only: --algorithm force-directed
@@ -703,6 +707,11 @@ def main():
     p_place.add_argument("-v", "--verbose", action="store_true",
                          help="Print per-stage cost breakdown (macro-v2 pipeline). "
                               "Legacy pipeline always prints verbose output regardless of this flag.")
+    p_place.add_argument("--exclude-nets", nargs="*", default=[],
+                         help="Net names to exclude from HPWL computation during SA. "
+                              "Useful for global GND/VCC nets that touch every component "
+                              "and contribute near-constant HPWL (no gradient signal, "
+                              "but costs O(n) per evaluation). Example: --exclude-nets GND +3V3")
     p_place.add_argument("--legalizer", choices=["abacus", "heuristic", "sa_polish"], default="heuristic",
                          help="Macro-v2 overlap-resolution strategy (default: heuristic). "
                               "'abacus' bridges macro-v2's rigid Macro objects into the "
