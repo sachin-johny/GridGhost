@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-from assign.assign_caps import assign_caps, IC_TYPES
+from assign.assign_caps import classify_caps, IC_TYPES
 from cost.cost import evaluate
 from cost.chains import detect_interior_chains, build_chain_net_weights, CHAIN_NET_WEIGHT
 from models.macro import Macro
@@ -60,11 +60,19 @@ def build_macros(model: "BoardModel") -> tuple[list[Macro], list[Macro], list[Ma
       cost function so SA sees the obstacle penalty (SA itself doesn't
       move them — see ``run_macro_sa``'s fixed-macro filtering).
 
-    A cap assigned to an IC is ONLY in that IC's macro — never as a
-    standalone macro. This is critical: if a cap were in two macros,
-    push_apart could move the standalone cap away from its IC.
+    A cap assigned to an IC as a rigid follower is ONLY in that IC's
+    macro — never as a standalone macro. Rail-adjacent caps (excess
+    decoupling caps beyond ``max_decaps_per_ic`` per IC) become
+    standalone macros so SA can move them freely toward the power rail.
+    This avoids rigidly locking a large fan of caps to one IC on dense
+    shared-rail boards, which starves SA of degrees of freedom and
+    produces a macro block that is hard to legalize.
     """
-    decap_map = assign_caps(model)
+    # classify_caps splits decoupling caps into rigid followers (≤ N per
+    # IC → Macro.with_caps) and rail-adjacent (the rest → standalone).
+    # Only rigid followers are in decap_map / cap_ref_to_ic, so the
+    # rail-adjacent caps naturally become Macro.alone() below.
+    decap_map, _rail_adjacent_refs, _bulk_refs, _coupling_refs = classify_caps(model)
     cap_ref_to_ic: dict[str, str] = {
         cap: ic for ic, caps in decap_map.items() for cap in caps
     }
@@ -156,6 +164,7 @@ def place_v2(
     grouping/separation, analog/digital separation, etc. — same rules
     the legacy path applies. Default 0 = current macro-v2 behavior
     (no constraint penalties). See IMPROVEMENTS §2.4.
+
     """
     # Resolve routability weights against config when the caller didn't
     # explicitly pass one. The CLI passes ``None`` when the user didn't

@@ -1,12 +1,24 @@
 """Classify caps and assign each decoupling cap to exactly one IC.
 
-Three cap classes:
+Four cap classes:
 
-- **Decoupling** — small value (<=1uF) on a non-GND power rail shared with
-  at least one IC. These become macro followers and stay within
-  ``MAX_CAP_IC_GAP_MM`` (edge-to-edge) of their leader.
+- **Decoupling (rigid)** — the first ``max_decaps_per_ic`` caps assigned
+  to each IC become macro followers and stay within
+  ``MAX_CAP_IC_GAP_MM`` (edge-to-edge) of their leader. These are the
+  "inner ring" of critical bypass caps that must be as close as
+  physically possible to the IC power pins.
 
-- **Bulk** — large value (>1uF) OR on a power rail that no IC shares.
+- **Decoupling (rail-adjacent)** — excess caps beyond
+  ``max_decaps_per_ic`` per IC. These are small-value caps on the same
+  power rail, but there isn't room for all of them in the rigid fan
+  around the IC. They become standalone macros (not rigid followers); SA
+  can move them freely. This avoids rigidly gluing a large cap fan to one
+  IC on dense shared-rail boards (e.g. test4: 10 caps on U30's +3V3
+  rail), which starves SA of degrees of freedom and produces a bulky
+  macro block that is hard for the legalizer to place without cap-IC
+  overlap.
+
+- **Bulk** — large value (>10uF) OR on a power rail that no IC shares.
   These are rail-level filters (regulator output, board input rail, etc.)
   and are placed standalone; they do not belong to any one IC.
 
@@ -14,7 +26,8 @@ Three cap classes:
   USB D+/D-, reset filters). No power rail at all. Standalone.
 
 Decoupling caps are distributed round-robin across the ICs sharing the
-rail so each IC gets roughly equal decoupling.
+rail so each IC gets roughly equal decoupling. The first N per IC
+(default 2) become rigid followers; the rest become rail-adjacent.
 """
 
 from __future__ import annotations
@@ -33,6 +46,15 @@ IC_TYPES = frozenset({"ic", "mcu", "regulator"})
 # threshold mis-classified them as decoupling followers (which get paired
 # tightly to a single IC via a rigid macro).
 DECAP_MAX_VALUE_F = 10e-6  # 10uF
+
+# Maximum decoupling caps per IC that become rigid macro followers.
+# The rest become standalone "rail-adjacent" caps that SA can move freely.
+# 2 is the standard bypass config: one 100nF (high-freq) + one bulk/low-ESL
+# (mid-freq) per IC power pin pair. Rigidly gluing more than 2 creates a
+# large rigid fan around the IC: it starves SA of degrees of freedom and
+# produces a bulky macro that is hard for the legalizer to place without
+# cap-IC overlap (observed on test4: 10 caps on U30).
+MAX_DECAPS_PER_IC = 2
 
 # Net-name patterns that mark power rails.
 _POWER_PREFIXES = (
@@ -109,13 +131,20 @@ def _build_power_net_map(model: "BoardModel") -> dict[str, set[str]]:
 
 def classify_caps(
     model: "BoardModel",
-) -> tuple[dict[str, list[str]], list[str], list[str]]:
+    max_decaps_per_ic: int = MAX_DECAPS_PER_IC,
+) -> tuple[dict[str, list[str]], list[str], list[str], list[str]]:
     """Classify caps and assign decoupling caps to ICs.
 
-    Returns ``(decap_map, bulk_refs, coupling_refs)`` where:
+    Returns ``(decap_map, rail_adjacent_refs, bulk_refs, coupling_refs)``
+    where:
 
-    - ``decap_map``: ``{ic_ref: [cap_ref, ...]}`` — each cap in exactly
-      one IC's list, distributed round-robin by fewest-caps-so-far.
+    - ``decap_map``: ``{ic_ref: [cap_ref, ...]}`` — rigid followers,
+      at most ``max_decaps_per_ic`` caps per IC. These become Macro
+      followers in ``build_macros``.
+    - ``rail_adjacent_refs``: decoupling caps that exceeded the per-IC
+      rigid limit. They become standalone macros (not rigid followers)
+      so SA can move them freely. They share the rail, so HPWL keeps
+      them near the IC cluster without rigidly locking them.
     - ``bulk_refs``: caps that are bulk rail filters (large value, or on
       rails with no IC sharing). Standalone macros.
     - ``coupling_refs``: caps with no power net at all (signal-only).
@@ -124,7 +153,7 @@ def classify_caps(
     ics = [c for c in model.components if c.component_type in IC_TYPES]
     caps = [c for c in model.components if c.component_type == "capacitor"]
     if not ics or not caps:
-        return {}, [], []
+        return {}, [], [], []
 
     ref_to_type = {c.ref: c.component_type for c in model.components}
     ic_refs = {c.ref for c in ics}
@@ -175,21 +204,35 @@ def classify_caps(
             decap_to_ics[cap.ref] = eligible
 
     # Round-robin: each decoupling cap → IC with the fewest decaps so far.
-    ic_caps: dict[str, list[str]] = defaultdict(list)
+    # This produces the FULL assignment (including caps that will later
+    # become rail-adjacent).
+    full_ic_caps: dict[str, list[str]] = defaultdict(list)
     for cap_ref in sorted(decap_to_ics):
         candidates = decap_to_ics[cap_ref]
-        best_ic = min(sorted(candidates), key=lambda r: len(ic_caps[r]))
-        ic_caps[best_ic].append(cap_ref)
+        best_ic = min(sorted(candidates), key=lambda r: len(full_ic_caps[r]))
+        full_ic_caps[best_ic].append(cap_ref)
 
-    return dict(ic_caps), bulk_refs, coupling_refs
+    # Split into rigid followers (≤ max_decaps_per_ic per IC) and
+    # rail-adjacent (the rest). Rigid followers go into decap_map for
+    # Macro.with_caps(); rail-adjacent become standalone macros.
+    decap_map: dict[str, list[str]] = {}
+    rail_adjacent_refs: list[str] = []
+    for ic_ref, all_caps in full_ic_caps.items():
+        rigid = all_caps[:max_decaps_per_ic]
+        excess = all_caps[max_decaps_per_ic:]
+        if rigid:
+            decap_map[ic_ref] = rigid
+        rail_adjacent_refs.extend(excess)
+
+    return decap_map, rail_adjacent_refs, bulk_refs, coupling_refs
 
 
 def assign_caps(model: "BoardModel") -> dict[str, list[str]]:
-    """Backward-compatible wrapper: returns the decoupling map only.
+    """Backward-compatible wrapper: returns the rigid decoupling map only.
 
-    Discards bulk/coupling info. Use ``classify_caps()`` for the full
-    picture. Caps not in the returned dict become standalone macros
-    naturally in ``pipeline.build_macros``.
+    Discards rail-adjacent/bulk/coupling info. Use ``classify_caps()`` for
+    the full picture. Caps not in the returned dict become standalone
+    macros naturally in ``pipeline.build_macros``.
     """
-    decap_map, _, _ = classify_caps(model)
+    decap_map, _, _, _ = classify_caps(model)
     return decap_map

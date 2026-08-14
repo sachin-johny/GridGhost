@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from models.board_model import BoardModel, BoardOutline, Component, Net
-from assign.assign_caps import assign_caps, is_power_net, is_ground_net
+from assign.assign_caps import assign_caps, classify_caps, is_power_net, is_ground_net
 
 passed = 0
 failed = 0
@@ -149,6 +149,43 @@ def test_deterministic_across_runs():
     assert m1 == m2, "Non-deterministic assignment"
 
 
+def test_max_decaps_per_ic_limits_rigid_followers():
+    """classify_caps returns at most max_decaps_per_ic rigid followers per IC.
+    Excess caps become rail-adjacent (standalone)."""
+    u1 = _ic("U1", ["+3V3"])
+    u2 = _ic("U2", ["+3V3"])
+    caps = [_cap(f"C{i}", ["+3V3"]) for i in range(6)]
+    pins = [("U1", "1"), ("U2", "1")] + [(c.ref, "1") for c in caps]
+    vcc = Net("+3V3", pins)
+    model = _model_with([u1, u2] + caps, [vcc])
+
+    # With default max_decaps_per_ic=2, each IC should get at most 2 rigid caps
+    decap_map, rail_adj, bulk, coupling = classify_caps(model)
+    for ic_ref, cap_refs in decap_map.items():
+        assert len(cap_refs) <= 2, f"{ic_ref} has {len(cap_refs)} rigid followers (max 2)"
+    # 6 caps total, 4 rigid (2 per IC), 2 rail-adjacent
+    total_rigid = sum(len(v) for v in decap_map.values())
+    assert total_rigid == 4, f"Expected 4 rigid caps, got {total_rigid}"
+    assert len(rail_adj) == 2, f"Expected 2 rail-adjacent caps, got {len(rail_adj)}"
+
+
+def test_rail_adjacent_caps_are_standalone():
+    """Rail-adjacent caps are NOT in assign_caps() result → standalone macros."""
+    u1 = _ic("U1", ["+3V3"])
+    caps = [_cap(f"C{i}", ["+3V3"]) for i in range(5)]
+    pins = [("U1", "1")] + [(c.ref, "1") for c in caps]
+    vcc = Net("+3V3", pins)
+    model = _model_with([u1] + caps, [vcc])
+
+    decap_map = assign_caps(model)
+    # Only 2 rigid followers (max_decaps_per_ic=2)
+    assert len(decap_map.get("U1", [])) == 2, f"Expected 2 rigid, got {decap_map}"
+
+    # Full classification shows 3 rail-adjacent
+    _, rail_adj, _, _ = classify_caps(model)
+    assert len(rail_adj) == 3, f"Expected 3 rail-adjacent, got {len(rail_adj)}"
+
+
 def main():
     print("=" * 60)
     print("  Cap-IC assignment tests")
@@ -161,6 +198,8 @@ def main():
     run("unassigned cap not in map", test_unassigned_cap_not_in_map)
     run("multi-rail cap picks least-loaded IC", test_cap_on_multiple_rails_picks_least_loaded_ic)
     run("deterministic across runs", test_deterministic_across_runs)
+    run("max_decaps_per_ic limits rigid followers", test_max_decaps_per_ic_limits_rigid_followers)
+    run("rail-adjacent caps are standalone", test_rail_adjacent_caps_are_standalone)
     print("=" * 60)
     print(f"  {passed} passed, {failed} failed")
     print("=" * 60)
