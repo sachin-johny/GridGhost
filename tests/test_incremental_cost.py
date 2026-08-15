@@ -147,6 +147,54 @@ def test_incremental_matches_full_recompute_rotate_and_swap():
             tracker.discard()
 
 
+def test_incremental_cap_attraction_matches_full_recompute():
+    """Cap→IC attraction must be tracked incrementally with exact
+    agreement to a from-scratch evaluate() — for all move types and
+    regardless of commit/discard. Freed caps (standalone macros) and
+    their ICs both move, so both sides of a pair can change.
+    """
+    model = _make_board(n_ics=6)
+    # Model the real freed-cap scenario: each IC is its own macro, and
+    # one cap per IC is a STANDALONE macro SA can move independently.
+    pairs = {}
+    macros = []
+    for c in model.components:
+        if c.component_type == "ic":
+            macros.append(Macro.alone(c))
+        elif c.ref.endswith("_1"):  # second cap of each IC -> freed
+            macros.append(Macro.alone(c))
+            pairs[c.ref] = "U" + c.ref.split("_")[0].lstrip("C")
+    assert pairs and len(pairs) == 6
+
+    bounds = (0.0, 0.0, 80.0, 80.0)
+    tracker = IncrementalCostTracker(
+        model, macros, alpha=1.0, beta=25.0, gamma=8.0,
+        cap_attraction_weight=2.0, cap_pairs=pairs,
+    )
+    rng = random.Random(11)
+    for _ in range(200):
+        idx = rng.randrange(len(macros))
+        m = macros[idx]
+        snap = m._snapshot()
+        if rng.random() < 0.5:
+            ok = m.translate(rng.uniform(-10, 10), rng.uniform(-10, 10), bounds=bounds)
+        else:
+            new_rot = (m.leader.rotation + rng.choice([90, 180, 270])) % 360
+            ok = m.set_pose(m.leader.x, m.leader.y, new_rot, bounds=bounds)
+        if not ok:
+            continue
+        proposed = tracker.propose([idx])
+        full = evaluate(model, macros, alpha=1.0, beta=25.0, gamma=8.0,
+                        cap_attraction_weight=2.0, cap_pairs=pairs)
+        assert abs(proposed["total"] - full["total"]) < 1e-6
+        assert abs(proposed["cap_attraction"] - full["cap_attraction"]) < 1e-6
+        if rng.random() < 0.5:
+            tracker.commit()
+        else:
+            m._restore(snap)
+            tracker.discard()
+
+
 def test_bias_overlapping_does_not_crash_and_reduces_overlap():
     """bias_overlapping is opt-in and touches the shared run_macro_sa
     move-selection code path — verify it runs cleanly and actually

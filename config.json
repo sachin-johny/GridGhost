@@ -36,6 +36,7 @@
         "rudy_grid_resolution": 2.0,
         "pin_density_weight": 0.2,
         "pin_density_grid_resolution": 2.0,
+        "cap_attraction_weight": 1.0,
         "sa_auto_disable_min_components": 6,
         "sa_auto_disable_max_components": 50,
         "spread_floor_fraction": 0.10

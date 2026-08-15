@@ -12,11 +12,20 @@ that gets discounted during hot SA.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from models.board_model import BoardModel, Net
     from models.macro import Macro
+
+# Soft target edge-gap for rail-adjacent (freed) caps around their assigned
+# IC. Rigid followers are held at 4.0mm edge-to-edge by macro construction
+# (assign_caps.MAX_CAP_IC_GAP_MM); freed caps get this looser SOFT target.
+# The attraction term has a deadband: a cap inside the target gap costs
+# nothing, so the term never fights the overlap penalty (which pushes
+# macros apart) — it only charges drift BEYOND the target.
+CAP_ATTRACTION_TARGET_GAP_MM = 5.0
 
 
 def hpwl_net(net: "Net", ref_map: dict[str, "object"], weight: float = 1.0) -> float:
@@ -138,6 +147,43 @@ def total_boundary(model: "BoardModel") -> float:
     return total
 
 
+def cap_attraction_penalty(
+    model: "BoardModel",
+    cap_to_ic: dict[str, str],
+    target_gap_mm: float = CAP_ATTRACTION_TARGET_GAP_MM,
+) -> float:
+    """Sum of deadband-linear drift for rail-adjacent caps.
+
+    For each ``(cap, ic)`` pair, charge ``max(0, dist − target_gap)`` where
+    ``dist`` is the Euclidean center distance between the cap and its
+    assigned IC. The deadband makes this purely a drift penalty:
+
+    - inside ``target_gap`` the term is flat — it never fights the overlap
+      penalty (β, which pushes macros apart) or the congestion terms;
+    - beyond it the gradient is constant-strength toward the IC, so SA has
+      a signal to pull shared-rail caps back even when rail-bbox HPWL is
+      flat w.r.t. the cap's position (the diagnosed root cause of cap drift
+      on boards like test4: a cap on +3V3 can wander inside the 4-IC rail
+      span with zero HPWL change).
+
+    Distances are center-to-center (not edge-to-edge) — cheap and adequate
+    for a soft term; the deadband absorbs the body sizes.
+    """
+    if not cap_to_ic:
+        return 0.0
+    ref_map = {c.ref: c for c in model.components}
+    total = 0.0
+    for cap_ref, ic_ref in cap_to_ic.items():
+        cap = ref_map.get(cap_ref)
+        ic = ref_map.get(ic_ref)
+        if cap is None or ic is None:
+            continue
+        d = math.hypot(cap.x - ic.x, cap.y - ic.y)
+        if d > target_gap_mm:
+            total += d - target_gap_mm
+    return total
+
+
 def total_keepout_overlap(model: "BoardModel") -> float:
     """Total area of component bboxes intersecting internal keepouts.
 
@@ -191,6 +237,8 @@ def evaluate(
     delta: float = 0.0,
     rules: list | None = None,
     constraint_penalty: float | None = None,
+    cap_attraction_weight: float = 0.0,
+    cap_pairs: dict[str, str] | None = None,
 ) -> dict[str, float]:
     """Total placement cost.
 
@@ -253,9 +301,24 @@ def evaluate(
             re-computing the rule evaluation on every cost call). Same
             caching pattern as ``rudy_penalty``. SA callers should
             pass this in.
+        cap_attraction_weight: Weight for the rail-adjacent cap→IC
+            attraction term (default 0 = disabled). When > 0 AND
+            ``cap_pairs`` is provided, adds
+            ``cap_attraction_weight · cap_attraction_penalty`` — a
+            deadband-linear charge on freed caps drifting beyond
+            ``CAP_ATTRACTION_TARGET_GAP_MM`` from their assigned IC.
+            Root-cause fix for shared-rail cap drift: on a rail like
+            +3V3 shared by ICs spread across the board, rail-bbox HPWL
+            is flat w.r.t. a freed cap's position, so SA has no signal
+            keeping it near its assigned IC (measured on test4: seed
+            8.8mm → 32.3mm post-SA). Dedicated-rail caps (+1V2,
+            VCCPLL*) don't need it — their rail HPWL already pins them.
+        cap_pairs: ``{cap_ref: ic_ref}`` assignment for rail-adjacent
+            caps (from ``assign_caps.rail_adjacent_to_ic``). Required
+            when ``cap_attraction_weight > 0``; ignored otherwise.
 
     Returns dict with hpwl, overlap, boundary, keepout, rudy, pin_density,
-    constraint, and total components.
+    constraint, cap_attraction, and total components.
     """
     h = total_hpwl(model, include_power=include_power, exclude_nets=exclude_nets,
                     net_weights=net_weights)
@@ -298,6 +361,9 @@ def evaluate(
                 c = 0.0
         else:
             c = constraint_penalty
+    a = 0.0
+    if cap_attraction_weight > 0 and cap_pairs:
+        a = cap_attraction_penalty(model, cap_pairs)
     return {
         "hpwl": h,
         "overlap": o,
@@ -306,8 +372,10 @@ def evaluate(
         "rudy": r,
         "pin_density": p,
         "constraint": c,
+        "cap_attraction": a,
         "total": (alpha * h + beta * o + gamma * b + kw * k
                   + rudy_weight * r
                   + pin_density_weight * p
-                  + delta * c),
+                  + delta * c
+                  + cap_attraction_weight * a),
     }

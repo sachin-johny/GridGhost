@@ -16,6 +16,7 @@ from cost.cost import (
     total_macro_overlap,
     total_boundary,
     evaluate,
+    cap_attraction_penalty,
 )
 
 passed = 0
@@ -197,6 +198,53 @@ def test_evaluate_returns_all_components():
     assert costs["boundary"] == 0.0
 
 
+def test_cap_attraction_penalty_deadband():
+    # Cap at 4mm from its IC (inside the 5mm deadband) -> zero charge.
+    ic = _comp("U1", 50, 50, ctype="ic")
+    cap = _comp("C1", 54, 50, w=1.0, h=0.5, ctype="capacitor")
+    model = BoardModel(
+        board=BoardOutline(0, 0, 100, 100),
+        components=[ic, cap],
+        nets=[],
+    )
+    assert cap_attraction_penalty(model, {"C1": "U1"}) == 0.0
+
+    # Cap at 12mm -> charge = 12 - 5 = 7 (deadband-linear).
+    cap.x = 62
+    assert cap_attraction_penalty(model, {"C1": "U1"}) == 7.0
+
+
+def test_cap_attraction_penalty_sums_pairs():
+    ic = _comp("U1", 50, 50, ctype="ic")
+    c1 = _comp("C1", 70, 50, w=1.0, h=0.5, ctype="capacitor")     # 20mm -> 15
+    c2 = _comp("C2", 50, 58, w=1.0, h=0.5, ctype="capacitor")     # 8mm -> 3
+    model = BoardModel(
+        board=BoardOutline(0, 0, 100, 100),
+        components=[ic, c1, c2],
+        nets=[],
+    )
+    assert cap_attraction_penalty(model, {"C1": "U1", "C2": "U1"}) == 18.0
+
+
+def test_evaluate_cap_attraction_weighted():
+    ic = _comp("U1", 50, 50, ctype="ic")
+    cap = _comp("C1", 70, 50, w=1.0, h=0.5, ctype="capacitor")  # 20mm -> 15
+    model = BoardModel(
+        board=BoardOutline(0, 0, 100, 100),
+        components=[ic, cap],
+        nets=[],
+    )
+    mi = Macro.alone(ic)
+    mc = Macro.alone(cap)
+    base = evaluate(model, [mi, mc])
+    with_attr = evaluate(model, [mi, mc],
+                         cap_attraction_weight=2.0, cap_pairs={"C1": "U1"})
+    assert with_attr["cap_attraction"] == 15.0
+    assert with_attr["total"] == base["total"] + 2.0 * 15.0
+    # Weight 0 (default) -> term absent, total unchanged.
+    assert evaluate(model, [mi, mc], cap_pairs={"C1": "U1"})["total"] == base["total"]
+
+
 def main():
     print("=" * 60)
     print("  Cost function tests")
@@ -213,6 +261,9 @@ def main():
     run("boundary: counts overshoot", test_total_boundary_counts_overshoot)
     run("boundary: excludes edge connectors", test_boundary_excludes_edge_connectors)
     run("evaluate returns all components", test_evaluate_returns_all_components)
+    run("cap attraction: deadband", test_cap_attraction_penalty_deadband)
+    run("cap attraction: sums pairs", test_cap_attraction_penalty_sums_pairs)
+    run("cap attraction: weighted in evaluate", test_evaluate_cap_attraction_weighted)
     print("=" * 60)
     print(f"  {passed} passed, {failed} failed")
     print("=" * 60)

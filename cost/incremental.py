@@ -42,9 +42,11 @@ incremental total matches a from-scratch recompute after every move).
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
-from cost.cost import hpwl_net, macro_overlap_area
+from cost.cost import hpwl_net, macro_overlap_area, cap_attraction_penalty, \
+    CAP_ATTRACTION_TARGET_GAP_MM
 
 if TYPE_CHECKING:
     from models.board_model import BoardModel, Component, Net
@@ -65,6 +67,8 @@ class IncrementalCostTracker:
         keepout_weight: float | None = None,
         delta: float = 0.0,
         rules: list | None = None,
+        cap_attraction_weight: float = 0.0,
+        cap_pairs: dict[str, str] | None = None,
     ) -> None:
         self.model = model
         self.macros = macros
@@ -83,6 +87,16 @@ class IncrementalCostTracker:
         self.delta = delta
         self.rules = rules
         self._constraint_total = 0.0
+        # Cap→IC attraction (deadband-linear drift penalty on freed caps).
+        # Incremental by construction: each pair's charge depends only on
+        # the cap and IC positions, and SA only moves whole macros — so a
+        # move can only change pairs whose cap or IC member belongs to a
+        # touched macro. Pair indexes are built after ``_ref_map`` below.
+        self.cap_attraction_weight = cap_attraction_weight
+        self._cap_pairs = cap_pairs or {}
+        self._cap_attraction_total = 0.0
+        self._cap_pair_keys_by_ref: dict[str, list[str]] = {}
+        self._cap_pair_charge: dict[str, float] = {}
         if delta > 0 and rules:
             try:
                 from engine.constraint_evaluator import evaluate_constraint_penalties
@@ -93,6 +107,23 @@ class IncrementalCostTracker:
         self.net_weights = net_weights or {}
 
         self._ref_map: dict[str, "Component"] = {c.ref: c for c in model.components}
+
+        # Cap→IC attraction caches — needs _ref_map for positions. The
+        # per-pair charge is max(0, dist − target_gap); pairs are indexed
+        # by BOTH member refs so a macro move (which touches whole macros)
+        # only recomputes the pairs its members participate in.
+        if cap_attraction_weight > 0 and self._cap_pairs:
+            self._cap_attraction_total = cap_attraction_penalty(
+                model, self._cap_pairs)
+            for cap_ref, ic_ref in self._cap_pairs.items():
+                pair_key = f"{cap_ref}::{ic_ref}"
+                self._cap_pair_keys_by_ref.setdefault(cap_ref, []).append(pair_key)
+                self._cap_pair_keys_by_ref.setdefault(ic_ref, []).append(pair_key)
+                cap = self._ref_map.get(cap_ref)
+                ic = self._ref_map.get(ic_ref)
+                d = math.hypot(cap.x - ic.x, cap.y - ic.y) if (cap and ic) else 0.0
+                self._cap_pair_charge[pair_key] = \
+                    max(0.0, d - CAP_ATTRACTION_TARGET_GAP_MM)
 
         # ref -> nets that include that ref as a pin (only nets we're
         # actually tracking, i.e. not in exclude_nets).
@@ -140,6 +171,7 @@ class IncrementalCostTracker:
         self._pending_pairs: dict[tuple[int, int], float] | None = None
         self._pending_boundary: dict[str, float] | None = None
         self._pending_keepout: dict[str, float] | None = None
+        self._pending_cap_pairs: dict[str, float] | None = None
 
     def _component_boundary(self, c: "Component") -> float:
         if getattr(c, "is_edge_connector", False):
@@ -186,19 +218,23 @@ class IncrementalCostTracker:
     def total(self) -> dict[str, float]:
         return self._compose(self._hpwl_total, self._overlap_total,
                               self._boundary_total, self._keepout_total,
-                              self._constraint_total)
+                              self._constraint_total,
+                              self._cap_attraction_total)
 
     def _compose(self, hpwl: float, overlap: float, boundary: float,
-                  keepout: float = 0.0, constraint: float = 0.0) -> dict[str, float]:
+                  keepout: float = 0.0, constraint: float = 0.0,
+                  cap_attraction: float = 0.0) -> dict[str, float]:
         return {
             "hpwl": hpwl,
             "overlap": overlap,
             "boundary": boundary,
             "keepout": keepout,
             "constraint": constraint,
+            "cap_attraction": cap_attraction,
             "total": (self.alpha * hpwl + self.beta * overlap
                        + self.gamma * boundary + self.keepout_weight * keepout
-                       + self.delta * constraint),
+                       + self.delta * constraint
+                       + self.cap_attraction_weight * cap_attraction),
         }
 
     def refresh_constraint_penalty(self) -> float:
@@ -280,10 +316,36 @@ class IncrementalCostTracker:
                     pending_keepout[c.ref] = new_k
                     keepout_delta += new_k - self._keepout_by_ref[c.ref]
 
+        # Cap→IC attraction delta — only pairs whose cap or IC member
+        # belongs to a touched macro. The per-pair charge is
+        # max(0, dist − target_gap); both sides can move (SA moves whole
+        # macros, and both the freed cap and its IC are macro leaders).
+        pending_cap_pairs: dict[str, float] = {}
+        cap_attraction_delta = 0.0
+        if self.cap_attraction_weight > 0 and self._cap_pairs:
+            seen: set[str] = set()
+            for idx in touched:
+                for c in self.macros[idx].members:
+                    for pair_key in self._cap_pair_keys_by_ref.get(c.ref, ()):
+                        if pair_key in seen:
+                            continue
+                        seen.add(pair_key)
+                        cap_ref, ic_ref = pair_key.split("::")
+                        cap = self._ref_map.get(cap_ref)
+                        ic = self._ref_map.get(ic_ref)
+                        if cap is None or ic is None:
+                            continue
+                        d = math.hypot(cap.x - ic.x, cap.y - ic.y)
+                        new_charge = max(0.0, d - CAP_ATTRACTION_TARGET_GAP_MM)
+                        pending_cap_pairs[pair_key] = new_charge
+                        cap_attraction_delta += (new_charge
+                                                 - self._cap_pair_charge[pair_key])
+
         self._pending_nets = pending_nets
         self._pending_pairs = pending_pairs
         self._pending_boundary = pending_boundary
         self._pending_keepout = pending_keepout
+        self._pending_cap_pairs = pending_cap_pairs
 
         # Include the cached constraint term so propose() is symmetric with
         # total() — both carry delta·constraint. The constraint penalty is
@@ -303,6 +365,7 @@ class IncrementalCostTracker:
             self._boundary_total + boundary_delta,
             self._keepout_total + keepout_delta,
             self._constraint_total,
+            self._cap_attraction_total + cap_attraction_delta,
         )
 
     def commit(self) -> None:
@@ -326,10 +389,15 @@ class IncrementalCostTracker:
             for ref, v in self._pending_keepout.items():
                 self._keepout_total += v - self._keepout_by_ref[ref]
                 self._keepout_by_ref[ref] = v
+        if self._pending_cap_pairs:
+            for pair_key, v in self._pending_cap_pairs.items():
+                self._cap_attraction_total += v - self._cap_pair_charge[pair_key]
+                self._cap_pair_charge[pair_key] = v
         self._pending_nets = None
         self._pending_pairs = None
         self._pending_boundary = None
         self._pending_keepout = None
+        self._pending_cap_pairs = None
 
     def discard(self) -> None:
         """Drop the last propose()'d values (caller must also revert
@@ -338,3 +406,4 @@ class IncrementalCostTracker:
         self._pending_pairs = None
         self._pending_boundary = None
         self._pending_keepout = None
+        self._pending_cap_pairs = None

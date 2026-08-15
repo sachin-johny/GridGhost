@@ -186,6 +186,126 @@ def test_rail_adjacent_caps_are_standalone():
     assert len(rail_adj) == 3, f"Expected 3 rail-adjacent, got {len(rail_adj)}"
 
 
+def test_rail_adjacent_to_ic_maps_excess_to_assigned_ic():
+    """rail_adjacent_to_ic pairs each freed cap with its round-robin IC.
+
+    With one IC the pairing is trivial; with two ICs the round-robin
+    assignment alternates, so the excess caps must map back to the IC
+    that actually received them (not just any rail peer).
+    """
+    from assign.assign_caps import rail_adjacent_to_ic
+
+    u1 = _ic("U1", ["+3V3"])
+    u2 = _ic("U2", ["+3V3"])
+    caps = [_cap(f"C{i}", ["+3V3"]) for i in range(6)]
+    pins = [("U1", "1"), ("U2", "1")] + [(c.ref, "1") for c in caps]
+    vcc = Net("+3V3", pins)
+    model = _model_with([u1, u2] + caps, [vcc])
+
+    decap_map, rail_adj, _, _ = classify_caps(model)
+    cap_to_ic = rail_adjacent_to_ic(model)
+
+    # Same cap set, and every freed cap maps to an IC from decap_map.
+    assert set(cap_to_ic.keys()) == set(rail_adj)
+    assert set(cap_to_ic.values()) <= set(decap_map.keys())
+
+    # The freed caps per IC are exactly that IC's assignment tail: the
+    # round-robin gave each IC 3 caps, of which the first 2 are rigid —
+    # so each IC's freed set has exactly 1 cap, and freed + rigid per IC
+    # is the full assignment (3 per IC).
+    from collections import Counter
+    freed_per_ic = Counter(cap_to_ic.values())
+    for ic_ref, rigid in decap_map.items():
+        assert freed_per_ic[ic_ref] == 3 - len(rigid), (
+            f"{ic_ref}: freed={freed_per_ic[ic_ref]}, rigid={len(rigid)}"
+        )
+
+
+def test_seed_rail_adjacent_caps_places_caps_near_assigned_ic():
+    """Phase A½ seeder puts freed caps in a ring around their assigned IC."""
+    from models.macro import Macro
+    from place.initial import seed_rail_adjacent_caps
+
+    u1 = _ic("U1", ["+3V3"])
+    u2 = _ic("U2", ["+3V3"])
+    caps = [_cap(f"C{i}", ["+3V3"]) for i in range(10)]
+    pins = [("U1", "1"), ("U2", "1")] + [(c.ref, "1") for c in caps]
+    vcc = Net("+3V3", pins)
+    model = _model_with([u1, u2] + caps, [vcc])
+
+    # Rigid macro for each IC with its 2 rigid caps; freed caps (10 - 4
+    # = 6) are standalone macros elsewhere on the board (far away).
+    u1.x, u1.y = 20.0, 20.0
+    u2.x, u2.y = 80.0, 80.0
+    m1 = Macro.with_caps(u1, caps[:2])
+    m2 = Macro.with_caps(u2, caps[2:4])
+    standalone = [Macro.alone(c) for c in caps[4:]]
+    for i, m in enumerate(standalone):  # park them far from both ICs
+        m.set_pose(50.0, 50.0 + i * 3.0, 0.0)
+    macros = [m1, m2] + standalone
+    bbox = (5.0, 5.0, 95.0, 95.0)
+
+    n = seed_rail_adjacent_caps(model, macros, bbox)
+    assert n == 6, f"Expected 6 freed caps re-seeded, got {n}"
+
+    ref = {c.ref: c for c in model.components}
+    from assign.assign_caps import rail_adjacent_to_ic
+    for cap, ic in rail_adjacent_to_ic(model).items():
+        d = ((ref[cap].x - ref[ic].x) ** 2 + (ref[cap].y - ref[ic].y) ** 2) ** 0.5
+        # Ring radius is host half-extent (~6mm incl. rigid caps) + gap +
+        # pitch/2 — well under 20mm. Before the fix they sat ≥30mm away.
+        assert d < 20.0, f"{cap} is {d:.1f}mm from assigned IC {ic}"
+
+    # Freed caps stay inside the interior bbox.
+    for m in standalone:
+        bx1, by1, bx2, by2 = m.bbox
+        assert bx1 >= bbox[0] and by1 >= bbox[1] and bx2 <= bbox[2] and by2 <= bbox[3], (
+            f"{m.leader.ref} bbox {[round(v,1) for v in m.bbox]} outside {bbox}"
+        )
+
+
+def test_sa_cap_attraction_holds_shared_rail_caps():
+    """SA with cap_attraction_weight > 0 keeps freed caps near their
+    assigned IC on a SHARED rail — the exact scenario where rail-bbox
+    HPWL is flat (2 ICs at opposite corners span the whole board) and
+    SA otherwise has no gradient signal at all.
+    """
+    from models.macro import Macro
+    from place.sa import run_macro_sa
+    from assign.assign_caps import rail_adjacent_to_ic
+
+    u1 = _ic("U1", ["+3V3"])
+    u2 = _ic("U2", ["+3V3"])
+    caps = [_cap(f"C{i}", ["+3V3"]) for i in range(10)]
+    pins = [("U1", "1"), ("U2", "1")] + [(c.ref, "1") for c in caps]
+    vcc = Net("+3V3", pins)
+    model = _model_with([u1, u2] + caps, [vcc])
+    pairs = rail_adjacent_to_ic(model)
+    assert len(pairs) == 6  # 10 caps - 2 rigid per IC
+
+    # Shared-rail corner ICs: the +3V3 bbox spans the entire board, so
+    # HPWL is flat w.r.t. any freed cap's position inside it.
+    u1.x, u1.y = 20.0, 20.0
+    u2.x, u2.y = 80.0, 80.0
+    macros = [Macro.with_caps(u1, caps[:2]), Macro.with_caps(u2, caps[2:4])]
+    for i, c in enumerate(caps[4:]):  # freed caps start far from both ICs
+        c.x, c.y = 50.0, 50.0 + i * 3.0
+        macros.append(Macro.alone(c))
+    for m in macros:
+        m.apply_offsets()
+
+    run_macro_sa(
+        model, macros, (5.0, 5.0, 95.0, 95.0),
+        iterations=1500, reheats=1, seed=42,
+        cap_attraction_weight=1.0, cap_pairs=pairs,
+    )
+
+    ref = {c.ref: c for c in model.components}
+    for cap, ic in pairs.items():
+        d = ((ref[cap].x - ref[ic].x) ** 2 + (ref[cap].y - ref[ic].y) ** 2) ** 0.5
+        assert d < 20.0, f"{cap} drifted {d:.1f}mm from assigned IC {ic}"
+
+
 def main():
     print("=" * 60)
     print("  Cap-IC assignment tests")
@@ -200,6 +320,9 @@ def main():
     run("deterministic across runs", test_deterministic_across_runs)
     run("max_decaps_per_ic limits rigid followers", test_max_decaps_per_ic_limits_rigid_followers)
     run("rail-adjacent caps are standalone", test_rail_adjacent_caps_are_standalone)
+    run("rail-adjacent→IC mapping", test_rail_adjacent_to_ic_maps_excess_to_assigned_ic)
+    run("seed freed caps near assigned IC", test_seed_rail_adjacent_caps_places_caps_near_assigned_ic)
+    run("SA cap attraction holds shared-rail caps", test_sa_cap_attraction_holds_shared_rail_caps)
     print("=" * 60)
     print(f"  {passed} passed, {failed} failed")
     print("=" * 60)

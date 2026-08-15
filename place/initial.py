@@ -26,6 +26,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from assign.assign_caps import rail_adjacent_to_ic
 from place.cluster import (
     order_macros_by_connectivity,
     collect_attractor_positions,
@@ -273,6 +274,96 @@ def place_interior_phase_a(
     _clamp_macros_to_bounds(macros, interior_bbox)
 
     return clusters
+
+
+def seed_rail_adjacent_caps(
+    model: "BoardModel",
+    macros: list["Macro"],
+    interior_bbox: tuple[float, float, float, float],
+) -> int:
+    """Re-seed rail-adjacent caps in a ring around their assigned IC.
+
+    Phase A shelf-packs clusters, and a freed cap's cluster may land far
+    from its assigned IC — on shared-rail boards the round-robin
+    assignment is load-balanced across the rail's ICs, so the correct
+    home is *near the assigned IC*, not wherever the cluster landed.
+    Without this, freed caps start as a tall shelf column (e.g. test4 at
+    ``max_decaps_per_ic=2``: a 122mm tower of cap blocks), the clamp
+    pass piles them at one edge, and SA never recovers the top of the
+    board because the rail-bbox HPWL gradient confines caps to the
+    rail's current extent.
+
+    Placement rule: each freed cap goes on an expanding ring around its
+    assigned IC's macro bbox — ring radii start just outside the macro
+    (plus the rigid followers' extent) and grow by half a cap pitch per
+    ring; caps walk the 8 compass directions per ring. Overlaps with the
+    host macro itself are impossible (ring radius > macro half-extent);
+    overlaps with neighbors are expected and left to SA + the legalizer,
+    same as any other seeding overlap.
+
+    Only runs for caps whose assigned IC actually has a macro in
+    ``macros`` and is movable. Returns the number of caps re-seeded.
+    """
+    ic_ref_to_macro: dict[str, "Macro"] = {
+        m.leader.ref: m for m in macros if not m.is_fixed
+    }
+    cap_to_ic = rail_adjacent_to_ic(model)
+    if not cap_to_ic:
+        return 0
+
+    x_min, y_min, x_max, y_max = interior_bbox
+    reseeded = 0
+    # Hosts in sorted-ref order for deterministic output.
+    host_refs = sorted(
+        ic for ic in set(cap_to_ic.values()) if ic in ic_ref_to_macro
+    )
+    for ic_ref in host_refs:
+        macro = ic_ref_to_macro[ic_ref]
+        cap_refs = sorted(
+            c for c, ic in cap_to_ic.items() if ic == ic_ref
+        )
+        cap_comps = [model.get_component(r) for r in cap_refs]
+        cap_comps = [c for c in cap_comps if c is not None]
+        bx1, by1, bx2, by2 = macro.bbox
+        cx = (bx1 + bx2) / 2
+        cy = (by1 + by2) / 2
+        half_w = (bx2 - bx1) / 2
+        half_h = (by2 - by1) / 2
+        # Cap bbox half-extents (caps are small, near-square: use the max
+        # dimension so one pitch fits all).
+        cap_hyp = max(
+            (math.hypot(
+                c.bbox[2] - c.bbox[0],
+                c.bbox[3] - c.bbox[1],
+            )) for c in cap_comps
+        ) if cap_comps else 1.0
+        pitch = cap_hyp + 1.0  # 1mm edge gap between ring neighbors
+        # Ring radii: host half-extent + 1 gap + k * (pitch/2). Convert
+        # to an ellipse-safe form by using the max half-extent so the
+        # ring clears the macro bbox on BOTH axes (the bbox of an IC
+        # with fan caps is usually near-square anyway).
+        base = max(half_w, half_h)
+        placed = 0
+        for c in cap_comps:
+            ring = placed // 8
+            slot = placed % 8
+            radius = base + 1.0 + pitch / 2 + ring * (pitch / 2)
+            angle = slot * (math.pi / 4)
+            # Elliptical placement: scale ring offsets so they clear the
+            # host bbox on each axis independently.
+            ox = radius * math.cos(angle) + half_w - base
+            oy = radius * math.sin(angle) + half_h - base
+            tx = cx + ox
+            ty = cy + oy
+            # Clamp into the interior (caps must stay in-bounds; SA and
+            # the legalizer take it from here).
+            bx1c, by1c, bx2c, by2c = c.bbox
+            tx = min(max(tx, x_min + (bx2c - bx1c) / 2), x_max - (bx2c - bx1c) / 2)
+            ty = min(max(ty, y_min + (by2c - by1c) / 2), y_max - (by2c - by1c) / 2)
+            c.set_bbox_center(tx, ty, c.rotation)
+            reseeded += 1
+            placed += 1
+    return reseeded
 
 
 def apply_connectivity_nudges(

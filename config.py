@@ -60,9 +60,16 @@ class AnnealerConfig:
     rudy_grid_resolution: float = 2.0  # RUDY grid cell size in mm
     pin_density_weight: float = 0.2    # Pin-density congestion penalty weight (0 = disabled).
                                        # Complementary to rudy_weight: catches pin-escape
-                                       # congestion (dense pin clusters) that RUDY misses.
+                                       # congestion (dense cap clusters) that RUDY misses.
                                        # Default-on so the placer produces a routable
                                        # result out of the box.
+    cap_attraction_weight: float = 1.0  # Rail-adjacent cap->IC attraction weight (0 = disabled).
+                                       # Deadband-linear drift penalty on freed caps beyond
+                                       # ~5mm from their assigned IC. Root-cause fix for
+                                       # shared-rail cap drift: rail-bbox HPWL is flat w.r.t.
+                                       # a freed cap's position when the rail spans multiple
+                                       # ICs across the board (test4 +3V3: 4 ICs), so SA has
+                                       # no signal keeping the cap near its IC.
     sa_auto_disable_min_components: int = 6   # auto-disable SA on tiny boards
     sa_auto_disable_max_components: int = 50  # auto-disable SA on large boards
     spread_floor_fraction: float = 0.10       # reject moves that collapse spread

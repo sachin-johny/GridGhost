@@ -133,6 +133,8 @@ def run_macro_sa(
     delta: float = 0.0,
     rules: list | None = None,
     exclude_nets: set[str] | None = None,
+    cap_attraction_weight: float = 0.0,
+    cap_pairs: dict[str, str] | None = None,
 ) -> dict[str, float]:
     """Run macro-aware simulated annealing.
 
@@ -183,6 +185,22 @@ def run_macro_sa(
     in ``cost.evaluate()`` and ``IncrementalCostTracker`` but was never
     threaded through from the SA/pipeline callers.
 
+    ``cap_attraction_weight`` (default 0 = disabled): weight for the
+    rail-adjacent cap→IC attraction term. When > 0, ``cap_pairs``
+    (``{cap_ref: ic_ref}`` from ``assign_caps.rail_adjacent_to_ic``)
+    must be provided. The term charges each freed cap's center distance
+    to its assigned IC beyond a deadband (CAP_ATTRACTION_TARGET_GAP_MM)
+    — flat inside the deadband so it never fights the overlap penalty,
+    constant gradient beyond it so SA pulls drifting caps back. Root-
+    cause fix for shared-rail cap drift: on a rail like +3V3 shared by
+    4 ICs spread across the board, rail-bbox HPWL is flat w.r.t. a
+    freed cap's position, so without this term SA has NO signal keeping
+    the cap near its assigned IC (measured on test4: shared-rail caps
+    drifted 8.8mm→32.3mm from seed to post-SA while dedicated-rail
+    caps held 13.2mm→13.4mm). Unlike RUDY/pin-density, this term IS in
+    the incremental tracker — the pairs are fixed at init and a move
+    only changes pairs whose cap or IC member is in a touched macro.
+
     ``bias_overlapping`` (default False — opt-in, doesn't affect the
     main placement pipeline unless explicitly requested): with
     probability ``bias_overlap_prob`` each iteration, pick the macro to
@@ -231,7 +249,9 @@ def run_macro_sa(
                        rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache,
                        pin_density_weight=pin_density_weight,
                        pin_density_penalty=pin_density_penalty_cache,
-                       delta=delta, rules=rules)
+                       delta=delta, rules=rules,
+                       cap_attraction_weight=cap_attraction_weight,
+                       cap_pairs=cap_pairs)
     initial_total = initial["total"]
     best_total = initial_total
     best_snapshot = _snapshot_positions(model)
@@ -262,6 +282,7 @@ def run_macro_sa(
     tracker = IncrementalCostTracker(
         model, macros, alpha=alpha, beta=beta, gamma=gamma, net_weights=net_weights,
         exclude_nets=exclude_nets, delta=delta, rules=rules,
+        cap_attraction_weight=cap_attraction_weight, cap_pairs=cap_pairs,
     )
     # Sanity: the tracker's from-cache total must agree with the
     # from-scratch evaluate() above (excluding the routability terms,
@@ -405,7 +426,9 @@ def run_macro_sa(
                                     rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache,
                                     pin_density_weight=pin_density_weight,
                                     pin_density_penalty=pin_density_penalty_cache,
-                                    delta=delta, rules=rules)
+                                    delta=delta, rules=rules,
+                                    cap_attraction_weight=cap_attraction_weight,
+                                    cap_pairs=cap_pairs)
                 new_total = new_cost["total"]
             # Local var renamed `delta` → `delta_cost` to avoid shadowing
             # the `delta` parameter (constraint weight) when SA is running
@@ -482,7 +505,9 @@ def run_macro_sa(
                      rudy_weight=rudy_weight, rudy_penalty=rudy_penalty_cache,
                      pin_density_weight=pin_density_weight,
                      pin_density_penalty=pin_density_penalty_cache,
-                     delta=delta, rules=rules)
+                     delta=delta, rules=rules,
+                     cap_attraction_weight=cap_attraction_weight,
+                     cap_pairs=cap_pairs)
     if verbose:
         constraint_str = (
             f", constraint={final.get('constraint', 0.0):.2f}"

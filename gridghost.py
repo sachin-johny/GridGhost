@@ -205,6 +205,7 @@ def cmd_place(args) -> None:
             verbose=getattr(args, "verbose", False),
             rudy_weight=getattr(args, "rudy_weight", None),
             pin_density_weight=getattr(args, "pin_density_weight", None),
+            cap_attraction_weight=getattr(args, "cap_attraction_weight", None),
             use_abacus=(getattr(args, "legalizer", "heuristic") == "abacus"),
             use_sa_polish=(getattr(args, "legalizer", "heuristic") == "sa_polish"),
             delta=getattr(args, "delta", 0.0),
@@ -682,6 +683,14 @@ def main():
                               "(dense clusters of signal pins) that RUDY's wire-density model "
                               "misses. Pass 0 to disable. The verbose report always shows "
                               "pin density regardless of this setting.")
+    p_place.add_argument("--cap-attraction-weight", type=float, default=None,
+                         help="Rail-adjacent cap->IC attraction weight in SA cost function "
+                              "(default: from config.json, currently 1.0 = enabled). "
+                              "Deadband-linear penalty charging freed (rail-adjacent) caps "
+                              "for drifting beyond ~5mm from their assigned IC. Root-cause "
+                              "fix for shared-rail cap drift: on a rail like +3V3 spanning "
+                              "multiple ICs, HPWL is flat w.r.t. the cap's position, so SA "
+                              "has no signal keeping the cap near its IC. Pass 0 to disable.")
     # --- macro-v2-only knobs (previously documented in README but never
     # registered as CLI args; place_v2() always accepted them). ---
     p_place.add_argument("--grid-mm", type=float, default=None,

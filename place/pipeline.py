@@ -22,6 +22,7 @@ from place.initial import (
     place_interior_phase_a,
     apply_connectivity_nudges,
     compute_interior_bbox,
+    seed_rail_adjacent_caps,
 )
 from place.legalizer import legalize as legalize_macros, expand_bounds_to_fit
 from place.sa import run_macro_sa
@@ -141,6 +142,8 @@ def place_v2(
     use_sa_polish: bool = False,
     delta: float = 0.0,
     rules: list | None = None,
+    cap_attraction_weight: float | None = None,
+    exclude_nets: set[str] | None = None,
 ) -> dict[str, object]:
     """Run the macro-first placement pipeline.
 
@@ -165,19 +168,28 @@ def place_v2(
     the legacy path applies. Default 0 = current macro-v2 behavior
     (no constraint penalties). See IMPROVEMENTS §2.4.
 
+    Cap attraction (``cap_attraction_weight``, default None → config
+    ``annealer.cap_attraction_weight``): weak cap→IC attraction for
+    rail-adjacent (freed) caps. Root-cause fix for shared-rail cap
+    drift — see ``cost.cost.cap_attraction_penalty``. The cap→IC
+    assignment is derived here from ``rail_adjacent_to_ic`` (deterministic,
+    same classification the macro builder used).
+
     """
     # Resolve routability weights against config when the caller didn't
     # explicitly pass one. The CLI passes ``None`` when the user didn't
     # set the flag, so the config default (0.3 / 0.2 in config.json)
     # wins — fixing the old bug where the CLI default of 0.0 silently
     # disabled RUDY even though config.json said 0.3.
-    if rudy_weight is None or pin_density_weight is None:
+    if rudy_weight is None or pin_density_weight is None or cap_attraction_weight is None:
         from config import load_config
         _cfg = load_config()
         if rudy_weight is None:
             rudy_weight = _cfg.annealer.rudy_weight
         if pin_density_weight is None:
             pin_density_weight = getattr(_cfg.annealer, "pin_density_weight", 0.0)
+        if cap_attraction_weight is None:
+            cap_attraction_weight = getattr(_cfg.annealer, "cap_attraction_weight", 0.0)
 
     # ─── Phase 1: classify → assign → build macros ───────────────────
     interior_macros, connector_macros, fixed_macros = build_macros(model)
@@ -292,6 +304,17 @@ def place_v2(
     clusters = place_interior_phase_a(model, interior_macros, interior_bbox)
     if verbose:
         print(f"  Phase A (space-filling shelf-pack): {len(clusters)} clusters seeded")
+
+    # Phase A½: re-seed rail-adjacent caps around their assigned IC.
+    # After the shelf-pack, freed caps sit wherever their cluster landed —
+    # often a tall cap-only column far from their assigned IC. Pulling
+    # each cap into a ring around its ASSIGNED IC (round-robin-balanced)
+    # spreads the excess across the rail's ICs and removes the pile-up
+    # the clamp pass would otherwise create. See seed_rail_adjacent_caps.
+    n_reseeded = seed_rail_adjacent_caps(model, interior_macros, interior_bbox)
+    if verbose and n_reseeded:
+        print(f"  Phase A½ (cap re-seed): {n_reseeded} rail-adjacent caps "
+              f"seeded around their assigned ICs")
 
     # Phase B: bounded, per-net-weighted connectivity nudge on top of Phase A.
     apply_connectivity_nudges(model, clusters, interior_bbox, verbose=verbose)
@@ -430,6 +453,24 @@ def place_v2(
               f"raw_peak={raw_rudy_peak:.3f} -> scale={rudy_scale:.1f}× "
               f"(effective weight={effective_rudy_weight:.2f}, config={rudy_weight:.2f})")
 
+    # Cap→IC pairs for the attraction term — the same deterministic
+    # rail-adjacent assignment build_macros classified. Only freed caps
+    # whose assigned IC actually HAS a macro participate (fixed/absent
+    # ICs give the term nothing to pull toward).
+    cap_pairs: dict[str, str] = {}
+    if cap_attraction_weight > 0:
+        from assign.assign_caps import rail_adjacent_to_ic
+        ra_map = rail_adjacent_to_ic(model)
+        movable_leader_refs = {
+            m.leader.ref for m in interior_macros if not m.is_fixed
+        }
+        cap_pairs = {
+            cap: ic for cap, ic in ra_map.items() if ic in movable_leader_refs
+        }
+        if verbose:
+            print(f"  Cap attraction: weight={cap_attraction_weight:.2f}, "
+                  f"{len(cap_pairs)} rail-adjacent cap->IC pair(s)")
+
     sa_result = run_macro_sa(
         model, interior_macros + fixed_macros, sa_bounds,
         iterations=sa_iterations, reheats=sa_reheats,
@@ -440,6 +481,9 @@ def place_v2(
         pin_density_weight=pin_density_weight,
         delta=delta,
         rules=rules,
+        cap_attraction_weight=cap_attraction_weight,
+        cap_pairs=cap_pairs if cap_attraction_weight > 0 else None,
+        exclude_nets=exclude_nets,
     )
 
     # ─── Phase 5: legalize all macros together ───────────────────────

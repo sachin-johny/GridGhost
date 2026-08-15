@@ -129,31 +129,21 @@ def _build_power_net_map(model: "BoardModel") -> dict[str, set[str]]:
     return power_nets
 
 
-def classify_caps(
+def _classify_caps_impl(
     model: "BoardModel",
-    max_decaps_per_ic: int = MAX_DECAPS_PER_IC,
-) -> tuple[dict[str, list[str]], list[str], list[str], list[str]]:
-    """Classify caps and assign decoupling caps to ICs.
+    max_decaps_per_ic: int,
+) -> tuple[dict[str, list[str]], dict[str, list[str]], list[str], list[str]]:
+    """Shared classification core. Returns
+    ``(decap_map, rail_adjacent_map, bulk_refs, coupling_refs)``.
 
-    Returns ``(decap_map, rail_adjacent_refs, bulk_refs, coupling_refs)``
-    where:
-
-    - ``decap_map``: ``{ic_ref: [cap_ref, ...]}`` — rigid followers,
-      at most ``max_decaps_per_ic`` caps per IC. These become Macro
-      followers in ``build_macros``.
-    - ``rail_adjacent_refs``: decoupling caps that exceeded the per-IC
-      rigid limit. They become standalone macros (not rigid followers)
-      so SA can move them freely. They share the rail, so HPWL keeps
-      them near the IC cluster without rigidly locking them.
-    - ``bulk_refs``: caps that are bulk rail filters (large value, or on
-      rails with no IC sharing). Standalone macros.
-    - ``coupling_refs``: caps with no power net at all (signal-only).
-      Standalone macros.
+    ``rail_adjacent_map`` groups the rail-adjacent (excess) caps by the
+    IC they were round-robin assigned to — the per-IC pairing the public
+    4-tuple flattens and the Phase-A seeder consumes.
     """
     ics = [c for c in model.components if c.component_type in IC_TYPES]
     caps = [c for c in model.components if c.component_type == "capacitor"]
     if not ics or not caps:
-        return {}, [], [], []
+        return {}, {}, [], []
 
     ref_to_type = {c.ref: c.component_type for c in model.components}
     ic_refs = {c.ref for c in ics}
@@ -213,18 +203,70 @@ def classify_caps(
         full_ic_caps[best_ic].append(cap_ref)
 
     # Split into rigid followers (≤ max_decaps_per_ic per IC) and
-    # rail-adjacent (the rest). Rigid followers go into decap_map for
-    # Macro.with_caps(); rail-adjacent become standalone macros.
+    # rail-adjacent (the rest), KEPT AS A PER-IC MAP so the Phase-A
+    # seeder knows which IC each freed cap was assigned to.
     decap_map: dict[str, list[str]] = {}
-    rail_adjacent_refs: list[str] = []
+    rail_adjacent_map: dict[str, list[str]] = {}
     for ic_ref, all_caps in full_ic_caps.items():
         rigid = all_caps[:max_decaps_per_ic]
         excess = all_caps[max_decaps_per_ic:]
         if rigid:
             decap_map[ic_ref] = rigid
-        rail_adjacent_refs.extend(excess)
+        if excess:
+            rail_adjacent_map[ic_ref] = excess
 
+    return decap_map, rail_adjacent_map, bulk_refs, coupling_refs
+
+
+def classify_caps(
+    model: "BoardModel",
+    max_decaps_per_ic: int = MAX_DECAPS_PER_IC,
+) -> tuple[dict[str, list[str]], list[str], list[str], list[str]]:
+    """Classify caps and assign decoupling caps to ICs.
+
+    Returns ``(decap_map, rail_adjacent_refs, bulk_refs, coupling_refs)``
+    where:
+
+    - ``decap_map``: ``{ic_ref: [cap_ref, ...]}`` — rigid followers,
+      at most ``max_decaps_per_ic`` caps per IC. These become Macro
+      followers in ``build_macros``.
+    - ``rail_adjacent_refs``: decoupling caps that exceeded the per-IC
+      rigid limit. They become standalone macros (not rigid followers)
+      so SA can move them freely. They share the rail, so HPWL keeps
+      them near the IC cluster without rigidly locking them. Use
+      ``rail_adjacent_to_ic()`` to recover which IC each was assigned to.
+    - ``bulk_refs``: caps that are bulk rail filters (large value, or on
+      rails with no IC sharing). Standalone macros.
+    - ``coupling_refs``: caps with no power net at all (signal-only).
+      Standalone macros.
+    """
+    decap_map, rail_adjacent_map, bulk_refs, coupling_refs = _classify_caps_impl(
+        model, max_decaps_per_ic,
+    )
+    rail_adjacent_refs = [
+        c for caps in rail_adjacent_map.values() for c in caps
+    ]
     return decap_map, rail_adjacent_refs, bulk_refs, coupling_refs
+
+
+def rail_adjacent_to_ic(
+    model: "BoardModel",
+    max_decaps_per_ic: int = MAX_DECAPS_PER_IC,
+) -> dict[str, str]:
+    """Map each rail-adjacent cap to the IC it was round-robin assigned to.
+
+    ``classify_caps`` splits each IC's full assignment at
+    ``max_decaps_per_ic``: the head becomes rigid followers, the tail
+    becomes rail-adjacent. This function re-runs the same deterministic
+    classification and returns the tail pairing as ``{cap_ref: ic_ref}``.
+
+    The Phase-A seeder uses this to place freed caps around their
+    ASSIGNED IC (not just any rail peer). The assignment is load-balanced
+    round-robin, so honoring it spreads excess caps across the rail's
+    ICs instead of dumping them all at one.
+    """
+    _, rail_map, _, _ = _classify_caps_impl(model, max_decaps_per_ic)
+    return {cap: ic for ic, caps in rail_map.items() for cap in caps}
 
 
 def assign_caps(model: "BoardModel") -> dict[str, list[str]]:
