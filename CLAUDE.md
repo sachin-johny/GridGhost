@@ -87,7 +87,7 @@ auto_placer/
 ## Core Concepts
 
 ### Cost Function (macro pipeline)
-`Total Cost = α·HPWL + β·Overlap + γ·Boundary + rudy·RUDY + pin_density·PinDensity`
+`Total Cost = α·HPWL + β·Overlap + γ·Boundary + rudy·RUDY + pin_density·PinDensity + cap_attraction·CapAttraction + clearance·Clearance`
 - **HPWL** — Half-perimeter wirelength over all nets. **Power/ground nets are included**
   (key change vs legacy) — caps share rails with their IC, so power-net HPWL is the
   gradient signal keeping caps near their assigned IC during SA.
@@ -101,10 +101,21 @@ auto_placer/
   (dense clusters of small passives next to a QFN) that RUDY's wire-density model misses.
   Default weight `0.2` (from `config.json` `annealer.pin_density_weight`); pass
   `--pin-density-weight 0` to disable.
+- **Cap attraction** — deadband-linear drift penalty (`max(0, dist − 5mm)`) on
+  rail-adjacent freed caps toward their assigned IC. Root-cause fix for shared-rail
+  cap drift (rail-bbox HPWL is flat w.r.t. a freed cap once the rail spans several ICs).
+  Default weight `1.0`; pass `--cap-attraction-weight 0` to disable.
+- **Clearance** — routing halo: pairwise `max(0, 1mm − edge_gap)` charge. Gives SA a
+  "close enough" floor between HPWL's monotone pull and the overlap term's cliff at
+  touching (β is 0 the instant bboxes stop intersecting, so without this term SA parks
+  components at 0.00mm gaps). Intersecting pairs charge exactly the target (β owns
+  depth) and mechanical-feature pairs are exempt. Default weight `5.0`, auto-tapered
+  by interior density (1.0× ≤ 0.45 → 0.25× ≥ 0.65); pass `--clearance-weight 0` to
+  disable.
 
-Both routability signals are **default-on** so the placer produces a routable result
-out of the box. The verbose report (`-v`) always shows initial + final values for both,
-even when their weight is set to 0.
+All routability signals (RUDY, pin density, clearance) are **default-on** so the placer
+produces a routable result out of the box. The verbose report (`-v`) always shows
+initial + final values, even when a term's weight is set to 0.
 
 The legacy path additionally applies a **δ·Constraints** term via `engine/cost_function.py`
 + `engine/constraint_evaluator.py` (decoupling proximity, crystal-MCU, thermal, etc.).
@@ -146,8 +157,10 @@ Key `place` options (defaults come from `config.json`; see README for the full t
 | `--sa-reheat` | `3` | `annealer.reheat_count` |
 | `--alpha/--beta/--gamma` | `1.0 / 25.0 / 8.0` | macro-v2 cost weights |
 | `--seed` | `42` | SA/placement RNG seed (`--seed 0` = non-deterministic) |
-| `--rudy-weight` | `0.3` (from config) | RUDY wire-density congestion penalty in SA cost (0 = off) |
+| `--rudy-weight` | `1.0` (from config) | RUDY wire-density congestion penalty in SA cost (0 = off) |
 | `--pin-density-weight` | `0.2` (from config) | Pin-density congestion penalty in SA cost (0 = off). Complements RUDY. |
+| `--cap-attraction-weight` | `1.0` (from config) | cap→IC drift penalty on rail-adjacent freed caps (0 = off) |
+| `--clearance-weight` | `5.0` (from config) | routing-halo pairwise clearance in SA cost (0 = off); density-tapered |
 | `--legalizer` | `heuristic` | one of `heuristic` / `abacus` / `sa_polish` |
 | `--connector-mating-margin` | `5.0` | edge offset for perimeter connectors |
 | `--macro-v2/--no-macro-v2` | on | toggle pipeline (`--no-macro-v2` = legacy grid) |

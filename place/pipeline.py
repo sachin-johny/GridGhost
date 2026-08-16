@@ -143,6 +143,7 @@ def place_v2(
     delta: float = 0.0,
     rules: list | None = None,
     cap_attraction_weight: float | None = None,
+    clearance_weight: float | None = None,
     exclude_nets: set[str] | None = None,
 ) -> dict[str, object]:
     """Run the macro-first placement pipeline.
@@ -175,13 +176,23 @@ def place_v2(
     assignment is derived here from ``rail_adjacent_to_ic`` (deterministic,
     same classification the macro builder used).
 
+    Clearance (``clearance_weight``, default None → config
+    ``annealer.clearance_weight``): routing-halo term charging
+    ``max(0, target − edge_gap)`` per macro pair — the missing "close
+    enough" floor between HPWL's monotone pull and the overlap term's
+    cliff at touching. Scales down automatically on dense boards (where
+    the target is unachievable) so it degrades to a tie-breaker instead
+    of fighting the legalizer. Pass ``0`` to disable. See
+    ``cost.cost.clearance_deficit``.
+
     """
     # Resolve routability weights against config when the caller didn't
     # explicitly pass one. The CLI passes ``None`` when the user didn't
     # set the flag, so the config default (0.3 / 0.2 in config.json)
     # wins — fixing the old bug where the CLI default of 0.0 silently
     # disabled RUDY even though config.json said 0.3.
-    if rudy_weight is None or pin_density_weight is None or cap_attraction_weight is None:
+    if (rudy_weight is None or pin_density_weight is None
+            or cap_attraction_weight is None or clearance_weight is None):
         from config import load_config
         _cfg = load_config()
         if rudy_weight is None:
@@ -190,6 +201,8 @@ def place_v2(
             pin_density_weight = getattr(_cfg.annealer, "pin_density_weight", 0.0)
         if cap_attraction_weight is None:
             cap_attraction_weight = getattr(_cfg.annealer, "cap_attraction_weight", 0.0)
+        if clearance_weight is None:
+            clearance_weight = getattr(_cfg.annealer, "clearance_weight", 0.0)
 
     # ─── Phase 1: classify → assign → build macros ───────────────────
     interior_macros, connector_macros, fixed_macros = build_macros(model)
@@ -471,6 +484,35 @@ def place_v2(
             print(f"  Cap attraction: weight={cap_attraction_weight:.2f}, "
                   f"{len(cap_pairs)} rail-adjacent cap->IC pair(s)")
 
+    # Clearance (routing halo) density scaling. On sparse boards the 1mm
+    # target between macro bboxes is cheap to satisfy — full weight gives
+    # every pair a trace lane. As density rises the target eventually
+    # becomes unachievable (components simply don't fit with 1mm lanes),
+    # so the term's weight tapers to a weak tie-breaker. Anchors are
+    # conservative because macro bboxes already carry courtyard margins
+    # (0.5-1.5mm per side, utils/courtyard.py): raw fill density
+    # OVERSTATES physical occupancy, and the calibration boards held a
+    # full halo well past 0.45 (cbb: density 0.30, halo achieved with
+    # HPWL actually improving; test4: density 0.51, deficit cleared on
+    # most pairs). Unlike RUDY's scale, this only DECREASES from the
+    # configured weight — a dense board never amplifies the halo term.
+    if clearance_weight > 0:
+        if interior_density <= 0.45:
+            clearance_scale = 1.0
+        elif interior_density >= 0.65:
+            clearance_scale = 0.25
+        else:
+            # Linear taper between the two anchors.
+            clearance_scale = 1.0 - 0.75 * (interior_density - 0.45) / 0.20
+    else:
+        clearance_scale = 0.0
+    effective_clearance_weight = clearance_weight * clearance_scale
+    if verbose and clearance_weight > 0:
+        print(f"  Clearance halo: density={interior_density:.2f} "
+              f"-> scale={clearance_scale:.2f}x "
+              f"(effective weight={effective_clearance_weight:.2f}, "
+              f"config={clearance_weight:.2f})")
+
     sa_result = run_macro_sa(
         model, interior_macros + fixed_macros, sa_bounds,
         iterations=sa_iterations, reheats=sa_reheats,
@@ -483,6 +525,7 @@ def place_v2(
         rules=rules,
         cap_attraction_weight=cap_attraction_weight,
         cap_pairs=cap_pairs if cap_attraction_weight > 0 else None,
+        clearance_weight=effective_clearance_weight,
         exclude_nets=exclude_nets,
     )
 
@@ -630,6 +673,13 @@ def place_v2(
                   f"avg={pd_avg_final:.3f}")
         elif pd_penalty_init > 0:
             print(f"  Pin-density: no hotspots remaining (was {pd_penalty_init:.3f} before SA)")
+        if clearance_weight > 0:
+            # Routing-halo state after legalization (which can shrink the
+            # gaps SA opened — the legalizer only resolves true overlaps).
+            from cost.cost import clearance_deficit as _clr_deficit
+            clr_final = _clr_deficit(all_macros)
+            print(f"  Clearance: residual deficit={clr_final:.2f}mm "
+                  f"(halo target 1.0mm edge-to-edge)")
 
     return {
         "sa_result": sa_result,

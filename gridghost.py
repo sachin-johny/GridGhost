@@ -206,6 +206,7 @@ def cmd_place(args) -> None:
             rudy_weight=getattr(args, "rudy_weight", None),
             pin_density_weight=getattr(args, "pin_density_weight", None),
             cap_attraction_weight=getattr(args, "cap_attraction_weight", None),
+            clearance_weight=getattr(args, "clearance_weight", None),
             use_abacus=(getattr(args, "legalizer", "heuristic") == "abacus"),
             use_sa_polish=(getattr(args, "legalizer", "heuristic") == "sa_polish"),
             delta=getattr(args, "delta", 0.0),
@@ -691,6 +692,14 @@ def main():
                               "fix for shared-rail cap drift: on a rail like +3V3 spanning "
                               "multiple ICs, HPWL is flat w.r.t. the cap's position, so SA "
                               "has no signal keeping the cap near its IC. Pass 0 to disable.")
+    p_place.add_argument("--clearance-weight", type=float, default=None,
+                         help="Routing-halo clearance weight in SA cost function "
+                              "(default: from config.json, currently 5.0 = enabled). "
+                              "Charges max(0, 1mm - edge gap) per macro pair so SA keeps a "
+                              "trace lane between non-overlapping components instead of "
+                              "parking them at a 0.00mm gap (the overlap penalty is 0 the "
+                              "instant bboxes stop intersecting). Auto-tapers on dense "
+                              "boards. Pass 0 to disable.")
     # --- macro-v2-only knobs (previously documented in README but never
     # registered as CLI args; place_v2() always accepted them). ---
     p_place.add_argument("--grid-mm", type=float, default=None,

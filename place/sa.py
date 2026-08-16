@@ -135,6 +135,8 @@ def run_macro_sa(
     exclude_nets: set[str] | None = None,
     cap_attraction_weight: float = 0.0,
     cap_pairs: dict[str, str] | None = None,
+    clearance_weight: float = 0.0,
+    clearance_target_mm: float = 1.0,
 ) -> dict[str, float]:
     """Run macro-aware simulated annealing.
 
@@ -201,6 +203,16 @@ def run_macro_sa(
     the incremental tracker — the pairs are fixed at init and a move
     only changes pairs whose cap or IC member is in a touched macro.
 
+    ``clearance_weight`` (default 0 = disabled): weight for the pairwise
+    clearance (routing-halo) deficit. β·overlap is discontinuous at
+    touching — a 0.01mm gap and a 1.5mm gap both cost zero — so without
+    this term SA parks pairs at just-barely-not-overlapping with no
+    trace lane between them (measured on test4: min pair gap 0.00mm,
+    ~3% of pairs under 1mm). The term charges max(0, target − gap) per
+    pair: linear ramp below ``clearance_target_mm``, flat beyond it.
+    Also in the incremental tracker — it shares the overlap loop's
+    touched-pair iteration, so it adds no extra O(macros) pass per move.
+
     ``bias_overlapping`` (default False — opt-in, doesn't affect the
     main placement pipeline unless explicitly requested): with
     probability ``bias_overlap_prob`` each iteration, pick the macro to
@@ -251,7 +263,9 @@ def run_macro_sa(
                        pin_density_penalty=pin_density_penalty_cache,
                        delta=delta, rules=rules,
                        cap_attraction_weight=cap_attraction_weight,
-                       cap_pairs=cap_pairs)
+                       cap_pairs=cap_pairs,
+                       clearance_weight=clearance_weight,
+                       clearance_target_mm=clearance_target_mm)
     initial_total = initial["total"]
     best_total = initial_total
     best_snapshot = _snapshot_positions(model)
@@ -283,6 +297,7 @@ def run_macro_sa(
         model, macros, alpha=alpha, beta=beta, gamma=gamma, net_weights=net_weights,
         exclude_nets=exclude_nets, delta=delta, rules=rules,
         cap_attraction_weight=cap_attraction_weight, cap_pairs=cap_pairs,
+        clearance_weight=clearance_weight, clearance_target_mm=clearance_target_mm,
     )
     # Sanity: the tracker's from-cache total must agree with the
     # from-scratch evaluate() above (excluding the routability terms,
@@ -428,7 +443,9 @@ def run_macro_sa(
                                     pin_density_penalty=pin_density_penalty_cache,
                                     delta=delta, rules=rules,
                                     cap_attraction_weight=cap_attraction_weight,
-                                    cap_pairs=cap_pairs)
+                                    cap_pairs=cap_pairs,
+                                    clearance_weight=clearance_weight,
+                                    clearance_target_mm=clearance_target_mm)
                 new_total = new_cost["total"]
             # Local var renamed `delta` → `delta_cost` to avoid shadowing
             # the `delta` parameter (constraint weight) when SA is running
@@ -507,7 +524,9 @@ def run_macro_sa(
                      pin_density_penalty=pin_density_penalty_cache,
                      delta=delta, rules=rules,
                      cap_attraction_weight=cap_attraction_weight,
-                     cap_pairs=cap_pairs)
+                     cap_pairs=cap_pairs,
+                     clearance_weight=clearance_weight,
+                     clearance_target_mm=clearance_target_mm)
     if verbose:
         constraint_str = (
             f", constraint={final.get('constraint', 0.0):.2f}"

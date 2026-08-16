@@ -195,6 +195,46 @@ def test_incremental_cap_attraction_matches_full_recompute():
             tracker.discard()
 
 
+def test_incremental_clearance_matches_full_recompute():
+    """Clearance (routing halo) must be tracked incrementally with exact
+    agreement to a from-scratch evaluate() — for all move types and
+    regardless of commit/discard. Moves cross the charged band from both
+    sides: pairs drift apart through the 1mm halo and get pushed back
+    into intersection (where the charge clamps at the target).
+    """
+    model = _make_board(n_ics=6)
+    macros = _build_macros(model)
+
+    bounds = (0.0, 0.0, 80.0, 80.0)
+    tracker = IncrementalCostTracker(
+        model, macros, alpha=1.0, beta=25.0, gamma=8.0,
+        clearance_weight=5.0, clearance_target_mm=1.0,
+    )
+    rng = random.Random(23)
+    for _ in range(200):
+        idx = rng.randrange(len(macros))
+        m = macros[idx]
+        snap = m._snapshot()
+        if rng.random() < 0.5:
+            ok = m.translate(rng.uniform(-3, 3), rng.uniform(-3, 3), bounds=bounds)
+        else:
+            new_rot = (m.leader.rotation + rng.choice([90, 180, 270])) % 360
+            ok = m.set_pose(m.leader.x + rng.uniform(-2, 2),
+                            m.leader.y + rng.uniform(-2, 2), new_rot, bounds=bounds)
+        if not ok:
+            continue
+        proposed = tracker.propose([idx])
+        full = evaluate(model, macros, alpha=1.0, beta=25.0, gamma=8.0,
+                        clearance_weight=5.0, clearance_target_mm=1.0)
+        assert abs(proposed["total"] - full["total"]) < 1e-6
+        assert abs(proposed["clearance"] - full["clearance"]) < 1e-6
+        if rng.random() < 0.5:
+            tracker.commit()
+        else:
+            m._restore(snap)
+            tracker.discard()
+
+
 def test_bias_overlapping_does_not_crash_and_reduces_overlap():
     """bias_overlapping is opt-in and touches the shared run_macro_sa
     move-selection code path — verify it runs cleanly and actually
@@ -291,3 +331,41 @@ def test_sa_exclude_nets_reduces_cost():
     final_eval = evaluate(model, macros, alpha=1.0, beta=25.0, gamma=8.0,
                           exclude_nets=exclude)
     assert abs(result["final_hpwl"] - final_eval["hpwl"]) < 1e-3
+
+
+def test_sa_clearance_reduces_tight_gaps():
+    """End-to-end: run_macro_sa with the clearance term should produce
+    fewer touching pairs (<0.5mm edge gap between macro bboxes) than
+    the same SA run with the term off — same seed, same board.
+    """
+    from place.sa import run_macro_sa
+    from cost.cost import clearance_pair_charge
+
+    def tight_pairs(macros, threshold=0.5):
+        n = 0
+        for i in range(len(macros)):
+            for j in range(i + 1, len(macros)):
+                if clearance_pair_charge(macros[i].bbox, macros[j].bbox,
+                                         target_mm=threshold) > 0:
+                    n += 1
+        return n
+
+    off_tight = on_tight = None
+    for enabled in (False, True):
+        model = _make_board(n_ics=10, seed=5)
+        macros = _build_macros(model)
+        bounds = (0.0, 0.0, 80.0, 80.0)
+        result = run_macro_sa(
+            model, macros, bounds, iterations=600, reheats=0,
+            alpha=1.0, beta=25.0, gamma=8.0,
+            seed=42, verbose=False,
+            clearance_weight=8.0 if enabled else 0.0,
+        )
+        assert result["final_hpwl"] >= 0.0
+        if enabled:
+            on_tight = tight_pairs(macros)
+        else:
+            off_tight = tight_pairs(macros)
+
+    assert on_tight < off_tight, (
+        f"clearance term did not reduce tight pairs: {on_tight} vs {off_tight}")

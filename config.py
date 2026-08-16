@@ -70,6 +70,19 @@ class AnnealerConfig:
                                        # a freed cap's position when the rail spans multiple
                                        # ICs across the board (test4 +3V3: 4 ICs), so SA has
                                        # no signal keeping the cap near its IC.
+    clearance_weight: float = 5.0      # Routing-halo clearance weight (0 = disabled).
+                                       # Charges max(0, target - edge_gap) per macro pair so
+                                       # SA keeps a trace lane between non-overlapping
+                                       # components instead of parking them at 0.00mm gaps
+                                       # (overlap penalty is 0 the instant bboxes stop
+                                       # intersecting — HPWL then pulls them back together).
+                                       # Auto-tapers with interior density (place/pipeline).
+                                       # 5.0 — calibrated on test4/cbb/th_sensor: at 5.0
+                                       # cbb achieves the full 1mm halo with HPWL improving
+                                       # (-5% vs clearance-off), th_sensor/test4 clear most
+                                       # tight pairs; 1.0 was too weak to compete with HPWL
+                                       # (dose-response: <0.5mm pairs 111->77->35 at w=1/3/10
+                                       # on test4, saturating ~10).
     sa_auto_disable_min_components: int = 6   # auto-disable SA on tiny boards
     sa_auto_disable_max_components: int = 50  # auto-disable SA on large boards
     spread_floor_fraction: float = 0.10       # reject moves that collapse spread

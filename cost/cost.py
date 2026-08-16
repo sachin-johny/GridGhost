@@ -27,6 +27,73 @@ if TYPE_CHECKING:
 # macros apart) — it only charges drift BEYOND the target.
 CAP_ATTRACTION_TARGET_GAP_MM = 5.0
 
+# Default minimum edge-to-edge clearance between macro bboxes (the routing
+# halo). Component bboxes already include type-aware courtyard margins
+# (0.5-1.5mm, utils/courtyard.py), so this is clearance ON TOP of courtyard
+# separation — roughly one trace lane + clearance class between neighbors.
+# Set to 0.0 to disable the clearance term entirely.
+CLEARANCE_TARGET_MM = 1.0
+
+
+def clearance_pair_charge(
+    a_bbox: tuple[float, float, float, float],
+    b_bbox: tuple[float, float, float, float],
+    target_mm: float = CLEARANCE_TARGET_MM,
+) -> float:
+    """Linear clearance deficit between two bboxes.
+
+    Returns ``max(0, target_mm − edge_gap)`` where ``edge_gap`` is the
+    axis-aligned separation between the two boxes (negative when they
+    intersect — clamped so the deficit equals ``target_mm`` at touching
+    and never exceeds it: pairs that actually overlap are the overlap
+    term's (β) job, not this term's; double-charging both would change
+    the effective β mid-run).
+
+    This is the pairwise primitive for ``clearance_deficit`` — see the
+    discussion there for why this is a separate term rather than bbox
+    inflation (``Macro.bbox`` feeds bounds checks, legalizer slot math,
+    and density calculations; inflating it would corrupt all three).
+    """
+    ax1, ay1, ax2, ay2 = a_bbox
+    bx1, by1, bx2, by2 = b_bbox
+    dx = max(ax1 - bx2, bx1 - ax2)  # x separation (negative = overlap)
+    dy = max(ay1 - by2, by1 - ay2)
+    if dx < 0 and dy < 0:
+        return target_mm  # bboxes intersect — full deficit, β handles depth
+    return max(0.0, target_mm - max(dx, dy))
+
+
+def clearance_deficit(
+    macros: list["Macro"],
+    target_mm: float = CLEARANCE_TARGET_MM,
+) -> float:
+    """Sum of pairwise clearance deficits (routing halo) across macros.
+
+    ``β·overlap`` alone is discontinuous at touching: a 0.01mm gap and a
+    1.5mm gap cost exactly the same (zero), so SA's gradient drives every
+    pair to just-barely-not-overlapping and parks it there — the measured
+    result on test4 was a 0.00-0.01mm minimum pair gap with ~3% of pairs
+    under 1mm, i.e. no room to route between neighbors. This term adds
+    the missing gradient: charge ``max(0, target − gap)`` per pair —
+    linear ramp below the target, flat (zero) beyond it, so there is no
+    incentive to spread further than one routing lane.
+
+    Uses the same mechanical-feature exemption as the overlap terms via
+    ``_is_overlap_exempt`` (mounting-hole pad stacks shouldn't be pushed
+    apart — they're fixed and their bboxes legitimately interleave).
+    """
+    from models.macro import _is_overlap_exempt
+
+    total = 0.0
+    n = len(macros)
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = macros[i], macros[j]
+            if _is_overlap_exempt(a, b):
+                continue
+            total += clearance_pair_charge(a.bbox, b.bbox, target_mm)
+    return total
+
 
 def hpwl_net(net: "Net", ref_map: dict[str, "object"], weight: float = 1.0) -> float:
     """Standard half-perimeter wirelength for one net.
@@ -239,6 +306,8 @@ def evaluate(
     constraint_penalty: float | None = None,
     cap_attraction_weight: float = 0.0,
     cap_pairs: dict[str, str] | None = None,
+    clearance_weight: float = 0.0,
+    clearance_target_mm: float = CLEARANCE_TARGET_MM,
 ) -> dict[str, float]:
     """Total placement cost.
 
@@ -316,9 +385,21 @@ def evaluate(
         cap_pairs: ``{cap_ref: ic_ref}`` assignment for rail-adjacent
             caps (from ``assign_caps.rail_adjacent_to_ic``). Required
             when ``cap_attraction_weight > 0``; ignored otherwise.
+        clearance_weight: Weight for the pairwise clearance (routing
+            halo) deficit. When > 0, adds ``clearance_weight ·
+            clearance_deficit`` — a linear charge on macro pairs closer
+            than ``clearance_target_mm`` edge-to-edge. Gives SA the
+            gradient β·overlap lacks (overlap cost is 0 the instant
+            bboxes stop intersecting, so pairs park at just-barely-
+            touching with no trace lane between them). Pairs that
+            actually overlap contribute a fixed deficit (the overlap
+            term charges their depth) so the two terms never fight.
+        clearance_target_mm: Target edge-to-edge gap between macro
+            bboxes. Bboxes include courtyard margins, so this is a true
+            routing lane on top of courtyard separation.
 
     Returns dict with hpwl, overlap, boundary, keepout, rudy, pin_density,
-    constraint, cap_attraction, and total components.
+    constraint, cap_attraction, clearance, and total components.
     """
     h = total_hpwl(model, include_power=include_power, exclude_nets=exclude_nets,
                     net_weights=net_weights)
@@ -364,6 +445,9 @@ def evaluate(
     a = 0.0
     if cap_attraction_weight > 0 and cap_pairs:
         a = cap_attraction_penalty(model, cap_pairs)
+    clr = 0.0
+    if clearance_weight > 0:
+        clr = clearance_deficit(macros, clearance_target_mm)
     return {
         "hpwl": h,
         "overlap": o,
@@ -373,9 +457,11 @@ def evaluate(
         "pin_density": p,
         "constraint": c,
         "cap_attraction": a,
+        "clearance": clr,
         "total": (alpha * h + beta * o + gamma * b + kw * k
                   + rudy_weight * r
                   + pin_density_weight * p
                   + delta * c
-                  + cap_attraction_weight * a),
+                  + cap_attraction_weight * a
+                  + clearance_weight * clr),
     }

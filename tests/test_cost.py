@@ -17,6 +17,8 @@ from cost.cost import (
     total_boundary,
     evaluate,
     cap_attraction_penalty,
+    clearance_pair_charge,
+    clearance_deficit,
 )
 
 passed = 0
@@ -245,6 +247,71 @@ def test_evaluate_cap_attraction_weighted():
     assert evaluate(model, [mi, mc], cap_pairs={"C1": "U1"})["total"] == base["total"]
 
 
+def test_clearance_pair_charge_gaps():
+    a = (0.0, 0.0, 10.0, 10.0)
+    # 0.5mm gap in x, aligned in y -> deficit 0.5 (target 1.0).
+    assert clearance_pair_charge(a, (10.5, 0.0, 20.0, 10.0)) == 0.5
+    # Full target gap -> zero charge.
+    assert clearance_pair_charge(a, (11.0, 0.0, 20.0, 10.0)) == 0.0
+    # Far apart -> zero charge.
+    assert clearance_pair_charge(a, (50.0, 50.0, 60.0, 60.0)) == 0.0
+    # Touching-but-not-intersecting (gap 0, diagonal) -> full target.
+    assert clearance_pair_charge(a, (10.0, 10.0, 20.0, 20.0)) == 1.0
+
+
+def test_clearance_pair_charge_intersect_caps_at_target():
+    a = (0.0, 0.0, 10.0, 10.0)
+    # Bboxes intersect -> charge is exactly the target (never deeper):
+    # β·overlap owns depth-charging, so the halo term must not
+    # double-charge once bboxes actually intersect.
+    assert clearance_pair_charge(a, (5.0, 5.0, 15.0, 15.0)) == 1.0
+    # A deep 90% intersection charges the same 1.0, not more.
+    assert clearance_pair_charge(a, (9.0, 9.0, 19.0, 19.0)) == 1.0
+
+
+def test_clearance_deficit_sums_and_respects_target():
+    a = Macro.alone(_comp("R1", 50, 50, w=4, h=4))          # bbox 48..52
+    b = Macro.alone(_comp("R2", 55, 50, w=4, h=4))          # bbox 53..57
+    c = Macro.alone(_comp("R3", 90, 90, w=4, h=4))
+    # R1-R2 gap = 1.0mm (53-52) -> satisfied at target 1.0, zero charge.
+    assert clearance_deficit([a, b, c]) == 0.0
+    # R2 slides to gap 0.6 -> deficit 0.4.
+    b.leader.x = 54.6
+    assert abs(clearance_deficit([a, b, c]) - 0.4) < 1e-9
+    # Custom target widens the charged band.
+    assert abs(clearance_deficit([a, b, c], target_mm=2.0) - 1.4) < 1e-9
+
+
+def test_clearance_deficit_skips_mechanical_pairs():
+    # Mounting-hole macros with overlapping pad-stack bboxes are exempt
+    # (same exemption as the overlap term — fixed mechanical features).
+    m1 = Macro.alone(_comp("H1", 50, 50, w=8, h=8, ctype="mounting_hole"))
+    m2 = Macro.alone(_comp("H2", 54, 54, w=8, h=8, ctype="mounting_hole"))
+    # Bboxes intersect (46..54 vs 50..58) — exempt pair charges 0.
+    assert clearance_deficit([m1, m2]) == 0.0
+    # An electrical pair in the same geometry would charge the full target.
+    e1 = Macro.alone(_comp("R1", 50, 50, w=8, h=8))
+    e2 = Macro.alone(_comp("R2", 54, 54, w=8, h=8))
+    assert clearance_deficit([e1, e2]) == 1.0
+
+
+def test_evaluate_clearance_weighted():
+    a = _comp("R1", 50, 50, w=4, h=4)   # bbox 48..52
+    b = _comp("R2", 54.6, 50, w=4, h=4)  # bbox 52.6..56.6 -> gap 0.6 -> deficit 0.4
+    model = BoardModel(
+        board=BoardOutline(0, 0, 100, 100),
+        components=[a, b],
+        nets=[],
+    )
+    ma, mb = Macro.alone(a), Macro.alone(b)
+    base = evaluate(model, [ma, mb])
+    with_clr = evaluate(model, [ma, mb], clearance_weight=5.0)
+    assert abs(with_clr["clearance"] - 0.4) < 1e-9
+    assert abs(with_clr["total"] - (base["total"] + 5.0 * 0.4)) < 1e-6
+    # Weight 0 (default) -> term absent from the total.
+    assert evaluate(model, [ma, mb])["total"] == base["total"]
+
+
 def main():
     print("=" * 60)
     print("  Cost function tests")
@@ -264,6 +331,11 @@ def main():
     run("cap attraction: deadband", test_cap_attraction_penalty_deadband)
     run("cap attraction: sums pairs", test_cap_attraction_penalty_sums_pairs)
     run("cap attraction: weighted in evaluate", test_evaluate_cap_attraction_weighted)
+    run("clearance pair charge: gap cases", test_clearance_pair_charge_gaps)
+    run("clearance pair charge: intersect caps at target", test_clearance_pair_charge_intersect_caps_at_target)
+    run("clearance deficit: sums and respects target", test_clearance_deficit_sums_and_respects_target)
+    run("clearance deficit: skips mechanical pairs", test_clearance_deficit_skips_mechanical_pairs)
+    run("clearance: weighted in evaluate", test_evaluate_clearance_weighted)
     print("=" * 60)
     print(f"  {passed} passed, {failed} failed")
     print("=" * 60)

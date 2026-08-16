@@ -46,7 +46,7 @@ import math
 from typing import TYPE_CHECKING
 
 from cost.cost import hpwl_net, macro_overlap_area, cap_attraction_penalty, \
-    CAP_ATTRACTION_TARGET_GAP_MM
+    CAP_ATTRACTION_TARGET_GAP_MM, clearance_pair_charge
 
 if TYPE_CHECKING:
     from models.board_model import BoardModel, Component, Net
@@ -69,6 +69,8 @@ class IncrementalCostTracker:
         rules: list | None = None,
         cap_attraction_weight: float = 0.0,
         cap_pairs: dict[str, str] | None = None,
+        clearance_weight: float = 0.0,
+        clearance_target_mm: float = 1.0,
     ) -> None:
         self.model = model
         self.macros = macros
@@ -97,6 +99,15 @@ class IncrementalCostTracker:
         self._cap_attraction_total = 0.0
         self._cap_pair_keys_by_ref: dict[str, list[str]] = {}
         self._cap_pair_charge: dict[str, float] = {}
+        # Clearance (routing halo) deficit — cached per macro pair, right
+        # next to the overlap cache it shares a loop with. The per-pair
+        # charge is max(0, target − edge_gap), clamped at touching; see
+        # cost.clearance_pair_charge. Only tracked when enabled (weight>0):
+        # otherwise the per-pair dict stays empty and propose/commit skip
+        # it, keeping the disabled path byte-for-byte identical to before.
+        self.clearance_weight = clearance_weight
+        self.clearance_target_mm = clearance_target_mm
+        self._clearance_total = 0.0
         if delta > 0 and rules:
             try:
                 from engine.constraint_evaluator import evaluate_constraint_penalties
@@ -143,15 +154,24 @@ class IncrementalCostTracker:
         self._hpwl_total = sum(self._net_hpwl.values())
 
         self._pair_overlap: dict[tuple[int, int], float] = {}
+        self._pair_clearance: dict[tuple[int, int], float] = {}
         n = len(macros)
         overlap_total = 0.0
+        clearance_total = 0.0
         for i in range(n):
             for j in range(i + 1, n):
                 a = macro_overlap_area(macros[i], macros[j])
                 if a:
                     self._pair_overlap[(i, j)] = a
                 overlap_total += a
+                if clearance_weight > 0:
+                    c = clearance_pair_charge(
+                        macros[i].bbox, macros[j].bbox, clearance_target_mm)
+                    if c:
+                        self._pair_clearance[(i, j)] = c
+                    clearance_total += c
         self._overlap_total = overlap_total
+        self._clearance_total = clearance_total
 
         self._boundary_by_ref: dict[str, float] = {
             c.ref: self._component_boundary(c) for c in model.components
@@ -172,6 +192,7 @@ class IncrementalCostTracker:
         self._pending_boundary: dict[str, float] | None = None
         self._pending_keepout: dict[str, float] | None = None
         self._pending_cap_pairs: dict[str, float] | None = None
+        self._pending_clearance: dict[tuple[int, int], float] | None = None
 
     def _component_boundary(self, c: "Component") -> float:
         if getattr(c, "is_edge_connector", False):
@@ -219,11 +240,13 @@ class IncrementalCostTracker:
         return self._compose(self._hpwl_total, self._overlap_total,
                               self._boundary_total, self._keepout_total,
                               self._constraint_total,
-                              self._cap_attraction_total)
+                              self._cap_attraction_total,
+                              self._clearance_total)
 
     def _compose(self, hpwl: float, overlap: float, boundary: float,
                   keepout: float = 0.0, constraint: float = 0.0,
-                  cap_attraction: float = 0.0) -> dict[str, float]:
+                  cap_attraction: float = 0.0,
+                  clearance: float = 0.0) -> dict[str, float]:
         return {
             "hpwl": hpwl,
             "overlap": overlap,
@@ -231,10 +254,12 @@ class IncrementalCostTracker:
             "keepout": keepout,
             "constraint": constraint,
             "cap_attraction": cap_attraction,
+            "clearance": clearance,
             "total": (self.alpha * hpwl + self.beta * overlap
                        + self.gamma * boundary + self.keepout_weight * keepout
                        + self.delta * constraint
-                       + self.cap_attraction_weight * cap_attraction),
+                       + self.cap_attraction_weight * cap_attraction
+                       + self.clearance_weight * clearance),
         }
 
     def refresh_constraint_penalty(self) -> float:
@@ -278,7 +303,10 @@ class IncrementalCostTracker:
                     hpwl_delta += new_v - self._net_hpwl[net.name]
 
         pending_pairs: dict[tuple[int, int], float] = {}
+        pending_clearance: dict[tuple[int, int], float] = {}
         overlap_delta = 0.0
+        clearance_delta = 0.0
+        track_clearance = self.clearance_weight > 0
         n = len(self.macros)
         for idx in touched:
             for j in range(n):
@@ -291,6 +319,16 @@ class IncrementalCostTracker:
                 old_a = self._pair_overlap.get((i, k), 0.0)
                 pending_pairs[(i, k)] = new_a
                 overlap_delta += new_a - old_a
+                # Clearance rides the same loop — the touched-pair set is
+                # identical (a move can only change the overlap OR the
+                # gap of pairs involving a touched macro).
+                if track_clearance:
+                    new_c = clearance_pair_charge(
+                        self.macros[i].bbox, self.macros[k].bbox,
+                        self.clearance_target_mm)
+                    old_c = self._pair_clearance.get((i, k), 0.0)
+                    pending_clearance[(i, k)] = new_c
+                    clearance_delta += new_c - old_c
 
         pending_boundary: dict[str, float] = {}
         boundary_delta = 0.0
@@ -346,6 +384,7 @@ class IncrementalCostTracker:
         self._pending_boundary = pending_boundary
         self._pending_keepout = pending_keepout
         self._pending_cap_pairs = pending_cap_pairs
+        self._pending_clearance = pending_clearance if track_clearance else None
 
         # Include the cached constraint term so propose() is symmetric with
         # total() — both carry delta·constraint. The constraint penalty is
@@ -366,6 +405,7 @@ class IncrementalCostTracker:
             self._keepout_total + keepout_delta,
             self._constraint_total,
             self._cap_attraction_total + cap_attraction_delta,
+            self._clearance_total + clearance_delta,
         )
 
     def commit(self) -> None:
@@ -393,11 +433,20 @@ class IncrementalCostTracker:
             for pair_key, v in self._pending_cap_pairs.items():
                 self._cap_attraction_total += v - self._cap_pair_charge[pair_key]
                 self._cap_pair_charge[pair_key] = v
+        if self._pending_clearance:
+            for pair, v in self._pending_clearance.items():
+                old = self._pair_clearance.get(pair, 0.0)
+                self._clearance_total += v - old
+                if v:
+                    self._pair_clearance[pair] = v
+                else:
+                    self._pair_clearance.pop(pair, None)
         self._pending_nets = None
         self._pending_pairs = None
         self._pending_boundary = None
         self._pending_keepout = None
         self._pending_cap_pairs = None
+        self._pending_clearance = None
 
     def discard(self) -> None:
         """Drop the last propose()'d values (caller must also revert
@@ -407,3 +456,4 @@ class IncrementalCostTracker:
         self._pending_boundary = None
         self._pending_keepout = None
         self._pending_cap_pairs = None
+        self._pending_clearance = None
