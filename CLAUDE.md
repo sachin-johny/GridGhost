@@ -9,7 +9,7 @@ once, optimized completely outside the editor, then written back.
 
 ## Project Status (Current)
 
-**Last Updated:** 2026-08-04
+**Last Updated:** 2026-08-18
 
 - Full pipeline end-to-end: extract → cap classification/assignment → build macros →
   connector perimeter → net-aware initial placement → macro SA → iterative legalization → save.
@@ -19,21 +19,30 @@ once, optimized completely outside the editor, then written back.
     (`--macro-v2` is on by default).
   - **Legacy grid pipeline** (`engine/smart_placement.py` + `engine/annealer.py`) —
     retained behind `--no-macro-v2` for A/B comparison. Still functional.
-- **152 tests across 11 files** (`python -m pytest tests/`). `test_phase1.py` (81 tests)
-  covers the legacy engine + data model; the rest cover the macro pipeline. `test_overlap_regression.py`
-  is currently disabled (0 collected).
+- **227 tests across 14 files** (`python -m pytest tests/`). `test_phase1.py` (87 tests)
+  covers the legacy engine + data model; the rest cover the macro pipeline, including
+  `test_nonrect_outline.py` (26 — polygon outlines), `test_keepout.py` (13 — internal
+  keepout zones), and `test_pad_rotation.py` (7 — footprint-only rotation rewrite).
+  `test_overlap_regression.py` is currently disabled (0 collected).
+- Non-rectangular board outlines (notches, mouse-bites, interior holes) and rectangular
+  internal keepout zones are now wired into the **default** macro-v2 path end-to-end
+  (cost gradient, initial placement, legalizer clamps) — previously data-model/parser-only.
 - Bundled boards run clean: `th_sensor.kicad_pcb` (0 overlaps, 0 OOB); larger `cbb.kicad_pcb`
   completes the pipeline.
 
 ### Next Improvements
 - Tune SA budget/cooling per board size (iterations already scale as `max(1500, 25×N)`).
-- Polygon board outline + keepout zone support (currently rectangular outlines only).
+- Expose a `--keepout-weight` CLI flag (currently hardcoded to default to `γ`, not independently tunable).
 - Improve dense-board legalization (residual overlaps on very dense boards).
+- `--delta` (constraint-rule penalty) is wired but off by default (`0.0`) — evaluate turning it
+  on by default now that propose()/total() symmetry is fixed (see IMPROVEMENTS §2.4 in commit history).
 
 ### Known Issues
 - Dense boards still benefit from SA/legalizer tuning (pipeline runs, placement not always optimal).
 - Legalization can regress wirelength slightly to reach a legal (overlap-free) placement.
 - Abacus legalizer (`--legalizer abacus`) is worse than the default heuristic on every bundled board — kept for comparison only (see `place/abacus_bridge.py` docstring).
+- `RAIL_PAD_SPREAD_THRESHOLD_MM = 3.0` mm (rigid-vs-rail-adjacent decap split) is calibrated
+  against one board family (`test4`/U30) — watch for mis-splits on unseen BGA pinouts.
 
 ---
 
@@ -60,7 +69,8 @@ fully outside, apply back.
 auto_placer/
 ├── gridghost.py            # CLI entry point (place / extract / profiles)
 ├── config.py / config.json # Typed config + defaults
-├── models/                 # board_model.py (BoardModel, Component, Net, Pad, BoardOutline),
+├── models/                 # board_model.py (BoardModel, Component, Net, Pad, BoardOutline —
+│                           #   rectangle or polygon-with-holes; BoardModel.keepouts),
 │                           #   macro.py (Macro: leader + rigid followers)
 ├── parsers/                # kicad_parser.py, placement_writer.py
 ├── assign/assign_caps.py   # Cap classification (decoupling/bulk/coupling) + IC assignment
@@ -77,7 +87,8 @@ auto_placer/
 ├── profiles/board_profiles.py  # Cost weights + constraint rules per board type
 ├── utils/                  # courtyard.py, density.py, display.py
 ├── samples/sample_board.py # 18-component MCU peripheral sample board
-└── tests/                  # test_*.py + run_all/dashboard/visualizer harness + test_pcbs/
+└── tests/                  # test_*.py + run_all/dashboard/visualizer/run_benchmark harness +
+                            #   test_pcbs/ + external_boards/rl_pcb/
 ```
 
 > `engine/` is split: **shared** modules are imported by both pipelines (clustering,
@@ -87,12 +98,20 @@ auto_placer/
 ## Core Concepts
 
 ### Cost Function (macro pipeline)
-`Total Cost = α·HPWL + β·Overlap + γ·Boundary + rudy·RUDY + pin_density·PinDensity + cap_attraction·CapAttraction + clearance·Clearance`
+`Total Cost = α·HPWL + β·Overlap + γ·Boundary + γ·Keepout + rudy·RUDY + pin_density·PinDensity + cap_attraction·CapAttraction + clearance·Clearance`
 - **HPWL** — Half-perimeter wirelength over all nets. **Power/ground nets are included**
   (key change vs legacy) — caps share rails with their IC, so power-net HPWL is the
-  gradient signal keeping caps near their assigned IC during SA.
+  gradient signal keeping caps near their assigned IC during SA. `--exclude-nets` drops
+  named nets (typically global GND/VCC, near-constant HPWL) from this term for SA speed;
+  threaded through every `evaluate()` call (initial, per-move, final) and the incremental tracker.
 - **Overlap** — sum of pairwise macro bbox intersection areas (macros = rigid union bboxes).
-- **Boundary** — linear distance penalty for bboxes outside the outline; edge connectors (intentional overhang) excluded.
+- **Boundary** — distance penalty for bboxes outside the outline, via `board.bbox_overflow()`
+  (byte-identical to the old four-sided sum on a rectangle; polygon-aware on notched/hole
+  boards). Edge connectors (intentional overhang) excluded.
+- **Keepout** — total area of component bboxes intersecting `BoardModel.keepouts` (rectangular
+  no-place zones). Weight defaults to `γ`; pass `keepout_weight=0.0` to drop the SA gradient
+  (the legalizer's `_keepout_clamp` still evicts violators regardless, via a multi-pass push
+  along the shallowest exit axis). Builds on the polygon/keepout data model from `8019d4d`.
 - **RUDY** — wire-density congestion (each net's bbox spread uniformly across the grid
   cells it covers). Catches routing choke points where many nets' bboxes overlap — HPWL
   alone is blind to this. Default weight `1.0` (from `config.json` `annealer.rudy_weight`);
@@ -127,6 +146,20 @@ at construction (`find_cap_offset`, 8-direction fan bounded by `MAX_CAP_IC_GAP_M
 followers, so the cap-IC gap can never grow at runtime. SA moves and the legalizer treat
 macros as opaque rigid bodies.
 
+### Cap Assignment (`assign/assign_caps.py`)
+One classification drives rigid gluing, cap attraction, *and* the legacy `--delta` decoupling-
+proximity constraint — no duplicate logic elsewhere.
+- **Decoupling (rigid)** — ≤ `DECAP_MAX_VALUE_F = 10µF`, and that (IC, rail) pair's pad spread
+  on the IC is ≤ `RAIL_PAD_SPREAD_THRESHOLD_MM = 3.0mm` (a geometric "can this rail host a tight
+  ring" test, not a per-IC cap count). All such caps become rigid `Macro` followers.
+- **Decoupling (rail-adjacent)** — same value threshold, but pad spread > 3.0mm (e.g. a BGA rail
+  landing on opposite corners). Standalone macros held near their IC by the cap-attraction term
+  instead of rigid geometry. No per-IC ceiling — one IC can have rigid followers on one rail and
+  rail-adjacent caps on another.
+- **Bulk** — > 10µF or on a rail no IC shares. **Coupling** — signal-only nets, no power rail.
+- Power-rail detection also matches hierarchical labels (`/Buck/VIN`) and KiCad auto-names
+  (`Net-(U1-VIN)`) via trailing-token conventions, not just literal net names.
+
 ### Component Types
 `ic`, `capacitor`, `resistor`, `connector`, `crystal`, `generic` — drive placement heuristics,
 spacing, and edge-connector detection (`is_edge_connector`).
@@ -155,12 +188,14 @@ Key `place` options (defaults come from `config.json`; see README for the full t
 | `--grid-mm` | `0.5` | `legalization.grid_mm` |
 | `--sa-iterations` | `max(1500, 25×N)` | scales with macro count |
 | `--sa-reheat` | `3` | `annealer.reheat_count` |
-| `--alpha/--beta/--gamma` | `1.0 / 25.0 / 8.0` | macro-v2 cost weights |
+| `--alpha/--beta/--gamma` | `1.0 / 25.0 / 8.0` | macro-v2 cost weights (`γ` also defaults the keepout weight) |
+| `--delta` | `0.0` | constraint-rule penalty weight (`engine/constraint_evaluator.py`: decoupling proximity, crystal-MCU, thermal, etc.); opt-in, `0` = current default behavior |
 | `--seed` | `42` | SA/placement RNG seed (`--seed 0` = non-deterministic) |
 | `--rudy-weight` | `1.0` (from config) | RUDY wire-density congestion penalty in SA cost (0 = off) |
 | `--pin-density-weight` | `0.2` (from config) | Pin-density congestion penalty in SA cost (0 = off). Complements RUDY. |
 | `--cap-attraction-weight` | `1.0` (from config) | cap→IC drift penalty on rail-adjacent freed caps (0 = off) |
 | `--clearance-weight` | `5.0` (from config) | routing-halo pairwise clearance in SA cost (0 = off); density-tapered |
+| `--exclude-nets` | *(none)* | net names dropped from HPWL during SA, e.g. `--exclude-nets GND +3V3` (speeds up SA on global power nets) |
 | `--legalizer` | `heuristic` | one of `heuristic` / `abacus` / `sa_polish` |
 | `--connector-mating-margin` | `5.0` | edge offset for perimeter connectors |
 | `--macro-v2/--no-macro-v2` | on | toggle pipeline (`--no-macro-v2` = legacy grid) |
@@ -198,6 +233,13 @@ Key `place` options (defaults come from `config.json`; see README for the full t
    process runs are reproducible; across processes results can vary because Python's hash
    seed changes set/dict iteration order (see project memory: SA hash-seed determinism).
 7. **`patches/` stays untracked** — never `git add patches/`; stage only source files.
+8. **Pad rotation** — footprint rotation rewrites only the footprint's own `(at ...)`; per-pad
+   `(at X Y r)` overrides are left alone. Rewriting both double-rotated asymmetric footprints
+   (SOIC/QFN/offset-pin-1) — fixed, don't reintroduce a pad-level rewrite.
+9. **Polygon outlines are opt-in by data, not by flag** — every polygon/keepout branch is gated
+   on `board is not None and board.is_polygon` (or non-empty `board.keepouts`), so a plain
+   rectangular board traces the exact pre-polygon code paths. New boundary/keepout logic must
+   preserve this fallback rather than assuming rectangular geometry.
 
 ## Dependencies
 

@@ -18,11 +18,14 @@
   - **Swap** — exchange leader positions of two macros
   - **Displace-neighbor** — pick a macro, find a macro it overlaps, push the neighbor along the cheaper axis. Helps SA escape jammed configurations.
 - **Calibrated T0** — initial temperature is set from overlap-clean sample moves only, so the HPWL gradient SA follows isn't drowned out by the β=25 overlap penalty.
-- **Single cost function** — `α·HPWL + β·Overlap + γ·Boundary`, with **power nets included in HPWL** (the key change vs the legacy pipeline — power-net HPWL is what gives SA gradient signal to keep caps near their assigned IC).
+- **Routability-aware cost function** — `α·HPWL + β·Overlap + γ·Boundary + γ·Keepout + rudy·RUDY + pin_density·PinDensity + cap_attraction·CapAttraction + clearance·Clearance`, with **power nets included in HPWL** (the key change vs the legacy pipeline — power-net HPWL is what gives SA gradient signal to keep caps near their assigned IC). RUDY, pin-density, cap-attraction and clearance are default-on so the placer produces a routable result out of the box. See [Cost Function](#cost-function) below.
+- **Non-rectangular board outlines** — polygon outlines (connector notches, mouse-bites, castellated edges) and interior holes/keepout zones are honored end-to-end: initial placement, SA's boundary gradient, and the legalizer all clamp to the true outline instead of its outer AABB. Plain rectangular boards trace the exact pre-polygon code paths (zero behavior change).
+- **Internal keepout zones** — rectangular no-place zones (mounting holes, board-edge fab notes, etc.) are penalized in the cost function and actively evicted by the legalizer's multi-pass keepout clamp, which pushes an offending macro out along its shallowest exit axis.
 - **End-mating connector orientation** — barrel jacks, USB, RJ45, HDMI, D-Sub and other end-mating connectors are oriented so the mating face points outward. Face-mating connectors (terminal blocks, pin headers, SMA) use the perpendicular-to-pad-column heuristic.
-- **Iterative legalizer** — grid snap → push-apart → boundary clamp, iterated up to 5 rounds to settle the push-apart ↔ clamp cycle. Cap-IC distance violations are reported as a separate stat.
-- **Pad rotation propagation** — when a footprint is rotated, the rotation delta is applied to each pad's `(at ...)` expression so copper layers match the courtyard orientation.
+- **Iterative legalizer** — grid snap → push-apart → boundary clamp, iterated up to 5 rounds to settle the push-apart ↔ clamp cycle. Cap-IC distance violations are reported as a separate stat. Alternate strategies (`abacus`, `sa_polish`) are selectable via `--legalizer`.
+- **Pad rotation propagation** — footprint rotation rewrites only the footprint's own `(at ...)` expression; per-pad `(at X Y r)` overrides are left untouched, avoiding the double-rotation that previously corrupted asymmetric footprints (SOIC/QFN/offset-pin-1 parts).
 - **Edge-connector awareness** — horizontal/surface-mount connectors are placed on the board perimeter and excluded from out-of-bounds counts; vertical/THT connectors are treated as interior components.
+- **Net exclusion for SA speed** — `--exclude-nets` drops near-constant-HPWL global nets (board-wide GND/VCC) from SA's per-move cost evaluation, cutting evaluation cost without changing what's optimized.
 - **Debug visualization** — `--debug-bbox` draws component bounding boxes and board outline on the `Dwgs.User` layer for visual inspection in KiCad.
 
 ## Pipeline (macro-first, `place_v2`)
@@ -85,13 +88,20 @@ python gridghost.py profiles
 | `--sa-reheat` | `3` | Number of SA reheat rounds (`config.json` `annealer.reheat_count`) |
 | `--alpha` | `1.0` | HPWL weight |
 | `--beta` | `25.0` | Overlap penalty weight |
-| `--gamma` | `8.0` | Boundary penalty weight |
+| `--gamma` | `8.0` | Boundary penalty weight (also the default keepout-overlap weight) |
+| `--delta` | `0.0` | Constraint-rule penalty weight (decoupling proximity, crystal-MCU, thermal grouping/separation, etc., via `engine/constraint_evaluator.py`). Opt-in — `0` preserves current behavior. |
+| `--rudy-weight` | `1.0` | RUDY wire-density congestion penalty (0 = off) |
+| `--pin-density-weight` | `0.2` | Pin-escape congestion penalty; complements RUDY (0 = off) |
+| `--cap-attraction-weight` | `1.0` | Deadband-linear drift penalty (`max(0, dist − 5mm)`) holding rail-adjacent freed caps near their assigned IC (0 = off) |
+| `--clearance-weight` | `5.0` | Pairwise routing-halo clearance charge (`max(0, 1mm − edge_gap)`) between macros; density-tapered (0 = off) |
+| `--exclude-nets` | *(none)* | Net names to drop from HPWL during SA (e.g. `--exclude-nets GND +3V3`) — speeds up SA on boards with near-constant, board-wide power nets |
+| `--legalizer` | `heuristic` | Overlap-resolution strategy: `heuristic` (grid snap/push-apart/clamp), `abacus` (row-based DP, kept for comparison only), or `sa_polish` (overlap-weighted SA pass) |
 | `--seed` | `42` | SA RNG seed (deterministic runs) |
 | `--connector-mating-margin` | `5.0` | Edge offset for perimeter connectors |
 | `--macro-v2` / `--no-macro-v2` | on | Toggle macro-first pipeline. Default on. `--no-macro-v2` falls back to the legacy grid pipeline (`engine/smart_placement.py`), retained for A/B comparison. |
 | `--dry-run` | off | Don't write PCB output file |
 | `--debug-bbox` | off | Draw bounding boxes on Dwgs.User layer |
-| `-v`, `--verbose` | off | Print per-stage cost breakdown |
+| `-v`, `--verbose` | off | Print per-stage cost breakdown, including routability-term initial/final values even when a term's weight is 0 |
 
 ### Examples
 
@@ -115,12 +125,21 @@ python gridghost.py extract board.kicad_pcb -o board_model.json
 ## Cost Function
 
 ```text
-Total Cost = α · HPWL + β · Overlap + γ · Boundary
+Total Cost = α·HPWL + β·Overlap + γ·Boundary + γ·Keepout
+             + rudy·RUDY + pin_density·PinDensity
+             + cap_attraction·CapAttraction + clearance·Clearance
 ```
 
-- **HPWL** — Half-perimeter wirelength over all nets. **Power and ground nets are included** — this is the key change vs the legacy pipeline. Caps share power rails with their ICs, so power-net HPWL is the gradient signal that keeps caps near their assigned ICs during SA.
+- **HPWL** — Half-perimeter wirelength over all nets. **Power and ground nets are included** — this is the key change vs the legacy pipeline. Caps share power rails with their ICs, so power-net HPWL is the gradient signal that keeps caps near their assigned ICs during SA. `--exclude-nets` can drop specific board-wide nets (e.g. global GND) from this term to speed up SA without changing what it optimizes.
 - **Overlap** — Sum of pairwise macro bbox intersection areas. Macros are treated as rigid rectangles (leader + follower union bbox).
-- **Boundary** — Linear distance penalty for components whose bbox extends outside the board outline. Edge connectors (intentional overhang) are excluded.
+- **Boundary** — Distance penalty for components whose bbox extends outside the board outline, computed via the outline's `bbox_overflow()` so it's identical on rectangles and gradient-correct on polygon/notched boards. Edge connectors (intentional overhang) are excluded.
+- **Keepout** — Total area of component bboxes intersecting internal keepout zones (mounting holes, fab no-place areas). Weight defaults to `γ` (the boundary weight). Even with this term's SA gradient off, the legalizer's `_keepout_clamp` still actively evicts macros parked inside a keepout, pushing them out along the shallowest exit axis.
+- **RUDY** — Wire-density congestion: each net's bounding-box "traffic" spread uniformly across the grid cells it spans, scaled by local component density (0.3× sparse boards, 1.2× dense boards, 1.0× otherwise) so amplification doesn't overshoot already-congested regions. Catches routing choke points HPWL alone is blind to. Default weight `1.0`.
+- **Pin density** — Signal-pin count per grid cell (power pins excluded, target adapts to board density). Catches pin-escape congestion — dense clusters of small passives crowding a QFN's pins — that RUDY's wire-density model misses. Default weight `0.2`.
+- **Cap attraction** — Deadband-linear drift penalty, `max(0, center_dist − 5mm)`, on *rail-adjacent* freed caps toward their assigned IC. Root-cause fix for shared-rail cap drift: on a rail spanning several ICs the rail's net bbox is already board-wide, so HPWL alone gives a freed cap zero gradient to stay near its IC. Default weight `1.0`.
+- **Clearance** — Pairwise routing-halo charge, `max(0, 1mm − edge_gap)`, between macro pairs. HPWL's pull and the overlap term's cliff-at-touching otherwise let SA park components at a 0.00 mm gap with no room for a trace; intersecting pairs charge exactly the target so `β` stays the sole "depth" charger. Auto-tapered by interior density (1.0× ≤ 0.45 density, 0.25× ≥ 0.65). Default weight `5.0`.
+
+All four routability terms (Keepout, RUDY, pin density, clearance) plus cap attraction are **default-on**. Pass the matching `--*-weight 0` flag to disable any of them; `-v` always reports each term's initial and final value, even at weight 0.
 
 ## Macro Model
 
@@ -138,13 +157,16 @@ Move operators and the legalizer all operate on macros as opaque rigid bodies. C
 
 ## Cap Assignment
 
-`assign/assign_caps.py` classifies each capacitor and assigns decoupling caps to ICs:
+`assign/assign_caps.py` classifies each capacitor and assigns decoupling caps to ICs. There are four classes:
 
-- **Decoupling** (≤ `DECAP_MAX_VALUE_F = 1e-6` F, i.e. ≤ 1 µF) — distributed round-robin across ICs. Each cap goes to exactly one IC (the cap-to-IC map has no duplicates). Assignment prefers ICs sharing the cap's power rail; falls back to nets-shared and physical proximity.
-- **Bulk** (> 1 µF, on a power rail) — stays standalone, not assigned to any IC.
-- **Coupling** (in signal path, e.g. AC-coupling caps) — stays standalone.
+- **Decoupling (rigid)** (≤ `DECAP_MAX_VALUE_F = 10e-6` F, i.e. ≤ 10 µF) — real decoupling caps whose pins on the IC land in one tight physical cluster (max pairwise pad distance on that net ≤ `RAIL_PAD_SPREAD_THRESHOLD_MM = 3.0` mm). **All** caps the netlist puts on that (IC, rail) pair become rigid `Macro` followers — the count comes from the schematic, not a manual cap — and stay within `MAX_CAP_IC_GAP_MM` edge-to-edge of the leader.
+- **Decoupling (rail-adjacent)** — real decoupling caps on a rail whose pins are physically scattered across the IC footprint (e.g. a BGA power net landing on opposite corners). There's no single point to glue a tight rigid ring to, so these become standalone macros; SA holds them near their assigned IC via the **cap→IC attraction** cost term instead of rigid geometry. One IC can have, say, 6 rigid followers on one rail and 2 rail-adjacent on another — the split is per (IC, rail) pair, not a per-IC ceiling.
+- **Bulk** (> 10 µF, or on a power rail no IC shares) — stays standalone, not assigned to any IC. Unparseable values default to bulk (conservative).
+- **Coupling / signal** — only on signal nets (crystal loads, shields, USB D+/D-, reset filters), no power rail. Standalone.
 
-A cap assigned to an IC is **only** in that IC's macro — never as a standalone macro. This is critical: if a cap were in two macros, push-apart could move the standalone cap away from its IC.
+Decoupling caps are distributed round-robin across the ICs sharing a rail. Power-rail detection also matches hierarchical labels (e.g. `/Buck/VIN`) and KiCad auto-generated net names (e.g. `Net-(U1-VIN)`) via trailing-token power-pin conventions, not just literal `+3V3`/`GND`-style names — deliberately conservative (EN/FB/COMP/SW/BOOT/VG and FET-source pins stay excluded).
+
+A cap assigned to an IC is **only** in that IC's macro — never as a standalone macro. This is critical: if a cap were in two macros, push-apart could move the standalone cap away from its IC. One `assign_caps` classification drives rigid gluing, cap attraction, *and* the legacy `--delta` decoupling-proximity constraint — there's a single source of truth for which caps belong to which IC.
 
 ## Project Structure
 
@@ -156,6 +178,9 @@ GridGhost/
 │
 ├── models/
 │   ├── board_model.py             # BoardModel, Component, Net, Pad, BoardOutline
+│   │                              # (rectangle or polygon-with-holes; contains/
+│   │                              # contains_bbox/fit_bbox_inside/bbox_overflow),
+│   │                              # BoardModel.keepouts (rectangular no-place zones)
 │   └── macro.py                   # Macro: leader + rigid followers
 │                                  # find_cap_offset; MAX_CAP_IC_GAP_MM = 4.0 (edge-to-edge)
 │
@@ -168,10 +193,11 @@ GridGhost/
 │                                  # and assign decoupling caps to ICs
 │
 ├── cost/
-│   ├── cost.py                    # Macro-v2 cost: α·HPWL (incl. power rails)
-│   │                              # + β·overlap + γ·boundary
+│   ├── cost.py                    # Macro-v2 cost: α·HPWL (incl. power rails) + β·overlap
+│   │                              # + γ·boundary + γ·keepout + rudy + pin_density
+│   │                              # + cap_attraction + clearance
 │   ├── chains.py                  # Signal-flow chain grouping for cost/SA
-│   └── incremental.py             # Incremental cost delta for macro SA
+│   └── incremental.py             # Incremental cost delta for macro SA (all cost terms)
 │
 ├── place/
 │   ├── pipeline.py                # 5-stage orchestrator (build → connector →
@@ -191,7 +217,8 @@ GridGhost/
 ├── engine/                        # Shared + legacy modules.
 │   ├── net_clustering.py          # Hypergraph clustering — reused by place/cluster.py
 │   ├── cost_state.py              # Incremental cost state — reused by cost/, place/
-│   ├── congestion.py              # RUDY wire-density + pin-density congestion maps — reused by cost/, place/sa
+│   ├── congestion.py              # Density-adaptive RUDY wire-density + pin-density
+│   │                              # congestion maps — reused by cost/, place/sa
 │   ├── constraint_evaluator.py    # Constraint penalty evaluation — reused by cost_state
 │   ├── group_moves.py             # Macro/group move primitives — reused widely
 │   ├── subcircuit_patterns.py     # Subcircuit pattern detection — reused by clustering
@@ -224,18 +251,24 @@ GridGhost/
 │
 ├── tests/
 │   ├── test_macro.py              # Macro model: rigid moves, bounds, cap gap, bbox
-│   ├── test_assign_caps.py        # Cap classification + IC assignment
-│   ├── test_cost.py               # HPWL / overlap / boundary cost
-│   ├── test_incremental_cost.py   # Incremental cost delta
+│   ├── test_assign_caps.py        # Cap classification + IC assignment (rigid/rail-adjacent split)
+│   ├── test_cost.py               # HPWL / overlap / boundary / keepout / cap-attraction / clearance cost
+│   ├── test_incremental_cost.py   # Incremental cost delta (all terms)
 │   ├── test_chains.py             # Signal-flow chain grouping
 │   ├── test_connector_placement.py# Perimeter connector placement + rotation
 │   ├── test_placement_spread.py   # Placement spread / coverage
 │   ├── test_abacus_bridge.py      # Macro → Abacus legalizer adapter
 │   ├── test_sa_polish.py          # SA-polish legalizer strategy
+│   ├── test_nonrect_outline.py    # Polygon outline geometry, parser tracing, legalizer clamps
+│   ├── test_keepout.py            # Internal keepout cost + legalizer eviction
+│   ├── test_pad_rotation.py       # Footprint-only rotation (no double-rotation on pads)
 │   ├── test_overlap_regression.py # (currently disabled — 0 collected)
-│   ├── test_phase1.py             # 81 tests: legacy pipeline + data model
+│   ├── test_phase1.py             # 87 tests: legacy pipeline + data model
 │   ├── run_all.py / dashboard.py / visualizer.py   # Batch run + result dashboard harness
-│   └── test_pcbs/                 # Bundled .kicad_pcb boards + reference JSONs
+│   ├── run_benchmark.py           # Benchmark harness for placement quality/timing
+│   ├── README.md                  # Test harness usage (run_all, dashboard, visualizer)
+│   ├── test_pcbs/                 # Bundled .kicad_pcb boards + reference JSONs
+│   └── external_boards/rl_pcb/    # Third-party reference boards (see its own README/LICENSE)
 │
 ├── patches/                       # (untracked) benchmark scripts + result JSONs
 │
@@ -302,16 +335,20 @@ python -m pytest tests/
 python -m pytest tests/test_macro.py tests/test_assign_caps.py tests/test_cost.py \
                    tests/test_incremental_cost.py tests/test_chains.py \
                    tests/test_connector_placement.py tests/test_placement_spread.py \
-                   tests/test_abacus_bridge.py tests/test_sa_polish.py
+                   tests/test_abacus_bridge.py tests/test_sa_polish.py \
+                   tests/test_nonrect_outline.py tests/test_keepout.py tests/test_pad_rotation.py
 
 # Legacy Phase 1 suite (data model, parser, legacy engine)
 python -m pytest tests/test_phase1.py
 ```
 
-The suite is **152 tests across 11 files** (run `python -m pytest tests/`). Breakdown: `test_phase1.py` (81 — legacy pipeline + data model), `test_cost.py` (12), `test_macro.py` (11), `test_chains.py` (9), `test_connector_placement.py` (10), `test_assign_caps.py` (8), `test_placement_spread.py` (9), `test_sa_polish.py` (5), `test_abacus_bridge.py` (4), `test_incremental_cost.py` (3). `test_overlap_regression.py` is currently disabled (0 collected). The macro-first pipeline is covered by:
+The suite is **227 tests across 14 files** (run `python -m pytest tests/`). Breakdown: `test_phase1.py` (87 — legacy pipeline + data model), `test_nonrect_outline.py` (26), `test_cost.py` (21), `test_assign_caps.py` (17), `test_keepout.py` (13), `test_macro.py` (11), `test_connector_placement.py` (10), `test_placement_spread.py` (9), `test_chains.py` (9), `test_incremental_cost.py` (8), `test_pad_rotation.py` (7), `test_sa_polish.py` (5), `test_abacus_bridge.py` (4). `test_overlap_regression.py` is currently disabled (0 collected). The macro-first pipeline is covered by:
 - **Macro model**: rigid translation, bounds revert, rotation propagation, `MAX_CAP_IC_GAP_MM` (edge-to-edge cap-IC gap) enforcement, bbox union, overlap detection
-- **Cap assignment**: power-net detection, single-IC assignment, round-robin distribution, determinism
-- **Cost**: HPWL (2-pin, 3-pin, with/without power), macro overlap area, boundary, edge-connector exclusion, evaluate() returns all components
+- **Cap assignment**: power-net detection (incl. hidden/hierarchical rail names), rigid-vs-rail-adjacent split by pad spread, round-robin distribution, determinism
+- **Cost**: HPWL (2-pin, 3-pin, with/without power), macro overlap area, boundary (rect + polygon), keepout overlap, cap-attraction drift, pairwise clearance, edge-connector exclusion, evaluate() returns all components
+- **Board outline**: polygon containment/clamp/fit, notch + nested-hole geometry, parser outline tracing and rectangle fallback, adversarial legalizer sweeps on notched boards
+- **Keepout zones**: cost penalty and multi-pass legalizer eviction from rectangular no-place zones
+- **Pad rotation**: footprint-only rotation rewrite on asymmetric footprints (no pad double-rotation)
 
 ## Design References
 
