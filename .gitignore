@@ -1,11 +1,10 @@
 *_pycache__/
 *.bak
 *.json
-milestone.md
-auto_placer_plan.md
 .history/
 *.log
 *placed.kicad_pcb
+.claude
 
 # Generated test-harness output (dashboards, SVGs, per-run JSON, logs).
 # See tests/README.md — not checked in.
