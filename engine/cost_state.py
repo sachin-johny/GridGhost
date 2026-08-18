@@ -6,11 +6,11 @@ essential for SA performance where thousands of moves are evaluated per second.
 
 from __future__ import annotations
 
-import re
 from bisect import bisect_left, insort
 
 from models.board_model import BoardModel
 from profiles.board_profiles import ConstraintRule
+from assign.assign_caps import is_power_net as _is_power_net
 from engine.constraint_evaluator import (
     evaluate_constraint_penalties,
     _build_decoupling_map,
@@ -163,17 +163,6 @@ def density_adaptive_weight(board_density: float, n_components: int = 0,
         count_scale = 1.0
 
     return DENSITY_WEIGHT * density_scale * count_scale
-
-_POWER_PREFIXES = (
-    'GND', 'AGND', 'DGND', 'PGND', 'SGND',
-    'VSS', 'VCC', 'VDD', 'VEE', 'VBAT', 'VBUS',
-)
-_POWER_VOLTAGE_RE = re.compile(r'^[+\-]\d[\d.]*V', re.IGNORECASE)
-
-
-def _is_power_net(name: str) -> bool:
-    n = name.lstrip('/').upper()
-    return any(n.startswith(p) for p in _POWER_PREFIXES) or bool(_POWER_VOLTAGE_RE.match(n))
 
 
 # Weight multiplier for signal-flow chain internal nets.  3.0 means a

@@ -62,17 +62,19 @@ def build_macros(model: "BoardModel") -> tuple[list[Macro], list[Macro], list[Ma
       move them — see ``run_macro_sa``'s fixed-macro filtering).
 
     A cap assigned to an IC as a rigid follower is ONLY in that IC's
-    macro — never as a standalone macro. Rail-adjacent caps (excess
-    decoupling caps beyond ``max_decaps_per_ic`` per IC) become
+    macro — never as a standalone macro. Rail-adjacent caps (real
+    decoupling caps whose rail lands on pads scattered across the IC
+    footprint, per ``assign_caps.RAIL_PAD_SPREAD_THRESHOLD_MM``) become
     standalone macros so SA can move them freely toward the power rail.
     This avoids rigidly locking a large fan of caps to one IC on dense
     shared-rail boards, which starves SA of degrees of freedom and
     produces a macro block that is hard to legalize.
     """
-    # classify_caps splits decoupling caps into rigid followers (≤ N per
-    # IC → Macro.with_caps) and rail-adjacent (the rest → standalone).
-    # Only rigid followers are in decap_map / cap_ref_to_ic, so the
-    # rail-adjacent caps naturally become Macro.alone() below.
+    # classify_caps splits decoupling caps into rigid followers (tight
+    # pin-cluster rails → Macro.with_caps) and rail-adjacent (scattered
+    # pin-cluster rails → standalone). Only rigid followers are in
+    # decap_map / cap_ref_to_ic, so the rail-adjacent caps naturally
+    # become Macro.alone() below.
     decap_map, _rail_adjacent_refs, _bulk_refs, _coupling_refs = classify_caps(model)
     cap_ref_to_ic: dict[str, str] = {
         cap: ic for ic, caps in decap_map.items() for cap in caps

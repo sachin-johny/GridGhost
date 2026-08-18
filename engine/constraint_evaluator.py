@@ -17,33 +17,12 @@ than one 1 mm beyond.
 from __future__ import annotations
 
 import math
-import re
 from collections import defaultdict
 from typing import Optional
 
 from models.board_model import BoardModel, Component
 from profiles.board_profiles import ConstraintRule
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-_POWER_PREFIXES_TUPLE = (
-    'GND', 'AGND', 'DGND', 'PGND', 'SGND',
-    'VSS', 'VCC', 'VDD', 'VEE', 'VBAT', 'VBUS',
-)
-_GND_PREFIXES_TUPLE = ('GND', 'AGND', 'DGND', 'PGND', 'SGND', 'VSS')
-# Compile the voltage regex once at module load (was re.match per call).
-_VOLTAGE_RE = re.compile(r'^[+\-]\d[\d.]*V', re.IGNORECASE)
-
-
-def _is_power_net(name: str) -> bool:
-    """Check if a net name is a power/ground net."""
-    n = name.lstrip('/').upper()
-    if n.startswith(_POWER_PREFIXES_TUPLE):
-        return True
-    return bool(_VOLTAGE_RE.match(n))
+from assign.assign_caps import is_power_net as _is_power_net
 
 
 def _center_distance(a: Component, b: Component) -> float:
@@ -67,73 +46,31 @@ def _build_decoupling_map(
 ) -> dict[str, list[str]]:
     """Map each IC ref → list of decoupling cap refs that share a power net.
 
-    Distributes caps evenly across ICs sharing a power rail.
+    Thin wrapper around ``assign_caps.classify_caps`` / ``rail_adjacent_to_ic``
+    — the canonical cap classification also used for macro building
+    (``place/pipeline.py``). Merges rigid followers and rail-adjacent caps
+    into one map since both get the same proximity penalty here (rigid
+    caps trivially satisfy it, being macro-glued at ~0mm; rail-adjacent
+    caps are the ones this penalty actually needs to pull in).
 
-    When multiple ICs share the same power net (e.g., four op-amps on
-    +3V3), the old code assigned ALL caps on that net to a single IC
-    (whichever came first alphabetically).  This left 3 out of 4 ICs
-    with zero decoupling caps and zero proximity penalty, so the SA
-    had no incentive to keep caps near those ICs.
-
-    The new algorithm:
-    1. For each cap, collect the set of ICs sharing its power net(s).
-    2. Distribute caps round-robin among those ICs, prioritising ICs
-       that currently have the fewest caps assigned.  This ensures
-       every IC gets at least one nearby decoupling cap.
+    Previously this reimplemented its own value-blind, geometry-blind
+    round-robin, which could disagree with the macro builder's
+    assignment for the same cap (e.g. one system gluing a cap rigidly to
+    IC A while this one independently scored its distance to IC B — a
+    penalty SA could only reduce by dragging IC A's whole macro toward
+    B, a spurious force with no electrical basis) and could pull bulk
+    caps (>``DECAP_MAX_VALUE_F``) toward an IC as if they were
+    decoupling caps. Delegating to the same classification eliminates
+    both: one cap→IC assignment, used consistently for rigid gluing,
+    cap→IC attraction, AND this proximity penalty.
     """
-    ic_types = {'ic', 'mcu', 'regulator'}
-    ics = [c for c in model.components if getattr(c, 'component_type', '') in ic_types]
-    caps = [c for c in model.components if getattr(c, 'component_type', '') == 'capacitor']
+    from assign.assign_caps import classify_caps, rail_adjacent_to_ic
 
-    if not ics or not caps:
-        return {}
-
-    ref_to_type = {c.ref: getattr(c, 'component_type', '') for c in model.components}
-
-    # Build net → {refs} for non-GND power nets
-    power_nets: dict[str, set[str]] = {}
-    for net in model.nets:
-        if not _is_power_net(net.name):
-            continue
-        clean = net.name.lstrip('/').upper()
-        # Exclude GND — everything shares it, no discriminative power
-        if clean.startswith(_GND_PREFIXES_TUPLE):
-            continue
-        refs = net.component_refs
-        power_nets[net.name] = refs
-
-    # For each cap, find which ICs share power nets
-    ic_refs = {ic.ref for ic in ics}
-    # cap → set of IC refs that share at least one power net
-    cap_to_ics: dict[str, set[str]] = defaultdict(set)
-
-    # Iterate power_nets and net_caps in sorted order so the
-    # cap_to_ics insertion order (and downstream min() tie-breaking in
-    # the round-robin) is deterministic across runs. Without this, set
-    # iteration order varies with id() under ASLR, leading to different
-    # cap→IC assignments and different SA trajectories.
-    for net_name in sorted(power_nets.keys()):
-        refs = power_nets[net_name]
-        net_ics = refs & ic_refs
-        # Check if non-IC refs are actually capacitors via ref→type lookup
-        net_caps = {r for r in refs if r not in ic_refs and ref_to_type.get(r) == 'capacitor'}
-        for cap_ref in sorted(net_caps):
-            cap_to_ics[cap_ref].update(net_ics)
-
-    # Distribute caps round-robin: each cap goes to the IC with the
-    # fewest caps currently assigned (among ICs that share its power net).
-    # This ensures every IC gets decoupling caps, not just one.
-    ic_caps: dict[str, list[str]] = defaultdict(list)
-    for cap_ref in sorted(cap_to_ics.keys()):
-        candidate_ics = cap_to_ics[cap_ref]
-        if not candidate_ics:
-            continue
-        # Pick the IC with fewest caps assigned so far. Sort to break
-        # ties deterministically (min() returns the first minimum).
-        best_ic = min(sorted(candidate_ics), key=lambda r: len(ic_caps[r]))
-        ic_caps[best_ic].append(cap_ref)
-
-    return dict(ic_caps)
+    decap_map, _rail_adj_refs, _bulk, _coupling = classify_caps(model)
+    merged: dict[str, list[str]] = {ic: list(caps) for ic, caps in decap_map.items()}
+    for cap_ref, ic_ref in rail_adjacent_to_ic(model).items():
+        merged.setdefault(ic_ref, []).append(cap_ref)
+    return merged
 
 
 def penalty_decoupling_proximity(

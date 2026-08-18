@@ -287,8 +287,9 @@ def seed_rail_adjacent_caps(
     from its assigned IC — on shared-rail boards the round-robin
     assignment is load-balanced across the rail's ICs, so the correct
     home is *near the assigned IC*, not wherever the cluster landed.
-    Without this, freed caps start as a tall shelf column (e.g. test4 at
-    ``max_decaps_per_ic=2``: a 122mm tower of cap blocks), the clamp
+    Without this, freed caps start as a tall shelf column (e.g. test4
+    under the old count-based rigid cap of 2: a 122mm tower of cap
+    blocks), the clamp
     pass piles them at one edge, and SA never recovers the top of the
     board because the rail-bbox HPWL gradient confines caps to the
     rail's current extent.
