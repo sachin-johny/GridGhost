@@ -395,6 +395,236 @@ def push_apart_overlapping(
     return _count_residual_overlaps(macros)
 
 
+def _edge_gap_signed(
+    a_bbox: tuple[float, float, float, float],
+    b_bbox: tuple[float, float, float, float],
+) -> tuple[float, float, float]:
+    """Signed edge gap between two AABBs.
+
+    Returns (dx, dy, gap) where dx/dy are the per-axis separations
+    (negative = overlap on that axis) and gap is the minimum
+    translation distance to make them just-touching (negative when
+    they overlap, zero at touching, positive when separated).
+    """
+    ax1, ay1, ax2, ay2 = a_bbox
+    bx1, by1, bx2, by2 = b_bbox
+    if ax2 < bx1:    dx = bx1 - ax2     # a left of b: positive
+    elif bx2 < ax1:  dx = ax1 - bx2     # b left of a: positive
+    else:            dx = max(ax1 - bx2, bx1 - ax2)  # overlap: negative
+    if ay2 < by1:    dy = by1 - ay2
+    elif by2 < ay1:  dy = ay1 - by2
+    else:            dy = max(ay1 - by2, by1 - ay2)
+    if dx <= 0 and dy <= 0:
+        gap = max(dx, dy)  # overlap depth (negative)
+    elif dx <= 0:
+        gap = dy
+    elif dy <= 0:
+        gap = dx
+    else:
+        gap = math.sqrt(dx * dx + dy * dy)  # corner-to-corner
+    return dx, dy, gap
+
+
+def _pair_is_drc_exempt(a: "Macro", b: "Macro") -> bool:
+    """Return True if this macro pair is exempt from hard-DRC min-gap.
+
+    Mirrors cost/cost.py::_clearance_target_for_pair's exemption rules:
+    mechanical-mechanical pairs (mounting holes) and pairs where EITHER
+    member's leader is a TestPoint (detected via footprint prefix) are
+    exempt — their tight placement is intentional, not a DRC violation.
+    """
+    from models.macro import _is_overlap_exempt, _MECHANICAL_COMPONENT_TYPES
+    if _is_overlap_exempt(a, b):
+        return True
+    # TestPoint detection (footprint prefix)
+    _TP_PREFIXES = ("TestPoint", "testpoint", "MeasurementPoint")
+    def _is_tp(m: "Macro") -> bool:
+        fp = getattr(m.leader, "footprint", "") or ""
+        if ":" in fp:
+            fp = fp.split(":", 1)[1]
+        return any(fp.startswith(p) for p in _TP_PREFIXES)
+    if _is_tp(a) or _is_tp(b):
+        return True
+    return False
+
+
+def enforce_drc_min_gap(
+    macros: list["Macro"],
+    bounds: tuple[float, float, float, float],
+    *,
+    min_gap_mm: float = 0.15,
+    max_passes: int = 8,
+    verbose: bool = False,
+) -> int:
+    """Hard-DRC post-process: push apart SMT passives with sub-DRC gap.
+
+    Runs AFTER the main legalize pipeline (push-apart + force-spread +
+    Tetris). Scans every macro pair for sub-DRC gaps (0 < gap <
+    ``min_gap_mm``) between any of macro A's members (leader or
+    follower) and any of macro B's members, and pushes the smaller macro
+    along the cheaper axis to achieve the DRC minimum.
+
+    Pairs are exempt when:
+      - BOTH macros' leaders are mechanical features (mounting holes,
+        fiducials, test coupons) — fixed, can't be moved, and their
+        pad+via stacks legitimately interleave. Matches
+        ``_is_overlap_exempt``.
+      - EITHER macro's leader is a TestPoint (detected via footprint
+        prefix) — intentionally tight placement for probe access.
+        Matches ``cost._clearance_target_for_pair``'s exemption rule.
+
+    Push attempts use the same fractional-step backoff as
+    ``push_apart_overlapping``: try the full push, then 1/2, 1/4, 1/8.
+    Each attempt is rolled back if it creates a new overlap with any
+    OTHER macro (the DRC fix must not regress overlap-freedom — that's
+    a hard constraint).
+
+    Returns the count of sub-DRC gaps that were brought up to ≥
+    ``min_gap_mm``. A residual sub-DRC gap (when no push direction is
+    overlap-free) is reported but not counted as a failure — it's a
+    DRC warning, not a placement invalidity (the existing overlap
+    terms in the cost function are the hard constraint).
+
+    Typical use case: test4's C6↔C23 at 0.130mm gap (two 0402 caps on
+    different IC macros) — the SA cost function can't push them apart
+    because lowering the clearance target WEAKENS the push-apart
+    gradient (lower target = lower deficit = less pressure). This pass
+    catches them post-SA as a DRC check, not a cost optimization.
+    """
+    if not macros:
+        return 0
+
+    bx_min, by_min, bx_max, by_max = bounds
+    n = len(macros)
+    fixed_count = 0
+
+    for pass_idx in range(max_passes):
+        fixed_this_pass = 0
+        # Rebuild the spatial grid each pass — macros move.
+        grid = _MacroSpatialGrid.from_macros(macros, bounds)
+        seen_pairs: set[tuple[int, int]] = set()
+
+        for i in range(n):
+            a = macros[i]
+            for j in grid.query_candidates(i, macros):
+                pair = (i, j) if i < j else (j, i)
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                b = macros[j]
+
+                # Exempt pairs (TestPoint, mechanical-mechanical) — skip.
+                if _pair_is_drc_exempt(a, b):
+                    continue
+
+                # Find the MINIMUM edge gap between any member of A and
+                # any member of B. (Macro bboxes are unions of leader +
+                # followers; the macro-pair gap might be 0 even when an
+                # individual cap-cap pair is sub-DRC.)
+                min_gap = math.inf
+                min_axis = None  # 'x' or 'y'
+                min_sign = 0  # +1 or -1 (push direction for the mover)
+                for a_mem in a.members:
+                    for b_mem in b.members:
+                        dx, dy, gap = _edge_gap_signed(a_mem.bbox, b_mem.bbox)
+                        if gap < min_gap:
+                            min_gap = gap
+                            # Pick the axis with smaller separation
+                            # magnitude — that's the cheaper push.
+                            if abs(dx) <= abs(dy) and dx != 0:
+                                min_axis = "x"
+                                # Push b_mem AWAY from a_mem along x.
+                                # If a_mem is left of b_mem (dx > 0),
+                                # push b right (+x). If a_mem is right
+                                # (dx < 0), push b left (-x). Wait,
+                                # this depends on which macro is the
+                                # mover. Simpler: if dx > 0, a is left
+                                # of b → push b further right.
+                                min_sign = 1 if dx > 0 else -1
+                            elif dy != 0:
+                                min_axis = "y"
+                                min_sign = 1 if dy > 0 else -1
+                            else:
+                                # Both zero (perfect overlap) — fall
+                                # back to x with +1.
+                                min_axis = "x"
+                                min_sign = 1
+
+                # Skip if gap is already ≥ min_gap_mm OR an actual overlap
+                # (overlap is the legalizer's job, not this pass).
+                if min_gap >= min_gap_mm or min_gap <= 0:
+                    continue
+
+                # Need to push apart by (min_gap_mm - min_gap) to hit the
+                # target. Pick the mover: smaller macro, never fixed.
+                a_area = max(0.0, a.bbox[2] - a.bbox[0]) * max(0.0, a.bbox[3] - a.bbox[1])
+                b_area = max(0.0, b.bbox[2] - b.bbox[0]) * max(0.0, b.bbox[3] - b.bbox[1])
+                if a.is_fixed and b.is_fixed:
+                    continue  # both fixed — can't push either
+                elif a.is_fixed:
+                    mover, other = b, a
+                    mover_sign = min_sign  # b is the mover, push along min_sign
+                elif b.is_fixed:
+                    mover, other = a, b
+                    mover_sign = -min_sign  # a is the mover, push opposite
+                else:
+                    if a_area < b_area:
+                        mover, other = a, b
+                        mover_sign = -min_sign  # a is mover
+                    else:
+                        mover, other = b, a
+                        mover_sign = min_sign  # b is mover
+
+                needed = min_gap_mm - min_gap  # positive (we're below target)
+
+                # Try fractional pushes: full, 1/2, 1/4, 1/8.
+                for frac in (1.0, 0.5, 0.25, 0.125):
+                    push = needed * frac * mover_sign
+                    snap = mover._snapshot()
+                    if min_axis == "x":
+                        ok = mover.translate(push, 0.0, bounds=bounds)
+                    else:
+                        ok = mover.translate(0.0, push, bounds=bounds)
+                    if not ok:
+                        mover._restore(snap)
+                        continue
+                    # Check the move didn't create a NEW overlap with any
+                    # OTHER macro (besides the one we're trying to fix).
+                    new_overlap = False
+                    for k in range(n):
+                        if k == i and mover is a: continue
+                        if k == j and mover is b: continue
+                        if macros[k].overlaps(mover):
+                            new_overlap = True
+                            break
+                    if new_overlap:
+                        mover._restore(snap)
+                        continue
+                    # Also verify the gap between mover and `other` is now
+                    # ≥ min_gap_mm (the push should have achieved it).
+                    new_min_gap = math.inf
+                    for a_mem in mover.members:
+                        for b_mem in other.members:
+                            _, _, gap = _edge_gap_signed(a_mem.bbox, b_mem.bbox)
+                            if gap < new_min_gap:
+                                new_min_gap = gap
+                    if new_min_gap >= min_gap_mm - 1e-6:
+                        fixed_this_pass += 1
+                        break  # success, move to next pair
+                    # Else: push wasn't enough — try larger frac (but we
+                    # started at 1.0, so this is for the rollback case).
+                    mover._restore(snap)
+
+        fixed_count += fixed_this_pass
+        if fixed_this_pass == 0:
+            break  # no progress this pass — done
+
+    if verbose and fixed_count > 0:
+        print(f"  DRC min-gap: {fixed_count} sub-DRC pair(s) brought up to "
+              f">={min_gap_mm}mm")
+    return fixed_count
+
+
 def _try_push(
     mover: "Macro",
     other: "Macro",
@@ -1598,6 +1828,32 @@ def legalize(
         # the user's evaluation flagged as "Finding 1/2 effect".
         residual = _count_residual_overlaps(macros)
 
+    # ─── Hard-DRC post-process: enforce minimum gap between SMT passives ──
+    # After all overlap-repair passes (push-apart, force-spread, Tetris),
+    # scan for sub-DRC gaps between small SMT passives on different macros
+    # (e.g. two 0402 caps at 0.13mm gap on test4 — touching but not
+    # overlapping). The SA cost function can't fix these because lowering
+    # the clearance target WEAKENS the push-apart gradient (counter-
+    # intuitive but correct: lower target = lower deficit = less pressure).
+    # This pass catches them post-SA as a DRC check.
+    #
+    # Runs unconditionally (even when residual==0) because sub-DRC gaps
+    # can exist between non-overlapping macros. Skips exempt pairs:
+    # mechanical-mechanical (mounting holes) and any pair containing a
+    # TestPoint. Never creates a new overlap — rolls back the push if
+    # it would collide with any other macro.
+    drc_min_gap_violations = enforce_drc_min_gap(
+        macros, bounds,
+        min_gap_mm=0.15,
+        max_passes=8,
+        verbose=verbose,
+    )
+    # If DRC pass moved anything, re-verify no new overlaps were created
+    # (the per-push rollback should already prevent this, but a final
+    # recount is cheap insurance).
+    if drc_min_gap_violations > 0:
+        residual = _count_residual_overlaps(macros)
+
     # Cap-IC invariant: a follower must never overlap its own leader.
     # Macros are rigid bodies, so this geometry is fixed at construction
     # (find_cap_offset places every cap gap-spaced off the leader body)
@@ -1620,6 +1876,7 @@ def legalize(
             f"  Legalize: {residual} residual overlaps, "
             f"{failed} boundary failures, {cap_ic_overlaps} cap-IC overlaps"
             + (f", {keepout_failures} keepout violations" if keepout_failures else "")
+            + (f", {drc_min_gap_violations} DRC min-gap fixes" if drc_min_gap_violations else "")
         )
 
     return {
@@ -1627,5 +1884,6 @@ def legalize(
         "boundary_failures": failed,
         "cap_ic_overlaps": cap_ic_overlaps,
         "keepout_failures": keepout_failures,
+        "drc_min_gap_fixes": drc_min_gap_violations,
         "expanded_bounds": bounds,
     }

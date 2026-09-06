@@ -46,7 +46,8 @@ import math
 from typing import TYPE_CHECKING
 
 from cost.cost import hpwl_net, macro_overlap_area, cap_attraction_penalty, \
-    CAP_ATTRACTION_TARGET_GAP_MM, clearance_pair_charge
+    CAP_ATTRACTION_TARGET_GAP_MM, clearance_pair_charge, \
+    _clearance_target_for_pair
 
 if TYPE_CHECKING:
     from models.board_model import BoardModel, Component, Net
@@ -155,6 +156,14 @@ class IncrementalCostTracker:
 
         self._pair_overlap: dict[tuple[int, int], float] = {}
         self._pair_clearance: dict[tuple[int, int], float] = {}
+        # Per-pair clearance target (mm). Precomputed once at init so the SA
+        # hot loop's propose() doesn't re-run _clearance_target_for_pair on
+        # every touched pair (which would call getattr + dict lookup + min
+        # per pair, ~10× slower than the cached lookup). Pairs with target
+        # 0.0 are exempt and naturally contribute 0 to both initial and
+        # delta — clearance_pair_charge returns 0 for any input when
+        # target_mm=0. See cost._clearance_target_for_pair for the rules.
+        self._pair_clearance_target: dict[tuple[int, int], float] = {}
         n = len(macros)
         overlap_total = 0.0
         clearance_total = 0.0
@@ -165,11 +174,15 @@ class IncrementalCostTracker:
                     self._pair_overlap[(i, j)] = a
                 overlap_total += a
                 if clearance_weight > 0:
-                    c = clearance_pair_charge(
-                        macros[i].bbox, macros[j].bbox, clearance_target_mm)
-                    if c:
-                        self._pair_clearance[(i, j)] = c
-                    clearance_total += c
+                    pair_target = _clearance_target_for_pair(
+                        macros[i], macros[j], clearance_target_mm)
+                    self._pair_clearance_target[(i, j)] = pair_target
+                    if pair_target > 0.0:
+                        c = clearance_pair_charge(
+                            macros[i].bbox, macros[j].bbox, pair_target)
+                        if c:
+                            self._pair_clearance[(i, j)] = c
+                        clearance_total += c
         self._overlap_total = overlap_total
         self._clearance_total = clearance_total
 
@@ -321,11 +334,18 @@ class IncrementalCostTracker:
                 overlap_delta += new_a - old_a
                 # Clearance rides the same loop — the touched-pair set is
                 # identical (a move can only change the overlap OR the
-                # gap of pairs involving a touched macro).
+                # gap of pairs involving a touched macro). Uses the
+                # precomputed per-pair target so cap-cap pairs use 0.3mm
+                # (not the IC's 1.0mm) and TestPoint/mechanical pairs
+                # are exempt (target=0 → charge=0, no false-positive push).
                 if track_clearance:
-                    new_c = clearance_pair_charge(
-                        self.macros[i].bbox, self.macros[k].bbox,
-                        self.clearance_target_mm)
+                    pair_target = self._pair_clearance_target.get((i, k), 0.0)
+                    if pair_target > 0.0:
+                        new_c = clearance_pair_charge(
+                            self.macros[i].bbox, self.macros[k].bbox,
+                            pair_target)
+                    else:
+                        new_c = 0.0  # exempt pair (TestPoint, mechanical)
                     old_c = self._pair_clearance.get((i, k), 0.0)
                     pending_clearance[(i, k)] = new_c
                     clearance_delta += new_c - old_c

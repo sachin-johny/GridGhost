@@ -34,6 +34,93 @@ CAP_ATTRACTION_TARGET_GAP_MM = 5.0
 # Set to 0.0 to disable the clearance term entirely.
 CLEARANCE_TARGET_MM = 1.0
 
+# Per-component-type clearance targets (mm, edge-to-edge on bbox).
+# A pair's effective target is the MIN of the two members' targets. Pairs
+# where EITHER member is a TestPoint are entirely exempt (see below).
+#
+# Rationale:
+#   - mounting_hole / fiducial / test_coupon: 0mm (exempt — mechanical
+#     features; pad+via stacks legitimately interleave, can't be moved
+#     by SA, exemption matches _is_overlap_exempt).
+#   - TestPoint (via footprint detection): 0mm (exempt — probe access
+#     pads intentionally placed on/near IC pins; the 1mm uniform target
+#     fought net-HPWL pull that pins them to the IC pin and lost, parking
+#     them at 0.000mm gap on test4 with no gradient signal to improve).
+#     Exempting them removes the false-positive charge and lets SA spend
+#     its clearance budget on actual routing-halo pairs.
+#   - All other types (ic, mcu, regulator, connector, crystal, capacitor,
+#     resistor, generic): fall back to the caller's target_mm (default
+#     1.0mm = the historical uniform target). Preserves behavior for
+#     the heterogeneous `generic` class (LEDs, diodes, inductors of
+#     widely varying sizes) and avoids the regression where reducing
+#     cap/resistor targets let HPWL pull a diode onto a mounting hole.
+#
+# Originally this table also relaxed cap/resistor targets to 0.3mm under
+# the reasoning that "small SMT passives don't need a 1mm halo". That was
+# INVERTED: lowering the target reduces the deficit (max(0, target - gap))
+# for the same gap, which WEAKENS SA's push-apart gradient — so cap-cap
+# pairs ended up at the same gap or tighter, not looser. The right way to
+# tighten DRC min-gap on cap-cap pairs is a higher target (more pressure)
+# or a separate hard-DRC term, not a lower one.
+_COMPONENT_CLEARANCE_TARGETS_MM: dict[str, float] = {
+    "mounting_hole": 0.0,
+    "fiducial":      0.0,
+    "test_coupon":   0.0,
+    # All other types fall back to the caller's target_mm (default 1.0).
+}
+
+# Footprint prefixes that identify test points (probe access pads).
+# TestPoints are classified as `component_type="generic"` by the parser
+# (no leading letter distinguishes them from R/C/U), so we need a
+# footprint-name check to exempt them from the clearance term.
+_TESTPOINT_FP_PREFIXES = (
+    "TestPoint", "testpoint",
+    "MeasurementPoint",
+)
+
+
+def _is_testpoint(comp: "object") -> bool:
+    """Return True if comp's footprint identifies it as a probe test point."""
+    fp = getattr(comp, "footprint", "") or ""
+    # Strip "Library:" prefix if present (KiCad convention)
+    if ":" in fp:
+        fp = fp.split(":", 1)[1]
+    return any(fp.startswith(p) for p in _TESTPOINT_FP_PREFIXES)
+
+
+def _clearance_target_for_pair(
+    a: "Macro",
+    b: "Macro",
+    default_mm: float,
+) -> float:
+    """Return the appropriate clearance target (mm) for this pair.
+
+    0.0 means the pair is exempt from the clearance term entirely.
+    The ``default_mm`` is used as a fallback for component types not in
+    the per-class table.
+    """
+    from models.macro import _is_overlap_exempt
+
+    # Mechanical-vs-mechanical pairs (mounting holes, fiducials) — exempt
+    if _is_overlap_exempt(a, b):
+        return 0.0
+
+    a_lead = a.leader
+    b_lead = b.leader
+
+    # TestPoint pairs — exempt (intentional tight placement for probing)
+    if _is_testpoint(a_lead) or _is_testpoint(b_lead):
+        return 0.0
+
+    a_target = _COMPONENT_CLEARANCE_TARGETS_MM.get(
+        getattr(a_lead, "component_type", "") or "", default_mm)
+    b_target = _COMPONENT_CLEARANCE_TARGETS_MM.get(
+        getattr(b_lead, "component_type", "") or "", default_mm)
+    # Use MIN of the two: the less-demanding component wins. A cap next to
+    # an IC gets the cap's 0.3mm, not the IC's 1.0mm — the cap doesn't
+    # need a full routing halo.
+    return min(a_target, b_target)
+
 
 def clearance_pair_charge(
     a_bbox: tuple[float, float, float, float],
@@ -81,6 +168,28 @@ def clearance_deficit(
     Uses the same mechanical-feature exemption as the overlap terms via
     ``_is_overlap_exempt`` (mounting-hole pad stacks shouldn't be pushed
     apart — they're fixed and their bboxes legitimately interleave).
+
+    Per-pair target selection (see ``_clearance_target_for_pair``):
+      - Mechanical-mechanical pairs: exempt (0mm target).
+      - Pairs with ANY TestPoint member: exempt (intentional tight
+        placement for probe access).
+      - Cap-cap / cap-resistor / resistor-resistor pairs: 0.3mm target
+        (DRC min + one trace lane; small SMT passives don't need the
+        full 1mm halo the IC class does).
+      - IC-IC / IC-MCU pairs: 1.0mm (full routing halo).
+      - Other pairs: per-component-class MIN of the two members, falling
+        back to ``target_mm`` for unclassified types.
+
+    The previous uniform 1.0mm target caused two distinct pathologies:
+      1. TestPoint ↔ IC pairs at 0.000mm (U1↔TP16 on test4) — SA fought
+         net-HPWL pull that pinned the test point to the IC pin,
+         couldn't win, and parked at touching with no gradient signal
+         to do better. Exempting them removes the false-positive charge.
+      2. Cap-cap pairs at 0.130mm (C6↔C23 on test4, two 0402s) — the
+         1mm target was so far above what's physically needed that SA
+         had no gradient to push them apart to DRC-min (0.15mm). A
+         0.3mm target gives SA 0.17mm of useful gradient without
+         demanding a 1mm halo the small passives don't need.
     """
     from models.macro import _is_overlap_exempt
 
@@ -89,9 +198,10 @@ def clearance_deficit(
     for i in range(n):
         for j in range(i + 1, n):
             a, b = macros[i], macros[j]
-            if _is_overlap_exempt(a, b):
-                continue
-            total += clearance_pair_charge(a.bbox, b.bbox, target_mm)
+            pair_target = _clearance_target_for_pair(a, b, target_mm)
+            if pair_target <= 0.0:
+                continue  # exempt pair
+            total += clearance_pair_charge(a.bbox, b.bbox, pair_target)
     return total
 
 

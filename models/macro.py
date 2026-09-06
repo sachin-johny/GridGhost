@@ -125,6 +125,31 @@ def find_cap_offset(
     leader_h = leader.effective_height
     cap_w = cap.effective_width
     cap_h = cap.effective_height
+    # Use MAX of cap half-extents when computing the offset, not the
+    # direction-specific half. Without this, a non-square cap (e.g. 0603
+    # with cap_w=4.56, cap_h=3.06 after courtyard inflation) placed BELOW
+    # the leader at rotation=0 using cap_h/2 will end up INSIDE the leader
+    # after a 90°/270° rotation, because the cap's relevant dimension in
+    # the new separation direction is cap_w/2 (the larger one).
+    #
+    # Concrete test6 case: U1 (9x7 IC) + C3 (0603, 4.56x3.06 cap).
+    #   Old offset_y = leader_h/2 + cap_h/2 + 0.5 = 3.5 + 1.53 + 0.5 = 5.53
+    #   After U1 rotates 270°, offset (0, 5.53) becomes (-5.53, 0). Cap right
+    #   edge = u1.x - 5.53 + 2.28 = u1.x - 3.25. Leader left edge (after
+    #   rotation, half-width=3.5) = u1.x - 3.5. Cap is 0.25mm INSIDE leader.
+    #   This is the stochastic test6 cap-IC overlap that surfaced on certain
+    #   SA seeds (the seed determines whether SA picks a rotate move that
+    #   triggers this for a non-square cap).
+    #
+    # With cap_max_half = max(cap_w, cap_h) / 2 = 2.28:
+    #   New offset_y = 3.5 + 2.28 + 0.5 = 6.28
+    #   After 270° rotation, cap right = u1.x - 6.28 + 2.28 = u1.x - 4.0.
+    #   Leader left = u1.x - 3.5. Gap = 0.5mm (exactly the target). No overlap.
+    #
+    # Trade-off: when the cap stays at rotation=0 (no leader rotation), the
+    # gap is overshoots by (cap_w - cap_h)/2 = 0.75mm. This is acceptable —
+    # overshoot means more routing room, never less.
+    cap_max_half = max(cap_w, cap_h) / 2
 
     others_list = [o for o in others if o is not cap and o is not leader]
     rad = math.radians(leader.rotation)
@@ -141,8 +166,8 @@ def find_cap_offset(
             if spacing > MAX_CAP_IC_GAP_MM:
                 break
             for dx_dir, dy_dir in _FAN_DIRS:
-                offset_x = dx_dir * (leader_w / 2 + cap_w / 2 + spacing)
-                offset_y = dy_dir * (leader_h / 2 + cap_h / 2 + spacing)
+                offset_x = dx_dir * (leader_w / 2 + cap_max_half + spacing)
+                offset_y = dy_dir * (leader_h / 2 + cap_max_half + spacing)
 
                 cap_x = leader.x + offset_x * cos_r - offset_y * sin_r
                 cap_y = leader.y + offset_x * sin_r + offset_y * cos_r
@@ -170,10 +195,11 @@ def find_cap_offset(
 
     # Absolute last resort (only if every fan slot overlaps a sibling):
     # a cardinal slot at the max gap. By construction (offset >=
-    # leader_half + cap_half) this never overlaps the leader. Unlike the
+    # leader_half + cap_max_half) this never overlaps the leader. Unlike the
     # old ``(MAX/sqrt(2), MAX/sqrt(2))`` fallback, this scales with the
-    # actual leader size instead of landing inside a large IC.
-    return (leader_w / 2 + cap_w / 2 + _FAN_SPACINGS[-1], 0.0)
+    # actual leader size instead of landing inside a large IC. Uses
+    # cap_max_half for the same rotation-safety reason as the main loop.
+    return (leader_w / 2 + cap_max_half + _FAN_SPACINGS[-1], 0.0)
 
 
 @dataclass
