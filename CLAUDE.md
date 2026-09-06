@@ -9,7 +9,7 @@ once, optimized completely outside the editor, then written back.
 
 ## Project Status (Current)
 
-**Last Updated:** 2026-08-18
+**Last Updated:** 2026-09-06
 
 - Full pipeline end-to-end: extract → cap classification/assignment → build macros →
   connector perimeter → net-aware initial placement → macro SA → iterative legalization → save.
@@ -19,14 +19,20 @@ once, optimized completely outside the editor, then written back.
     (`--macro-v2` is on by default).
   - **Legacy grid pipeline** (`engine/smart_placement.py` + `engine/annealer.py`) —
     retained behind `--no-macro-v2` for A/B comparison. Still functional.
-- **227 tests across 14 files** (`python -m pytest tests/`). `test_phase1.py` (87 tests)
+- **229 tests across 14 files** (`python -m pytest tests/`). `test_phase1.py` (87 tests)
   covers the legacy engine + data model; the rest cover the macro pipeline, including
-  `test_nonrect_outline.py` (26 — polygon outlines), `test_keepout.py` (13 — internal
+  `test_nonrect_outline.py` (26 — polygon outlines), `test_cost.py` (23 — incl. per-pair
+  clearance-target exemption tests), `test_keepout.py` (13 — internal
   keepout zones), and `test_pad_rotation.py` (7 — footprint-only rotation rewrite).
   `test_overlap_regression.py` is currently disabled (0 collected).
 - Non-rectangular board outlines (notches, mouse-bites, interior holes) and rectangular
   internal keepout zones are now wired into the **default** macro-v2 path end-to-end
   (cost gradient, initial placement, legalizer clamps) — previously data-model/parser-only.
+- **Hard-DRC min-gap pass** (2026-09-06) — after the main legalize loop, the default
+  legalizer runs `enforce_drc_min_gap` (0.15 mm min gap): pushes sub-DRC passive-pair
+  gaps up to the minimum, exempting TestPoint/mechanical pairs and rolling back any
+  push that would create a new overlap. Runs unconditionally (sub-DRC gaps aren't
+  overlaps, so the overlap pass can't catch them).
 - Bundled boards run clean: `th_sensor.kicad_pcb` (0 overlaps, 0 OOB); larger `cbb.kicad_pcb`
   completes the pipeline.
 
@@ -124,13 +130,20 @@ auto_placer/
   rail-adjacent freed caps toward their assigned IC. Root-cause fix for shared-rail
   cap drift (rail-bbox HPWL is flat w.r.t. a freed cap once the rail spans several ICs).
   Default weight `1.0`; pass `--cap-attraction-weight 0` to disable.
-- **Clearance** — routing halo: pairwise `max(0, 1mm − edge_gap)` charge. Gives SA a
-  "close enough" floor between HPWL's monotone pull and the overlap term's cliff at
-  touching (β is 0 the instant bboxes stop intersecting, so without this term SA parks
-  components at 0.00mm gaps). Intersecting pairs charge exactly the target (β owns
-  depth) and mechanical-feature pairs are exempt. Default weight `5.0`, auto-tapered
-  by interior density (1.0× ≤ 0.45 → 0.25× ≥ 0.65); pass `--clearance-weight 0` to
-  disable.
+- **Clearance** — routing halo: pairwise `max(0, target − edge_gap)` charge where the
+  pair's target is the **MIN of the two members'** per-type targets
+  (`cost/cost.py:_clearance_target_for_pair`, table `_COMPONENT_CLEARANCE_TARGETS_MM`,
+  default 1.0 mm). Exempt pairs (0 mm target): mechanical–mechanical
+  (mounting_hole/fiducial/test_coupon, via `_is_overlap_exempt`) and any pair with a
+  TestPoint member (footprint prefix `TestPoint`/`MeasurementPoint` — probe pads are
+  intentionally pinned to IC pins, and the uniform target's false-positive charge
+  fought HPWL's pull and lost). Gives SA a "close enough" floor between HPWL's
+  monotone pull and the overlap term's cliff at touching (β is 0 the instant bboxes
+  stop intersecting, so without this term SA parks components at 0.00mm gaps).
+  Intersecting pairs charge exactly the target (β owns depth). Default weight `5.0`,
+  auto-tapered by interior density (1.0× ≤ 0.45 → 0.25× ≥ 0.65); pass
+  `--clearance-weight 0` to disable. The incremental tracker precomputes per-pair
+  targets so the SA hot loop stays a dict lookup.
 
 All routability signals (RUDY, pin density, clearance) are **default-on** so the placer
 produces a routable result out of the box. The verbose report (`-v`) always shows
@@ -142,9 +155,11 @@ The legacy path additionally applies a **δ·Constraints** term via `engine/cost
 ### Macro Model
 A `Macro` = a leader component + rigidly-attached follower caps. Follower offsets are fixed
 at construction (`find_cap_offset`, 8-direction fan bounded by `MAX_CAP_IC_GAP_MM = 4.0` mm
-**edge-to-edge** gap). Translating/rotating the leader applies the same rigid transform to
-followers, so the cap-IC gap can never grow at runtime. SA moves and the legalizer treat
-macros as opaque rigid bodies.
+**edge-to-edge** gap; offsets use `max(cap_w, cap_h)/2` on both axes — `apply_offsets()`
+rotates the offset vector but not the cap, so a cap-height-based offset would land a
+non-square cap INSIDE the leader after a 90°/270° leader rotation). Translating/rotating
+the leader applies the same rigid transform to followers, so the cap-IC gap can never
+grow at runtime. SA moves and the legalizer treat macros as opaque rigid bodies.
 
 ### Cap Assignment (`assign/assign_caps.py`)
 One classification drives rigid gluing, cap attraction, *and* the legacy `--delta` decoupling-
@@ -240,6 +255,13 @@ Key `place` options (defaults come from `config.json`; see README for the full t
    on `board is not None and board.is_polygon` (or non-empty `board.keepouts`), so a plain
    rectangular board traces the exact pre-polygon code paths. New boundary/keepout logic must
    preserve this fallback rather than assuming rectangular geometry.
+10. **DRC min-gap is a post-pass, not a cost weight** — `place/legalizer.py::enforce_drc_min_gap`
+    runs after the legalize loop and pushes sub-0.15 mm gaps to the minimum, with rollback
+    on overlap regression. Don't "fix" sub-DRC gaps by lowering a pair's clearance target:
+    a lower target *weakens* the push-apart gradient (`max(0, target − gap)` shrinks for the
+    same gap), so pairs end at the same gap or tighter — the inversion that motivated the
+    hard pass (see `_COMPONENT_CLEARANCE_TARGETS_MM` comment in `cost/cost.py`). Tighten via
+    a *higher* target or the hard pass, never a lower one.
 
 ## Dependencies
 

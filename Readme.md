@@ -22,7 +22,7 @@
 - **Non-rectangular board outlines** — polygon outlines (connector notches, mouse-bites, castellated edges) and interior holes/keepout zones are honored end-to-end: initial placement, SA's boundary gradient, and the legalizer all clamp to the true outline instead of its outer AABB. Plain rectangular boards trace the exact pre-polygon code paths (zero behavior change).
 - **Internal keepout zones** — rectangular no-place zones (mounting holes, board-edge fab notes, etc.) are penalized in the cost function and actively evicted by the legalizer's multi-pass keepout clamp, which pushes an offending macro out along its shallowest exit axis.
 - **End-mating connector orientation** — barrel jacks, USB, RJ45, HDMI, D-Sub and other end-mating connectors are oriented so the mating face points outward. Face-mating connectors (terminal blocks, pin headers, SMA) use the perpendicular-to-pad-column heuristic.
-- **Iterative legalizer** — grid snap → push-apart → boundary clamp, iterated up to 5 rounds to settle the push-apart ↔ clamp cycle. Cap-IC distance violations are reported as a separate stat. Alternate strategies (`abacus`, `sa_polish`) are selectable via `--legalizer`.
+- **Iterative legalizer** — grid snap → push-apart → boundary clamp, iterated up to 5 rounds to settle the push-apart ↔ clamp cycle. Cap-IC distance violations are reported as a separate stat. A post-pass **hard-DRC min-gap check** then pushes sub-0.15 mm passive-pair gaps up to the DRC minimum — TestPoint and mechanical-feature pairs are exempt (their tight placement is intentional), and any push that would create a new overlap is rolled back. Alternate strategies (`abacus`, `sa_polish`) are selectable via `--legalizer`.
 - **Pad rotation propagation** — footprint rotation rewrites only the footprint's own `(at ...)` expression; per-pad `(at X Y r)` overrides are left untouched, avoiding the double-rotation that previously corrupted asymmetric footprints (SOIC/QFN/offset-pin-1 parts).
 - **Edge-connector awareness** — horizontal/surface-mount connectors are placed on the board perimeter and excluded from out-of-bounds counts; vertical/THT connectors are treated as interior components.
 - **Net exclusion for SA speed** — `--exclude-nets` drops near-constant-HPWL global nets (board-wide GND/VCC) from SA's per-move cost evaluation, cutting evaluation cost without changing what's optimized.
@@ -58,8 +58,8 @@ KiCad .kicad_pcb
   └────┬─────┘
        │
   ┌──────────┐   grid snap → push-apart → boundary clamp, iterated
-  │ legalize │   reports residual overlaps, boundary failures, and
-  │          │   cap-IC distance violations
+  │ legalize │   + hard-DRC min-gap pass (0.15 mm); reports residual
+  │          │   overlaps, boundary failures, and cap-IC violations
   └────┬─────┘
        │
   Updated .kicad_pcb  (+  positions JSON)
@@ -137,7 +137,7 @@ Total Cost = α·HPWL + β·Overlap + γ·Boundary + γ·Keepout
 - **RUDY** — Wire-density congestion: each net's bounding-box "traffic" spread uniformly across the grid cells it spans, scaled by local component density (0.3× sparse boards, 1.2× dense boards, 1.0× otherwise) so amplification doesn't overshoot already-congested regions. Catches routing choke points HPWL alone is blind to. Default weight `1.0`.
 - **Pin density** — Signal-pin count per grid cell (power pins excluded, target adapts to board density). Catches pin-escape congestion — dense clusters of small passives crowding a QFN's pins — that RUDY's wire-density model misses. Default weight `0.2`.
 - **Cap attraction** — Deadband-linear drift penalty, `max(0, center_dist − 5mm)`, on *rail-adjacent* freed caps toward their assigned IC. Root-cause fix for shared-rail cap drift: on a rail spanning several ICs the rail's net bbox is already board-wide, so HPWL alone gives a freed cap zero gradient to stay near its IC. Default weight `1.0`.
-- **Clearance** — Pairwise routing-halo charge, `max(0, 1mm − edge_gap)`, between macro pairs. HPWL's pull and the overlap term's cliff-at-touching otherwise let SA park components at a 0.00 mm gap with no room for a trace; intersecting pairs charge exactly the target so `β` stays the sole "depth" charger. Auto-tapered by interior density (1.0× ≤ 0.45 density, 0.25× ≥ 0.65). Default weight `5.0`.
+- **Clearance** — Pairwise routing-halo charge between macro pairs: `max(0, target − edge_gap)`, where the pair's target is the **min of the two members'** per-type targets (default 1.0 mm). Pairs are exempt when both leaders are mechanical features (mounting holes, fiducials, test coupons) or when either member is a TestPoint — probe pads are intentionally pinned to IC pins, and the uniform target charged them for exactly the tight placement the design wants. HPWL's pull and the overlap term's cliff-at-touching otherwise let SA park components at a 0.00 mm gap with no room for a trace; intersecting pairs charge exactly the target so `β` stays the sole "depth" charger. Auto-tapered by interior density (1.0× ≤ 0.45 density, 0.25× ≥ 0.65). Default weight `5.0`.
 
 All four routability terms (Keepout, RUDY, pin density, clearance) plus cap attraction are **default-on**. Pass the matching `--*-weight 0` flag to disable any of them; `-v` always reports each term's initial and final value, even at weight 0.
 
@@ -149,6 +149,7 @@ A `Macro` is the atomic unit of placement. Construction:
 2. **Followers**: caps assigned to that IC. Each follower has a *fixed offset* in leader-local coordinates, chosen at construction time by `find_cap_offset` — an 8-direction fan search at increasing edge-to-edge spacings (0.5–4.0 mm) that:
    - Rejects slots where the cap overlaps the leader or any already-placed sibling.
    - Bounds the cap's **edge-to-edge gap** to the leader by `MAX_CAP_IC_GAP_MM = 4.0` mm (the spacing itself). The gap — not the center-to-center distance — is what governs decoupling effectiveness; center-distance is size-dependent and broke every cap on ICs larger than ~9 mm.
+   - Uses `max(cap_w, cap_h)/2` as the cap's half-extent on **both** axes, so the chosen gap survives leader rotation: offsets rotate with the leader but caps don't rotate with it, and a cap-height-based offset would land a non-square cap inside the leader after a 90°/270° rotation.
    - Falls back to the first leader-clear slot (smallest gap) if no slot is sibling-free.
 
 Because offsets are fixed, the cap-IC gap can **never grow at runtime** — translating or rotating the leader applies the same rigid transform to followers. The gap is enforced by construction.
@@ -210,7 +211,8 @@ GridGhost/
 │   │                              # displace-neighbor); calibrated T0
 │   ├── sa_polish.py               # Overlap-weighted SA legalizer strategy (--legalizer sa_polish)
 │   ├── legalizer.py               # Grid snap → push-apart → boundary clamp,
-│   │                              # iterated up to 5 rounds
+│   │                              # iterated up to 5 rounds + hard-DRC min-gap
+│   │                              # pass (0.15 mm, overlap-rollback safe)
 │   └── abacus_bridge.py           # Adapter from rigid Macros to the row-based
 │                                  # Abacus legalizer (--legalizer abacus)
 │
@@ -342,10 +344,10 @@ python -m pytest tests/test_macro.py tests/test_assign_caps.py tests/test_cost.p
 python -m pytest tests/test_phase1.py
 ```
 
-The suite is **227 tests across 14 files** (run `python -m pytest tests/`). Breakdown: `test_phase1.py` (87 — legacy pipeline + data model), `test_nonrect_outline.py` (26), `test_cost.py` (21), `test_assign_caps.py` (17), `test_keepout.py` (13), `test_macro.py` (11), `test_connector_placement.py` (10), `test_placement_spread.py` (9), `test_chains.py` (9), `test_incremental_cost.py` (8), `test_pad_rotation.py` (7), `test_sa_polish.py` (5), `test_abacus_bridge.py` (4). `test_overlap_regression.py` is currently disabled (0 collected). The macro-first pipeline is covered by:
+The suite is **229 tests across 14 files** (run `python -m pytest tests/`). Breakdown: `test_phase1.py` (87 — legacy pipeline + data model), `test_nonrect_outline.py` (26), `test_cost.py` (23), `test_assign_caps.py` (17), `test_keepout.py` (13), `test_macro.py` (11), `test_connector_placement.py` (10), `test_placement_spread.py` (9), `test_chains.py` (9), `test_incremental_cost.py` (8), `test_pad_rotation.py` (7), `test_sa_polish.py` (5), `test_abacus_bridge.py` (4). `test_overlap_regression.py` is currently disabled (0 collected). The macro-first pipeline is covered by:
 - **Macro model**: rigid translation, bounds revert, rotation propagation, `MAX_CAP_IC_GAP_MM` (edge-to-edge cap-IC gap) enforcement, bbox union, overlap detection
 - **Cap assignment**: power-net detection (incl. hidden/hierarchical rail names), rigid-vs-rail-adjacent split by pad spread, round-robin distribution, determinism
-- **Cost**: HPWL (2-pin, 3-pin, with/without power), macro overlap area, boundary (rect + polygon), keepout overlap, cap-attraction drift, pairwise clearance, edge-connector exclusion, evaluate() returns all components
+- **Cost**: HPWL (2-pin, 3-pin, with/without power), macro overlap area, boundary (rect + polygon), keepout overlap, cap-attraction drift, pairwise clearance incl. per-pair targets and TestPoint/mechanical exemptions, edge-connector exclusion, evaluate() returns all components
 - **Board outline**: polygon containment/clamp/fit, notch + nested-hole geometry, parser outline tracing and rectangle fallback, adversarial legalizer sweeps on notched boards
 - **Keepout zones**: cost penalty and multi-pass legalizer eviction from rectangular no-place zones
 - **Pad rotation**: footprint-only rotation rewrite on asymmetric footprints (no pad double-rotation)
