@@ -255,16 +255,6 @@ def cmd_place(args) -> None:
         residual_overlaps = legal_stats.get("residual_overlaps", 0)
         boundary_failures = legal_stats.get("boundary_failures", 0)
         placement_invalid = residual_overlaps > 0 or boundary_failures > 0
-        if placement_invalid:
-            print(
-                f"\n  WARNING: legalizer could not produce a valid placement — "
-                f"{residual_overlaps} overlapping footprint pair(s), "
-                f"{boundary_failures} out-of-bounds footprint(s) remain.\n"
-                f"  The written board is NOT physically valid as placed. Try "
-                f"--sa-iterations with a larger value, a lower --beta board "
-                f"density, or manually resolve the flagged components in "
-                f"KiCad before fabrication."
-            )
 
         print("\nStep 8: Saving results (macro-v2 pipeline — skipping legacy SA/legalize)")
         model_json = args.input.replace(".kicad_pcb", "_placed_model.json")
@@ -275,12 +265,34 @@ def cmd_place(args) -> None:
         export_positions_json(model, pos_json)
         print(f"  Positions JSON: {pos_json}")
 
+        output_pcb = args.output or args.input.replace(".kicad_pcb", "_placed.kicad_pcb")
         if not args.dry_run:
-            output_pcb = args.output or args.input.replace(".kicad_pcb", "_placed.kicad_pcb")
             apply_placement(model, args.input, output_pcb)
             print(f"  Placed PCB: {output_pcb}")
         else:
             print("  [DRY RUN] Not writing PCB file")
+
+        if placement_invalid:
+            # Warn only after the outputs are on disk: "the written board"
+            # refers to files that now actually exist (or the dry-run result).
+            if args.dry_run:
+                verdict = (
+                    "The placement result is NOT physically valid "
+                    "(dry run — no board written)."
+                )
+            else:
+                verdict = (
+                    f"The written board ({output_pcb}) is NOT physically "
+                    f"valid as placed."
+                )
+            print(
+                f"\n  WARNING: legalizer could not produce a valid placement — "
+                f"{residual_overlaps} overlapping footprint pair(s), "
+                f"{boundary_failures} out-of-bounds footprint(s) remain.\n"
+                f"  {verdict} Try --sa-iterations with a larger value, a lower "
+                f"--beta board density, or manually resolve the flagged "
+                f"components in KiCad before fabrication."
+            )
 
         print(f"\n{'#' * 60}")
         if placement_invalid:
